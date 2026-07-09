@@ -12,10 +12,18 @@ members  = ["crates/*"]
 version = "0.1.0"
 edition = "2024"
 
-# Single source of truth for third-party version pins. EMPTY at Phase 1 scaffolding (zero
-# dependencies). Bevy 0.19 / matchbox / str0m / rhai / ed25519-dalek pins land
-# HERE (never per-crate) so versions cannot drift across the workspace.
+# Single source of truth for third-party version pins (ADR-0007). Member crates
+# reference these via `dep.workspace = true`; Cargo.lock pins the exact patch.
 [workspace.dependencies]
+# scripting crate (Rhai ↔ Bevy-ECS bridge). rhai `sync` OFF (NonSend storage, ADR-0011);
+# default-features off drops `ahash/runtime-rng` (needs entropy on wasm) → fixed hash keys,
+# WASM-safe. `unchecked`/`internals` are NOT defaults and MUST stay off (they void the sandbox).
+rhai     = { version = "1.25", default-features = false, features = ["std"] }
+bevy_ecs = { version = "0.19" }
+log      = { version = "0.4" }
+# dev-only
+tempfile = { version = "3" }
+filetime = { version = "0.2" }
 
 # Size-optimized ship profile (docs/final-todo.md §1.1). `panic = "abort"` is
 # scoped to release ONLY — `cargo test` builds under the dev/test profile

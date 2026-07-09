@@ -109,3 +109,19 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   added — handled by a commented `.override` in `flake.nix`, decoupled from the nixpkgs rev. `.mcp.json` `npx`
   invocations route through `direnv exec`. `.direnv/` and `/result` are gitignored.
 - **Status:** Accepted (2026-07-09).
+
+## ADR-0011 — Rhai engine stored as a Bevy `NonSend` resource; rhai `sync` OFF
+- **Context:** the `scripting` bridge holds a Rhai `Engine`/`AST`/`Scope`, which are `Rc`/`RefCell`-based
+  and NOT `Send + Sync` unless rhai's `sync` feature is enabled. A normal Bevy `Resource` requires
+  `Send + Sync + 'static`. Two options: enable `rhai/sync` (`Arc`/`RwLock`) + `#[derive(Resource)]`, or store
+  the engine as a **NonSend resource** and keep `sync` off.
+- **Decision:** store the `ScriptEngine` via `world.insert_non_send(engine)` (accessed with `NonSendMut`),
+  rhai `sync` **OFF**. rhai is pinned `default-features = false, features = ["std"]` — drops
+  `ahash/runtime-rng` (needs entropy on wasm → fixed keys, WASM-safe); `unchecked`/`internals` stay off.
+- **Consequences:** faster per-tick interpreter (no atomic refcounts/locks in a tree-walking interpreter
+  already ~2× slower than Python); matches the single-threaded-WASM-at-launch invariant (ADR-0003);
+  sidesteps the Bevy 0.19 `Resource`-implies-`Component` collision (the wrapper is a plain non-derived
+  struct). Cost: the script system is pinned to the main thread even under a future `multi_threaded`
+  schedule — acceptable while scripts stay thin; flipping to `sync` + `#[derive(Resource)]` later is a
+  localized change (only the insert call + trait bounds move).
+- **Status:** Accepted (2026-07-09).

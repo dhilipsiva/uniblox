@@ -4,3 +4,13 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+rhai.workspace = true
+bevy_ecs.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+# integration tests (tests/) are separate crates — they need rhai/bevy_ecs directly.
+rhai.workspace = true
+bevy_ecs.workspace = true
+tempfile.workspace = true
+filetime.workspace = true

@@ -4,7 +4,7 @@ Living snapshot of where uniblox is. Update it when a phase's status changes.
 The **why** behind decisions lives in `DECISIONS.md`; the **what/how** lives in
 `docs/final-buildspec.md`; the backlog lives in `TODO.md`.
 
-**Current phase: Phase 1 (the vertical slice) — scaffolding done; next is the Rhai↔Bevy bridge.**
+**Current phase: Phase 1 (the vertical slice) — scaffolding + the Rhai↔Bevy bridge done; next is the mini-game simulation.**
 
 ## Done
 - **Cargo workspace** — virtual manifest, 9 crates under `crates/*` (glob members),
@@ -21,6 +21,10 @@ The **why** behind decisions lives in `DECISIONS.md`; the **what/how** lives in
 - **Nix flake devShell + direnv** (ADR-0010) — `flake.nix`/`flake.lock`/`.envrc` provide a pinned
   Rust toolchain (1.96.1, wasm32 target) + `wasm-bindgen`/`wasm-opt`/`brotli`/`twiggy`/`node`,
   auto-activated on `cd` and via `direnv exec .`. Cargo/tool scripts self-activate.
+- **Rhai ↔ Bevy-ECS bridge** (ADR-0011, first real deps — rhai 1.25 non-sync + bevy_ecs 0.19) —
+  locked-down `new_raw()` engine + all `set_max_*` limits + `eval` disabled, held as a NonSend resource,
+  mutating a whitelisted `Health` component per tick; in-memory + file hot-reload. 8 TDD tests green,
+  sandbox-audited, compiles for wasm32. Full hardening is Phase 12.
 
 ## Blocked / deferred (prerequisites do not exist yet)
 - **Real two-build WASM artifacts + size table** — WASM toolchain is now provided by the flake;
@@ -33,11 +37,11 @@ The **why** behind decisions lives in `DECISIONS.md`; the **what/how** lives in
 - **Web Audio worklet** investigation — needs a running WASM client with audio.
 
 ## Next
-- **The Rhai ↔ Bevy ECS bridge** (HIGH-RISK — plan-mode-first, `sandbox-auditor`, adversarial TDD).
-- Then the rest of the Phase 1 slice: the mode-agnostic mini-game, matchbox two-channel transport, the
-  custom replication protocol, and the authority-swap to Mode 3 + one A→B handoff. **The replication →
-  authority-swap → handoff items are the architecture go/no-go gate** — do not build services until the
-  authority-swap and a clean handoff are proven.
+- **The mini-game simulation** (mode-agnostic ECS components + `Owner`/authority tags; a single
+  `authority_of` decision point, no mode-specific gameplay branches).
+- Then the rest of the Phase 1 slice: matchbox two-channel transport, the custom replication protocol, and
+  the authority-swap to Mode 3 + one A→B handoff. **The replication → authority-swap → handoff items are the
+  architecture go/no-go gate** — do not build services until the authority-swap and a clean handoff are proven.
 
 ## Toolchain notes
 WSL2 Ubuntu. **The toolchain comes from the Nix flake devShell** (ADR-0010): pinned Rust 1.96.1
