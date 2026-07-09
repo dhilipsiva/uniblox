@@ -1,0 +1,273 @@
+# Building a Browser-First Rust/WASM UGC Game Platform: Engineering Resolution of the Open Questions
+
+## TL;DR
+- **The pivotal verdict (D.1): no single existing crate can back all three modes. You must build a custom per-entity replication protocol on top of a transport, because the only mature Rust WebRTC-DataChannel transport that runs in both browser and native (Matchbox/`bevy_matchbox` 0.14, on `matchbox_socket` 0.14) provides only raw channels, while the mature Bevy replication crates (`lightyear` 0.26, `bevy_replicon` 0.38) do NOT speak WebRTC DataChannels at all — `lightyear` is WebTransport/WebSocket/UDP/Steam only, and `bevy_replicon` is transport-agnostic but central-server-authoritative. Reuse their *designs*, not their code, for the replication layer.**
+- **The stack is buildable on mature-enough parts as of July 2026: Bevy 0.19 (June 19 2026), wgpu, Rhai, Matchbox for transport, str0m for the native/server WebRTC stack, ed25519-dalek for signing, coturn for Mode-3 TURN, Postgres + object store for platform state. The load-bearing risks are all quantifiable and bounded, not blockers.**
+- **The browser forces four unavoidable, measurable compromises: single-threaded ECS (Bevy's parallel schedule runs serially in WASM), a 10–44 MB WASM binary with a ~1 s+ cold load, no attestation (accepted structurally), and a threads/COOP-COEP tradeoff that breaks third-party embeds and OAuth/payment popups — recommend shipping single-threaded by default.**
+
+## Key Findings
+
+1. **Engine (A).** Bevy 0.19 shipped June 19 2026. wgpu underneath already does runtime backend selection natively (Vulkan/Metal/DX12/GL), but in the browser WebGPU vs WebGL2 remains a **build-time feature choice**, not one runtime binary — the long-standing request to serve both from one WASM file (bevy issue #13168) is still open. Deployment pattern: **two WASM builds + JS capability detection**, serving the WebGPU build to capable browsers and the WebGL2 build as fallback.
+2. **Single-thread ceiling (A.4/K.1).** Bevy's parallel ECS executes serially under `wasm32-unknown-unknown`. Multithreading requires `SharedArrayBuffer`, which requires cross-origin isolation (`COOP: same-origin` + `COEP: require-corp`). Those headers break YouTube/third-party embeds, Stripe Checkout, and Google/OAuth sign-in popups. **Recommendation: ship single-threaded; do not enable browser threads at launch.**
+3. **Binary size / cold load (A.3).** Realistic Bevy WASM binaries land in the **10–44 MB uncompressed** range, compressing to roughly **1.4–6.6 MB** with brotli after `wasm-opt`. One real P2P Bevy game (Extreme Bevy) ships ~6.6 MB brotli. A 44 MB Bevy-in-Leptos build showed ~1 s first-contentful-paint on a high-end desktop — so mid-tier/mobile cold load is materially worse.
+4. **Rhai perf (B.4).** Rhai is a tree-walking interpreter, ~2× slower than Python 3, far slower than JIT'd JS/LuaJIT. Native compilation does **not** meaningfully speed up Rhai — the interpreter loop is the bottleneck on both targets. Keep Rhai for thin high-level logic; hot loops stay in Rust/Bevy systems.
+5. **Transport (C).** Matchbox is the correct WebRTC-DataChannel spine: it already exposes both reliable-ordered and unreliable-unordered channels with configurable retransmits, works browser+native, and ships a signaling server. For the native Mode-3 hub and native peers, **str0m** (sans-IO) is the better server-side choice than `webrtc-rs`.
+6. **State replication (D).** Build custom. Per-entity authority with distributed ownership (Mode 2) is not a shipped, tested capability in any WebRTC-capable Bevy crate today.
+7. **Anti-cheat (E).** ed25519 signing is cheap enough to sign every message at 30–60 Hz on native; verification is the cost center and should be watched in-browser. Sign the reliable/durable channel always; make per-frame state signing configurable.
+8. **Infra (I/J).** One always-on WebSocket service (signaling + registry + matchmaking) is needed for every mode including free tiers. Mode 3 adds per-session headless-Bevy servers (container-per-session or pooled) plus TURN — costs that scale with concurrent sessions, matching the subscription economics.
+
+## Details
+
+### A. Engine, rendering, headless server
+
+**Version & maturity (established).** Bevy 0.19 released **June 19 2026**; per the official Bevy release announcement (bevy.org/news): *"Thanks to 261 contributors, 1185 pull requests, community reviewers, and our generous donors, we're happy to announce the Bevy 0.19 release on crates.io!"* It follows 0.18 (Jan 13 2026) and 0.17 (Sept 30 2025), on a ~3-month cadence, and remains pre-1.0 with breaking changes every release — the team is explicit this continues until 1.0, which has no committed date. Tiny Glade is the flagship shipped commercial title. WASM/WebGL2 is the default, well-trodden web path; WebGPU works but is still gated by browser rollout. Bevy 0.18 added `2d`/`3d`/`ui` cargo feature collections that make aggressive feature pruning (essential for WASM size) a first-class operation.
+
+**WebGPU/WebGL2 runtime fallback (A.1) — browser compromise (established).** `wgpu` selects the best backend at runtime *natively*. In the browser it does not: enabling the `webgpu` feature overrides `webgl2`, and "builds with the webgpu feature enabled won't be able to run on browsers that don't support WebGPU." Bevy issue #13168 ("Support WebGL2 and WebGPU in the same WASM file") remains open. **Deployment: build twice, detect `navigator.gpu` in the loader JS, serve the matching binary.** Cost: doubled build+CDN artifacts and a small detection shim. WebGPU browser support is broad on Chromium as of 2026 but Safari/Firefox coverage is still uneven, so the WebGL2 build remains load-bearing, not vestigial.
+
+**Headless Mode-3 server (A.2) — established.** Run Bevy with `MinimalPlugins` + `StatesPlugin` (rendering, windowing, audio plugins omitted). Drive simulation in `FixedMain`/`Time<Fixed>` for a stable server tick (Bevy defaults `Time<Fixed>` to 64 Hz; `bevy_replicon` ties its `ServerTick` to `FixedPostUpdate`). This is the same pattern `bevy_replicon`'s "dedicated server configuration" documents. The same Rhai logic and same replication systems run here; only authority assignment differs.
+
+**WASM binary size + cold load (A.3) — measured.** Concrete figures gathered:
+
+| App | Uncompressed | After strip + wasm-opt | Compressed | Notes |
+|---|---|---|---|---|
+| Bevy `3d_scene` (lto=thin, opt=s) | 15 MB | 7.6 MB | 1.4 MB brotli / 2.1 MB gzip | historical (~0.6-era), bevy #3978 |
+| Extreme Bevy (real P2P game) | 68 MB (debug) | — | ~6.6 MB brotli | debug "before"; predates 0.16 |
+| Minimal Bevy (no winit) | 3.5 MB (release) | — | — | practical floor |
+| Bevy-in-Leptos app | 44 MB | — | ~1 s FCP high-end desktop | Bevy 0.16 |
+
+`wasm-opt -Oz`/`-Os` typically shaves 10–30%; `--strip-debug` is the single biggest reduction on a release-with-debug build. Techniques that stack: `opt-level="z"`/`"s"`, `lto="thin"`, `codegen-units=1`, `strip="debuginfo"`, feature pruning via the `2d`/`3d`/`ui` collections, `wasm-opt -Oz --converge`, brotli at the CDN, and lazy asset loading so the user sees UI before the full payload arrives. **Budget target: ≤ ~8 MB brotli for the engine binary and a "playable within ~2–3 s on mid-tier hardware/broadband" cold-load goal; treat anything past ~1 s FCP on high-end desktop as a signal to prune harder.** No clean before/after size table exists for a non-trivial game built specifically on Bevy 0.16–0.19 — **this is a measurement gap; instrument your own vertical slice with `twiggy` and record byte counts per release.**
+
+**Single-thread ECS ceiling (A.4) — browser compromise, established.** Under `wasm32-unknown-unknown`, Bevy's parallel scheduler runs serially and wgpu's WebGL/WebGPU objects are not `Send`/`Sync` across threads. The performance ceiling is workload-dependent (the more your frame is dominated by parallelizable ECS systems, the more you lose), and **no clean published Bevy single-thread-vs-multi-thread WASM benchmark exists — instrument this in the slice.** Enabling threads (`SharedArrayBuffer` + COOP/COEP) is available in the Bevy CLI as an unstable flag but forces cross-origin isolation, which breaks third-party embeds, image CDNs (unless they send CORP), OAuth/social sign-in popups, and payment checkout popups. **Go/no-go: NO browser threads at launch.** Rationale specific to this product: the platform *needs* OAuth sign-in and a payment-provider checkout for Mode 3, and those flows use popups that COEP breaks. Audio stutter on the single thread is a known Bevy WASM symptom; mitigate by keeping audio buffers generous and not blocking the main loop.
+
+**Runtime content/asset loading (A.5) — established.** Bevy's asset system loads at runtime on both targets; content bundles (Rhai + scene/BSN data + assets) are fetched and hot-swapped. Note that Bevy 0.19's new BSN scene format ships without a file loader — confirmed by the Bevy 0.19 release coverage (Medium, "Bevy 0.19 Just Dropped," Jun 2026): *"One honest caveat from the Bevy team: there is no first-party .bsn asset file loader yet. This release focuses on the code-driven workflow."* So a **custom content-bundle loader is required** rather than relying on a first-party scene-file loader.
+
+**Physics (A.6) — established, confirms the fixed decision.** `bevy_rapier` (and Avian) run on WASM. Rapier offers an `enhanced-determinism` feature giving bit-level cross-platform determinism on IEEE-754-2008 platforms including WASM — but the architecture **does not require it**, and `bevy_rapier` "does not (yet) provide good support for ensuring determinism and convenient rollback" anyway. Since physics/full verification lives only in Mode 3 (single authority, no peer re-simulation) and Mode 2 keeps physics out of peer-verified state, cross-platform determinism is genuinely not needed. This holds.
+
+### B. Scripting (Rhai)
+
+**Integration (B.1) — inferred/established.** Two live options: `bevy_mod_scripting` (Rhai + Lua, auto-generates ECS bindings from Bevy's reflection registry; pinned per Bevy patch version; `bevy_mod_scripting_rhai` was at 0.9.0-alpha.2 as of ~late 2025) and `bevy_scriptum` (callbacks-as-Bevy-systems, hot-reload built in). Both are real but young and churn with Bevy. **Recommendation: use `bevy_mod_scripting`'s pattern (reflection-driven bindings + callback labels like `on_update`) but expect to maintain a thin in-house binding layer, because you want a tightly *whitelisted* API surface, not the full auto-generated reflection surface.**
+
+**Sandbox hardening (B.2) — established.** Rhai is built for this: it has a "Don't Panic" guarantee, is "rugged" against stack-overflow/over-sized-data/runaway scripts, and exposes hard limits — max operations (instruction budget), max call depth, max string/array/map sizes, and progress/operation callbacks for timeouts. Use `Engine::new_raw` (registers *nothing*) and add only whitelisted packages, so scripts can't reach arithmetic you didn't grant, let alone I/O. Disable `eval`, module resolution/filesystem loading, and any custom function that touches the host. Keep `unchecked` **off** (it disables the very safety checks you need). Note the sandbox protects the *host machine from malicious content* — it is explicitly **not** anti-cheat (a modified client bypasses it entirely).
+
+**Hot reload (B.3) — established.** Both integration crates hot-reload Rhai on asset change, on native and browser.
+
+**Perf ceiling (B.4) — measured.** Per the Rhai official benchmarks page (rhai.rs/book/about/benchmarks.html), run on a 2.6 GHz Linux VM against Python 3 and V8/Node.js: *"In general, Rhai is roughly 2x slower than Python 3, which is a bytecodes interpreter, for typical real-life workloads."* The same source notes V8/LuaJIT "blow any interpreter out of the water," and Rhai clocks ~1M simple iterations in ~0.14 s on that VM. Because the cost is the tree-walk interpreter loop, **native does not meaningfully accelerate script-bound logic** — the same interpreter runs on both targets. Practical implication: Rhai is fine for per-entity/per-event high-level logic (spawn, score, state transitions) at modest call rates, and becomes the bottleneck if you try to run per-frame physics-like math or tight loops over many entities in script. Enable Fast Operators Mode (default on) and `only_i32`/`only_i64` to trim engine setup and speed operator-heavy scripts.
+
+**Escape hatch (B.5) — recommendation, inference.** Default is Rhai. When a piece of user logic is both perf-critical and needs hot-update, the escape ladder is: (1) expose a **precompiled Rust system** (a curated "verb" the script calls, e.g. `apply_area_damage`) — covers most cases; (2) native-only acceleration for that verb; (3) a WASM-component fast path only if a genuine general-purpose sandbox for user-authored hot code becomes necessary. **Boundary rule: reach for the escape hatch only when profiling shows script time exceeds ~10–20% of the frame budget; until then, Rhai remains default and you push math into Rust verbs, not new languages.**
+
+### C. Transport (WebRTC DataChannels)
+
+**Native/server stack (C.1) — recommend str0m (established/inferred).** `webrtc-rs` is the full-stack port of Pion but its async-callback design "require[s] locks and prevent[s] the idiomatic use of `&mut`," bloats the dependency tree, and has known upgrade-blocking issues. **str0m** is sans-IO (no internal threads/async, you own the socket loop), was built and battle-tested by Lookback as a server SFU, supports DataChannels, and multiple crypto backends (default `aws-lc-rs`). rust-libp2p explicitly evaluated migrating off `webrtc-rs` to str0m for these reasons. There is also `webrtc-rs/rtc` (a newer sans-IO rewrite of the webrtc-rs ecosystem, declared "feature complete" in a Jan 18 2026 post). **Recommendation: str0m for the Mode-3 hub and native peers** — its sans-IO model fits a fixed-tick authoritative loop cleanly and avoids the lock-heavy callback model. Concrete failure mode of choosing `webrtc-rs` instead: lock contention in hot paths and integration friction with Bevy's `&mut World` model.
+
+**Bevy P2P transport + signaling (C.2) — recommend Matchbox (established).** `matchbox_socket` 0.14 and `bevy_matchbox` 0.14 (released Feb 13 2026, tracking Bevy 0.18) give "udp-like, unordered, unreliable p2p connections in web browsers or native," support **both** reliable and unreliable channels with configurable ordering and retransmits, and ship `matchbox_server` as a signaling service. This maps directly onto the two-channel design. It's the de-facto WebRTC-DataChannel spine of the Bevy ecosystem (used with `bevy_ggrs`). **What matchbox provides:** channel setup, signaling handshake, peer connect/disconnect lifecycle, mesh or client-server signaling topologies. **What you must build on top:** per-entity replication, authority assignment, interest management, ownership handoff, anti-entropy — i.e., everything in section D. Maturity caveat: Matchbox is a small-team OSS project (Johan Helsing), ~41.6 k all-time downloads for `bevy_matchbox`; actively maintained (webrtc-rs bumped to 0.12, Rust toolchain bumps through 2026) but not a large-org-backed dependency — budget for occasional in-house patching.
+
+**Browser/native asymmetry (C.3) — established.** Matchbox already *is* the single abstraction: in-browser it drives the JS `RTCPeerConnection` via `wasm-bindgen`/`web-sys`; natively it uses `webrtc-rs` under the same `WebRtcSocket` API. Interop (browser peer ↔ native peer ↔ native server) works because all sides speak standard WebRTC/SCTP DataChannels. If the server side uses str0m instead of matchbox-native, both still interoperate over the wire because they implement the same standard — but you then maintain two WebRTC implementations under your abstraction, which is exactly the fixed design's "native and browser use different WebRTC implementations under one abstraction."
+
+**Channel configuration (C.4) — established.** Two `RTCDataChannel`s:
+- **Unreliable/unordered (high-freq state, 30–60 Hz):** `ordered: false`, `maxRetransmits: 0` (equivalently a very small `maxPacketLifeTime`). Last-write-wins positions/inputs; drop stale packets rather than resend. In Matchbox this is `ChannelConfig::unreliable()`.
+- **Reliable/ordered (durable events, ownership handoffs, resync):** `ordered: true`, no retransmit cap (`maxRetransmits`/`maxPacketLifeTime` both unset). In Matchbox this is `ChannelConfig::reliable()`. Note: you may set exactly one of `maxRetransmits` or `maxPacketLifeTime`, never both (WebRTC spec error otherwise).
+
+**Signaling (C.5) — established.** SDP/ICE exchange over WebSocket, integrated with the session registry — this is the central service in section I. `matchbox_server` (built on `matchbox_signaling`) is a starting point but you will extend it with mode/version filtering, matchmaking, and the session registry rather than run it stock.
+
+**NAT traversal per mode (C.6) — measured.** TURN-fallback rates vary sharply by deployment context. Per CelloIP (a firm citing 25+ WebRTC deployments), "WebRTC TURN Server Setup: Complete Production Guide 2026": *"In consumer-facing apps (mobile, home broadband) the TURN requirement is 15–20%. In enterprise B2B deployments with corporate firewalls, it rises to 40–60%."* Metered's write-up cites Chrome UMA telemetry that only ~20–25% of sessions ever traverse TURN. For a consumer game the practical planning figure is **~15–20% of peer-pairs need TURN** (higher on cellular/enterprise networks). **Mode 2: STUN-only** — that ~15–20% of peer-pairs behind symmetric NAT silently fail to connect (accepted). **Mode 3: provide TURN** via coturn. TURN cost is dominated by bandwidth ($0.05–0.15/GB typical cloud egress; self-hosted coturn on a ~$20–40/mo VPS vs $500–2000/mo managed at moderate volumes). Provision TURN credentials **only for authenticated paid sessions** using coturn's time-limited (REST/shared-secret) credentials, so free tiers cannot consume relay bandwidth.
+
+### D. State replication protocol — the pivotal build-vs-reuse verdict (D.1)
+
+**Verdict: build a custom per-entity replication protocol on top of the Matchbox transport. No existing crate can back all three modes by swapping only authority assignment.** Evidence:
+
+- **`lightyear` 0.26 (Jan 22 2026)** is the most feature-complete Bevy netcode (client prediction, rollback, interpolation, interest management, bandwidth priority accumulation, authority *transfer*). Its 0.21 rewrite deliberately made replication "agnostic to the roles of client and server," and 0.26 shipped fixes to authority transfer (PR #1338) and the distributed-authority example (PR #1339, "fix: fix distributed authority example"). **But it does not speak WebRTC DataChannels** — since 0.21 it defers all IO to the `aeronet` crate, whose transports are WebTransport, WebSocket, Steam, UDP, and in-memory channels. There is **no WebRTC-DataChannel IO layer** in lightyear or aeronet. Its own tagline is "server-authoritative … Compatible with wasm via WebTransport," and P2P topology is explicitly "aspirational / next steps," not tested. The transport is a hard incompatibility with the fixed WebRTC-DataChannels-only decision.
+- **`bevy_replicon` 0.38.2** is mature (123 k downloads, high test coverage, `no_std`), transport-agnostic (bring your own messaging backend), and cleanly abstracts singleplayer/client/dedicated/listen-server. But replication is **server→client only, by design, "to prevent cheating."** It is central-authority-only; bending it to Mode-2 distributed per-peer authority means fighting its core invariant.
+- **`renet`/`aeronet`** are transport/channel layers, not replication; renet notably lacks WebSocket/WebTransport (and WebRTC), so it's a non-starter for browser.
+
+So the three modes cannot be produced by "swap authority assignment on one crate," because (a) the WebRTC-capable transport (Matchbox) has no replication layer, and (b) the replication-capable crates have no WebRTC transport and each hard-codes an authority topology opposite to at least one of your modes. **The fixed architecture's own thesis — one replication mechanism, authority assignment the only variable — is exactly what you must implement yourself.** The upside: the design is well-understood, and you can lift proven *techniques* (not code) from lightyear (prediction/rollback/interpolation buffers, priority-accumulation bandwidth capping, interest via rooms) and from the snapshot-interpolation literature.
+
+**Wire format (D.2) — recommend `bitcode`, fall back to `postcard` (measured).** For compact fast versioned encoding: `bitcode` is a bitwise serializer that "comes out at the top of nearly every benchmark" in the community Rust serialization benchmark and sorts enum variants to occupy fewer bits; `postcard` is the conservative, embedded-grade choice (~41 bytes on the standard test struct, ~1.5× slower than bincode at ~70% of its size). Layer on: **state quantization/bit-packing** (positions to fixed-point, angles to bytes), **delta encoding** against the last acked snapshot, and per-component dirty flags. **Recommendation: `bitcode` for the hot state channel (bit-packing is exactly its strength), `postcard` for durable/reliable events where readability of the format contract and stability matter more. Version every message with the {engine, content, schema} triple so receivers can reject incompatible encodings.** Snapshot-vs-delta: send periodic keyframe snapshots + deltas between them, so late joiners and post-loss recovery have a resync point.
+
+**Prediction/interpolation & tick rate (D.3) — established/inferred.** Predict entities you own (with reconciliation on authority correction); interpolate entities others own with an interpolation delay buffer (typically ~2 snapshots / ~100 ms) to smooth 20–30 Hz network updates up to display rate. **Start at a 20–30 Hz network tick with client interpolation to 60+ FPS render** — lightyear's demo runs the server at 10 Hz and still looks smooth via interpolation, which validates that a low network tick + interpolation is viable. Buffer sizing: interpolation buffer ≥ 2× the send interval; input/prediction buffer sized to worst-case RTT. **Bandwidth: no first-party measured number exists for this exact protocol — measure it in the slice.** Order-of-magnitude planning figure (inference): at ~15 bytes/entity/tick quantized + delta, 50 visible entities at 20 Hz ≈ 15 KB/s per peer downstream per remote peer — which is why Mode-2 full mesh upstream is the binding constraint (see risk register).
+
+**Interest management / AOI (D.4) — established pattern.** Use a spatial grid or spatial-hash over entity positions; each peer replicates only entities within an area of interest. In Mode 2 this bounds per-peer upstream bandwidth; in Mode 3 withholding out-of-AOI state is the **read-cheat mitigation** (the client literally never receives what it shouldn't see). Implement as a Bevy system that buckets entities into grid cells each tick and computes per-recipient visibility sets; lightyear's "rooms" and `bevy_replicon`'s component-based visibility layers are reference implementations of the same idea.
+
+**Ownership transfer — the Mode-2 sharp edge (D.5) — recommendation, inference.** Protocol: authority is per-entity, default-owned by spawner/controller. Handoff is an **owner-initiated, signed, reliable-channel** message ("I, current owner, transfer entity E to peer B at tick T"). To prevent two peers both claiming E, route contested claims through the **coordinator** peer, which arbitrates with a deterministic tiebreak (lowest peer-ID wins). Failure modes to handle explicitly: (i) **owner drops mid-handoff** — the coordinator times out the pending transfer and reassigns via join-order election (oldest surviving peer), same mechanism as host migration; (ii) **race — two peers claim an ownerless entity** — coordinator serializes claims, lowest-ID wins, losers get a rejection on the reliable channel and must re-request; (iii) **handoff message lost** — reliable channel retransmits; the new owner does not assume authority until it receives the coordinator's commit. Latency: a handoff costs at least one RTT to the coordinator plus one to the new owner (~2 × one-way latency, i.e. tens to low-hundreds of ms), during which the entity is briefly frozen/interpolated. **Deliberately exercise one A→B handoff in the first slice** to hit this early.
+
+**Cross-owner interaction (D.6) — characterize, do not eliminate (inference).** When an A-owned and a B-owned entity interact in Mode 2, no single peer is authoritative over both, so the outcome is resolved by **predict-and-correct** (each peer predicts locally, then corrects toward the owner's replicated result) or **rule-arbitration** (a deterministic rule assigns resolution to one owner, e.g. "the entity being hit is authoritative over the hit"). Visible jank appears on mismatch, bounded by the correction interval and interpolation delay — expect **~one interpolation-buffer's worth (~100 ms) of visible snap** in the worst case for a contested interaction. This is *the* Mode-2-vs-Mode-3 quality gap: Mode 3's single authority eliminates it entirely. **Bound it: keep cross-owner interactions coarse (positional overlap, not frame-perfect collision) in Mode 2; reserve competitive/precise interaction for Mode 3.**
+
+**Anti-entropy / resync without CRDT (D.7) — established mechanism.** Periodically (e.g. every N ticks) each owner sends a **state hash** for its entities on the reliable channel; a receiver whose local hash diverges (or a late joiner) requests a **full-state refetch** of those entities from the owning peer. On reliable-channel drop/reconnect, the rejoining peer requests a full snapshot before resuming delta application. Single-ownership means there is never a merge — the owner's state is authoritative and simply overwrites, which is precisely why CRDT is unnecessary.
+
+### E. Anti-cheat & verification
+
+**Mode-2 plausibility/bounds (E.1) — established pattern.** A receiving peer can cheaply check: speed/velocity caps (position delta ÷ time ≤ max), rate limits (messages/sec per entity), value ranges (HP within [0, max]), and state-machine legality (can't teleport, can't act while dead). What a peer **cannot** cheaply verify: hidden-information correctness, whether an input was "really" pressed, or global consistency — those need an authority. This is tamper-*evidence*, not prevention.
+
+**Signed ops (E.2) — measured.** Per the official ed25519-dalek docs ("Performance" section, Intel Skylake i9-7900X @ 3.3 GHz): *"Ed25519 signing time: [15.617 us 15.630 us 15.647 us] Ed25519 signature verification time: [45.930 us 45.968 us 46.011 us]"*, and batched verification via `verify_batch()` is "greatly improved" (~18.4 µs/sig). At 60 Hz, signing every outbound message costs ~0.9 ms/s of one core — negligible. Verification is the cost center: verifying 60 msg/s from each of, say, 8 peers = 480 verifications/s ≈ 22 ms/s of one core single-shot, or far less batched. **On native this is trivial; in the browser (single-thread, WASM-compiled dalek, no AVX2) expect several × slower — this is a browser compromise to measure.** **Recommendation: always sign the reliable/durable channel (handoffs, events, resync) — low volume, high stakes; make per-frame state-channel signing a configurable option, default ON for native peers/server and evaluated-under-load for browser peers.** Confirm: signing gives tamper-evidence (you can prove peer X sent message M), not semantic-cheat prevention (a signed message can still contain a cheated-but-plausible value).
+
+**Mode-3 server-authoritative validation (E.3) — established.** The authoritative headless-Bevy sim validates all client inputs (legality, rate, plausibility), runs the only physics/full verification, and owns all entities. Interest management (D.4) is wired as read-cheat mitigation: clients receive only their AOI. This is the strongest guarantee the platform offers and is why it's the paid, Sybil-resisted tier.
+
+**Trust model per mode (E.4) — see section L.**
+
+### F. Identity, accounts, billing, persistence
+
+**Device keypair (F.1) — inference/browser compromise.** Browser: generate a keypair via **WebCrypto with a non-extractable private key**, persisted in **IndexedDB** (CryptoKey objects are storable). Survivability: keys are lost if the user clears site data / storage is evicted under pressure — near-anonymous free identity is therefore **best-effort, not durable**, which is acceptable for free tiers. Native: store in the **OS keyring** (Keychain/Credential Manager/Secret Service) via a Rust keyring crate. Portability/recovery: because the private key is non-extractable in-browser, cross-device identity portability requires re-binding to an authenticated account — another reason paid Mode 3 requires a real account.
+
+**Auth & billing (F.2) — established.** Email + auth provider for Mode 3; billing via a hosted payment provider (Stripe or similar) so **raw card data never touches your systems** (the provider's hosted checkout/Payment Element handles PCI scope). Subscription lifecycle (active/past-due/canceled) maps to a Mode-3 entitlement flag checked at matchmaking. Note the COEP/threads conflict (K.1): the payment popup is a reason not to enable cross-origin isolation.
+
+**Persistence (F.3) — established.** Postgres for platform state (identity, billing, published-content metadata, rankings, match records); object storage for content bundles/assets and opt-in save snapshots. **Content-addressing:** hash the content bundle (e.g. BLAKE3/SHA-256) → the hash is the immutable content ID and the object-store key, giving free dedup and cache-busting.
+
+### G. Publish pipeline & versioning
+
+**Content-addressed IDs & bundle format (G.1) — established/inference.** A published game is a bundle packaging Rhai scripts + assets + scene/scene-graph data + a version-metadata manifest, hashed to an immutable content ID. Because Bevy 0.19 has no first-party `.bsn` file loader yet (per the release coverage cited in A.5), the bundle uses your own manifest + loader, not a stock scene file.
+
+**Version triple (G.2) — established rule.** `{engine, content, schema}`. Matchmaker enforces at join: **engine ≥ content's declared minimum engine**, and **exact content + schema match** between grouped players (you can't force-update clients, so join is version-gated and the matchmaker filters incompatible versions into separate pools). Schema migrations ship as new content versions; old sessions keep running their pinned version.
+
+**UGC moderation (G.3) — inference/realism.** At the publish chokepoint: automated scanning (hash-matching against known-illegal-content databases for images/textures; automated classifiers for imagery; static scan of Rhai for disallowed patterns) + a human report/review queue. Realistically automatable: known-bad hash matching, format/size validation, obvious-classifier hits. **Requires human review:** context-dependent policy calls, novel content, appeals. This is the platform's sole moderation vantage (no in-session chat to moderate), which both narrows and concentrates the T&S surface.
+
+### H. Hot update & distribution
+
+**Content hot-reload (H.1) — established.** Fetch new content bundle by content ID, swap Rhai + assets + scene data at runtime on both targets; content-addressing makes cache invalidation automatic (new hash = new URL).
+
+**Engine updates (H.2) — established/inference.** Engine/binary is versioned, not hot-reloaded. Browser: new WASM served with cache-busting (hashed filename) and a **service worker** (also the standard workaround for setting COOP/COEP later if ever needed); the tab reloads to pick up a new engine. Native: an **auto-updater** (e.g. a self-update crate) downloads the new signed binary and relaunches. Distribute native builds as **plain signed executables per OS (code-signed .app/.exe, notarized on macOS) — NOT wrapped in a webview** (native uses native winit + native wgpu backends, the whole point of the native path).
+
+**Version-gating (H.3) — established.** Enforced at session join by the matchmaker (G.2) — the desync defense.
+
+### I. Session/matchmaking/coordination service
+
+**Design (I.1) — inference.** One deployable WebSocket service providing: WebRTC signaling (SDP/ICE relay), session registry/listing, mode + version filtering, and matchmaking. Message protocol: JSON or a compact binary over WS (announce, list, join-request, signal-relay, match-found). Required for **every** mode including free — this is the one always-on piece. Reference base: `matchbox_signaling`/`matchbox_server`, extended.
+
+**Coordinator election & host migration (I.2) — established (join-order).** In Mode 2 the coordinator peer holds session bookkeeping only. Host migration = **oldest surviving peer inherits by join-order election**; the same timeout+reassign mechanism arbitrates contested ownership handoffs (D.5).
+
+**Scaling (I.3) — inference.** Keep it **stateless per connection** with session state in a shared store (Redis/Postgres) so it scales horizontally behind a load balancer; WebSocket sessions are sticky but the registry is shared. This is the component whose availability gates the entire platform, so it gets the highest reliability budget.
+
+### J. Mode-3 orchestration & infrastructure (paid tier)
+
+**Per-session sim processes (J.1) — inference.** On match, spin up a headless-Bevy authoritative server, admit matched players, tear down at session end. **Container-per-session** gives clean isolation and simple teardown; **pooled/pre-warmed processes** cut cold-start latency at the cost of idle capacity. Cost scales with **concurrent sessions, not total users** — the key to subscription economics (a subscriber not currently in a Mode-3 match costs nothing in sim compute).
+
+**Orchestration (J.2) — measured tradeoff.** Options: **Agones** (open-source, Kubernetes-based, fleet + FleetAutoscaler, one GameServer pod per session; free license but heavy — needs deep k8s expertise and ~1 FTE, 20–30% idle fleet waste, and documented **10–15 min scale-up boot times** in the worst case per KRAFTON's PUBG migration at AWS re:Invent 2024) vs **managed fleets** (Edgegap ~3 s cold-start claims; Gameye ~0.5 s from warm pool, per-second billing). **Recommendation: start on a managed session-based orchestrator (per-second billing, no idle waste, ~seconds cold-start) to match subscription economics; consider self-hosted Agones only if scale makes the managed premium exceed a dedicated infra hire.** Matchmaking→server handoff: matchmaker requests an allocation, receives the server's ip:port + a connect token, returns it to matched clients, which then open WebRTC DataChannels to that hub (over TURN as needed).
+
+**TURN for Mode 3 (J.3) — measured.** coturn (or managed TURN), credentials issued only for paid sessions; bandwidth-dominated cost as in C.6.
+
+### K. Cross-cutting WASM/browser constraints
+
+- **K.1 Threads:** covered in A.4 — **no-go at launch**; the COOP/COEP requirement breaks OAuth + payment popups + third-party embeds, which this product needs.
+- **K.2 Memory:** wasm32 caps a single linear memory at **4 GB** architecturally, and browsers cap lower (commonly ~4 GB per tab historically; ~16 GB is the newer per-tab ceiling with Memory64). **Memory64** shipped in Wasm 3.0 (Chrome/Firefox on by default; Safari lagging) but carries a bounds-check performance penalty and larger pointers, and doesn't help a game that fits in 4 GB. **Recommendation: stay wasm32; budget a content-heavy session to well under ~2 GB** (many user machines lack free memory beyond that, and fragmentation causes OOM before the hard cap). Do not adopt Memory64 unless a session genuinely needs >4 GB — it's not worth the perf hit and Safari gap.
+- **K.3 Persistent storage:** keypairs + save/asset cache in IndexedDB / Cache API; subject to **quota and eviction under storage pressure** — treat browser-persisted identity and cache as evictable, refetchable by content ID.
+- **K.4 Cold-load synthesis:** see A.3 — brotli, feature pruning, `wasm-opt`, lazy assets; show UI before full load.
+
+### L. Security & trust-model synthesis
+
+**End-to-end statement.** The platform's trust model is deliberately tiered, and the browser removes attestation everywhere:
+
+- **Root assumptions (all modes):** clients are **not attestable** in the browser (no secure attestation primitive), so a modified/instrumented client is always possible. The Rhai sandbox protects the *host machine from malicious UGC*; it does **nothing** against a modified client. Signing proves *who sent* a message (tamper-evidence), never that the message's contents are honest.
+- **Mode 1 (Standalone):** no network, no authority contest, no anti-cheat needed; the only residual surface is malicious UGC, handled at publish (G.3).
+- **Mode 2 (Hybrid, free):** each peer is authoritative over its own entities. Guarantees: plausibility/bounds checks (E.1) **detect** implausible state; signed ops (E.2) make tampering **attributable**. Does NOT prevent: a peer lying within plausible bounds about its own entities, hidden-information cheats, or Sybil/collusion (multiple fake peers). Symmetric-NAT peers (~15–20%) silently fail to connect. This is explicitly *tamper-evident, not cheat-proof.*
+- **Mode 3 (Full-Server, paid):** central authority owns all entities, runs the only physics/full verification, validates all inputs, and withholds out-of-AOI state as read-cheat mitigation. **Payment is the Sybil resistance** — spinning up N fake identities costs N subscriptions. This is the only mode suitable for competitive integrity, and even here a modified client can still cheat on *inputs it's allowed to send* (aim, timing) — server validation catches impossible inputs, not superhuman-but-possible ones.
+- **Residual surface across the platform:** UGC content at the publish chokepoint (the sole moderation vantage), the always-on signaling/matchmaking service (availability + abuse target), TURN bandwidth abuse (mitigated by paid-only credentials), and the fundamental browser-attestation ceiling that caps all client-side trust.
+
+## Architecture (Deliverable 3)
+
+**Central services (shared by all modes):**
+```
+                 ┌─────────────────────────────────────────────┐
+                 │  CENTRAL SERVICES (always-on, you operate)   │
+                 │                                              │
+   [Publish] ───►│  Publish pipeline ──► content-addressed IDs  │
+   (author)      │      │  (moderation scan + review queue)     │
+                 │      ▼                                        │
+                 │  Object store (bundles/assets/saves) + Postgres (identity,
+                 │  billing, content meta, rankings, match records)          │
+                 │                                              │
+                 │  Signaling + Session registry + Matchmaking (WebSocket)   │
+                 │      (mode & version filtering; SDP/ICE relay)│
+                 │                                              │
+                 │  [Mode-3 only] Server fleet orchestrator + TURN (coturn)  │
+                 └─────────────────────────────────────────────┘
+```
+**Mode 1 (Standalone):** single client (browser WASM or native), local authority over all entities, no network. Trust boundary: the device only.
+
+**Mode 2 (Hybrid P2P mesh):**
+```
+ Browser peer A ◄──WebRTC DataChannels──► Browser/native peer B
+   (auth: A's entities)     mesh          (auth: B's entities)
+        ▲   ▲                                   ▲
+        │   └── signaling/STUN via central WS ──┘
+        │        coordinator peer = bookkeeping + handoff arbitration
+   Trust boundary per peer: each trusts only its own entities;
+   receives others' state as tamper-evident-but-not-verified.
+```
+**Mode 3 (Full-Server hub, paid):**
+```
+   Clients ──WebRTC DataChannels (+TURN)──► Headless-Bevy authoritative server
+                                              (owns ALL entities, runs physics,
+                                               validates inputs, AOI-gates reads)
+   Trust boundary: the server is the single source of truth; clients trusted
+   only to submit inputs, which are validated.
+```
+
+## Recommendations
+
+**Concrete stack (Deliverable 1).**
+
+| Workstream | Choice | Version / date (as of Jul 2026) | Maturity | WASM/native | Justification | Label |
+|---|---|---|---|---|---|---|
+| A Engine | Bevy | 0.19 (Jun 19 2026) | Active, pre-1.0, breaking each release; Tiny Glade shipped | Both (WASM WebGL2 default, WebGPU gated) | Fixed decision; ECS fits data-driven UGC | established |
+| A Render | wgpu (via Bevy) | tracks Bevy 0.19 | Powers Firefox/Servo/Deno WebGPU | Both; browser = build-time WebGPU/WebGL2 choice | Runtime backend native only; 2 web builds | established |
+| A Physics | bevy_rapier | tracks Bevy | Battle-tested | Both incl. WASM | Mode-3-only; determinism not required | established |
+| B Script | Rhai (+ bevy_mod_scripting pattern) | Rhai current; `bevy_mod_scripting_rhai` 0.9.0-alpha.2 | Rhai mature; integration young/churns | Both (Rhai runs in WASM) | Fixed decision; hard sandbox limits | established (Rhai) / inferred (integration) |
+| C Transport (browser P2P) | Matchbox / bevy_matchbox | 0.14 (Feb 13 2026) | Small-team OSS, active; de-facto WebRTC-DC spine | Both | Only mature browser+native WebRTC-DataChannel lib | established |
+| C Transport (native/server) | str0m | current | Battle-tested server SFU (Lookback) | Native/server | Sans-IO fits fixed-tick loop; avoids webrtc-rs locks | established |
+| C Signaling/TURN | matchbox_signaling + coturn | coturn current | coturn is industry standard | Server | Paid-only TURN credentials | established |
+| D Replication | **Custom protocol** | — | You build it | Both | No crate has WebRTC-DC + per-entity distributed authority | established (verdict) |
+| D Wire format | bitcode (hot) / postcard (durable) | current | bitcode tops benchmarks; postcard embedded-grade | Both | Bit-packing + delta for bandwidth | measured |
+| E Crypto | ed25519-dalek | current | Widely used | Both (slower in WASM) | Cheap signing at 30–60 Hz | measured |
+| F/G Persistence | Postgres + object store (content-addressed) | — | Industry standard | Server | Durable platform state | established |
+| F Billing | Hosted payment provider (Stripe-class) | — | Standard | — | Raw card data never touches your systems | established |
+| I Signaling/matchmaking | Custom WS service (Axum/tokio-class) | — | You build it | Server | Always-on, all modes | inferred |
+| J Orchestration | Managed session fleet (Edgegap/Gameye-class); Agones if scale demands | — | Managed = seconds cold-start; Agones = heavy | Server | Per-session cost matches subscription | measured tradeoff |
+
+**Risk register (Deliverable 5).**
+
+| Subsystem | Risk | Likelihood | Severity | Mitigation | Confidence |
+|---|---|---|---|---|---|
+| D.5 Ownership transfer | Two peers both claim an entity; handoff during peer drop | Med | High (dupes/desync) | Coordinator-arbitrated, lowest-ID tiebreak, reliable-channel commit, timeout→join-order reassign | Med (custom, untested) |
+| D.6 Cross-owner interaction | Visible jank (~100 ms) on contested interactions | High (intrinsic) | Med | Keep Mode-2 interactions coarse; precise play → Mode 3 | High |
+| L Browser attestation | Modified client cheats undetectably | Certain | High (free modes) | Accept; gate competitive to paid Mode 3 | High |
+| B.4 Rhai perf | Script time dominates frame | Med | Med | Rust "verb" escape hatch at 10–20% budget | High (benchmarked) |
+| C.6 STUN-only | ~15–20% peer-pairs can't connect (Mode 2) | High | Med | Accept in Mode 2; Mode 3 provides TURN | High (measured) |
+| J TURN/orchestration cost | Relay bandwidth + fleet cost | Med | Med | Paid-only TURN creds; managed per-second fleet | High |
+| G.3 UGC moderation | Illegal/harmful content published | Med | High (legal) | Hash-match + classifier + human queue at chokepoint | Med |
+| A.4/K.1 Single-thread ceiling | Frame budget blown on complex sessions | Med | Med | Ship single-thread; push work to Rust; measure | Med (no bench) |
+| A.3 Binary/cold-load | Slow first load, especially mobile | High | Med | wasm-opt/brotli/prune/lazy assets; UI-before-load | Med (measured elsewhere) |
+
+**Benchmarks to run where data is missing (Deliverable 4).** (1) **WASM size + cold load:** build the Slice-0 binary, record uncompressed/`wasm-opt`/brotli sizes with twiggy and FCP across desktop + mid-tier + mobile. (2) **Rhai throughput:** run realistic game-logic scripts, measure calls/frame before script time hits ~10–20% of a 16 ms budget. (3) **Replication bandwidth:** log bytes/peer/tick at 20/30 Hz for 10/50/100 entities. (4) **Mode-2 mesh ceiling:** increase peer count until per-peer *upstream* saturates a typical home uplink (~5–10 Mbit) — this, not CPU, sets the max mesh size. (5) **Per-message crypto:** measure dalek sign/verify in-browser (WASM, no AVX2) at 60 Hz × N peers.
+
+**Phased build sequence (Deliverable 6) — vertical slice first.**
+
+1. **Slice 0 — the load-bearing proof (do this first).** One ownership-explicit Bevy + Rhai mini-game. Two peers over a WebRTC DataChannel (Matchbox), each authoritative over its own entities, replicating quantized snapshots on the unreliable channel + events on the reliable channel (Mode 2). **Then run the exact same simulation headless-authoritative (Mode 3)**, proving swapping ONLY authority assignment yields both modes with no logic fork. **Deliberately execute one A→B ownership handoff mid-session** to hit the sharp edge (D.5) early. Instrument: WASM binary size (twiggy), cold load, single-thread frame budget, replication bandwidth/peer, per-message sign/verify cost in-browser. This slice retires the four biggest unknowns at once.
+2. **Slice 1 — transport hardening:** str0m native/server peer interop with browser peers; two-channel config; STUN-only connectivity + TURN fallback measurement.
+3. **Slice 2 — replication depth:** delta compression, interest management (AOI grid), prediction/reconciliation/interpolation buffers, anti-entropy resync.
+4. **Slice 3 — Mode 3 infra:** headless server orchestration, matchmaking→server handoff, TURN provisioning, entitlement gating.
+5. **Slice 4 — platform:** identity/keypairs, auth + billing, Postgres/object-store, publish pipeline + version triple + moderation queue, hot-update + native auto-updater.
+6. **Slice 5 — polish/scale:** signaling service horizontal scaling, cold-load optimization pass, single-thread audio mitigation.
+
+Dependencies: everything depends on Slice 0's replication protocol; Mode 3 infra (3) depends on transport (1); platform (4) is largely parallel but publish pipeline gates real UGC.
+
+**Compromise ledger (Deliverable 7).**
+
+| Browser compromise vs native | Quantified cost | Recommended stance |
+|---|---|---|
+| Serial ECS (no thread parallelism) | Workload-dependent; native gets N-core parallel scheduling, browser gets 1 | Ship single-thread; push hot work to Rust; measure headroom |
+| WebGPU/WebGL2 not one binary | 2× build+CDN artifacts + detection shim | Build twice, detect `navigator.gpu`, serve match |
+| Binary size + cold load | 10–44 MB uncompressed / 1.4–6.6 MB brotli; ~1 s+ FCP | Prune/wasm-opt/brotli/lazy assets; UI before load |
+| No attestation | Client-side trust = 0 in free modes | Accept; competitive gated to paid Mode 3 |
+| Threads require COOP/COEP | Breaks OAuth + payment popups + third-party embeds | Do not enable at launch |
+| Memory ceiling (wasm32 4 GB, browser lower) | Practical budget <2 GB before OOM/fragmentation | Stay wasm32; skip Memory64 unless >4 GB needed |
+| Non-extractable keys, evictable storage | Free identity is best-effort, not durable | Accept for free; real account for Mode 3 portability |
+| WASM crypto (no AVX2, single-thread) | dalek verify several× slower than the native ~46 µs | Always sign reliable channel; state-channel signing measured/configurable |
+| STUN-only connectivity | ~15–20% peer-pairs fail (symmetric NAT) | Accept in Mode 2; TURN in paid Mode 3 |
+
+**Thresholds that change the recommendations.** Enable browser threads only if (a) profiling shows single-thread ECS is the dominant frame cost AND (b) you can drop OAuth/payment popups or a `COOP: restrict-properties`-class solution ships cross-browser. Adopt Memory64 only if a session provably needs >4 GB. Move Mode-3 orchestration in-house (Agones) only when managed-fleet spend exceeds a dedicated infra engineer's cost. Reach for a scripting escape hatch only when Rhai exceeds ~10–20% of frame budget.
+
+## Caveats
+
+- **Version churn:** Bevy is pre-1.0 and breaks APIs every ~3 months; every ecosystem crate (Matchbox 0.14, lightyear 0.26, bevy_replicon 0.38, bevy_mod_scripting 0.9-alpha) tracks a specific Bevy version. Expect continuous migration cost; pin versions and budget upgrade time.
+- **Measurement gaps flagged in-line:** no clean before/after WASM size table for a non-trivial Bevy 0.16–0.19 game; no published Bevy single-thread-vs-multithread WASM benchmark; no first-party replication-bandwidth number for this exact protocol; browser-side dalek verification cost not directly measured. These are explicitly assigned to the Slice-0 instrumentation.
+- **Small-team dependencies:** Matchbox and the Rhai-Bevy integration crates are small-maintainer OSS — real and working, but budget for in-house patching rather than assuming large-org support. str0m is maintained by Lookback for their own SFU use case, so P2P paths get less testing than server paths.
+- **The Mode-2 quality gap is intrinsic, not a bug:** cross-owner interaction jank (~up to one interpolation buffer, ~100 ms) and ~15–20% symmetric-NAT connection failure are accepted properties of the free tier, by design. Competitive integrity lives only in paid Mode 3.
+- **Trust ceiling is permanent:** browser clients cannot be attested; no amount of engineering closes hidden-information or Sybil/collusion cheats in the free modes. Payment is the only Sybil resistance, and even Mode 3 cannot stop plausible-but-cheated inputs.
