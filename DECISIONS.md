@@ -86,3 +86,26 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
 - **Consequences:** clippy blocks turn-end; both clippy and tests block a commit. Least-disruptive
   design that still satisfies "blocking clippy + test gate."
 - **Status:** Accepted.
+
+## ADR-0010 — Nix flake devShell owns Rust + the WASM toolchain; direnv auto-activation
+- **Context:** `wasm-bindgen`, `wasm-opt`, `brotli`, `twiggy`, and `node`/`npx` were all absent on the WSL2
+  host (the ambient `npx` was a `/mnt/c/...` Windows-interop shim over a missing WSL node), blocking the build
+  pipeline and the MCP servers. The host already had Nix 2.33 (flakes on) + direnv 2.37 + nix-direnv 3.1.2.
+  This **supersedes** the earlier informal "there is no Nix dev-shell — call `cargo` directly" stance recorded
+  in `PROJECT_STATE.md` / the skill.
+- **Decision:** a per-repo `flake.nix` `devShells.default` provides a **pinned Rust toolchain** (via
+  `oxalica/rust-overlay`, `wasm32-unknown-unknown` target + clippy/rustfmt/rust-src) **and** `wasm-bindgen-cli`,
+  `binaryen` (wasm-opt), `brotli`, `twiggy`, `nodejs`. `.envrc` is `use flake`; `flake.lock` is committed so the
+  whole toolchain (including cargo/rustc — realizing ADR-0007's pinning intent for Rust itself) is reproducible.
+  Interactive `cd` auto-activates via the existing direnv hook + nix-direnv. The non-interactive WSL wrapper is
+  **targeted**: cargo/WASM-tool/npx commands get a `direnv exec .` prefix; pure git/python3-only commands are
+  unchanged. Cargo/tool-bearing **scripts self-activate** (`eval "$(direnv export bash)" 2>/dev/null || true`
+  after their `cd`) — `scripts/build-wasm.sh`, `scripts/hooks/gate-clippy.sh`, `scripts/hooks/fmt-on-write.sh`,
+  `scripts/git-hooks/pre-commit` — so they hit the flake however invoked, falling back to ambient rustup if the
+  env is unavailable.
+- **Consequences:** one-time `direnv allow` per clone; first build fetches the toolchain from the nix cache
+  (minutes, cold). rustup (cargo 1.92) still exists ambiently — only *routed* commands use the flake (1.96.1);
+  the ambient fallback is benign. `wasm-bindgen-cli` must match the `wasm-bindgen` crate version once Bevy is
+  added — handled by a commented `.override` in `flake.nix`, decoupled from the nixpkgs rev. `.mcp.json` `npx`
+  invocations route through `direnv exec`. `.direnv/` and `/result` are gitignored.
+- **Status:** Accepted (2026-07-09).

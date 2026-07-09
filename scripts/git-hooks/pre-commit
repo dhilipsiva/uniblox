@@ -5,6 +5,10 @@ set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
 
+# Self-activate the flake devShell (DECISIONS.md ADR-0010) so fmt/clippy/test run
+# under the pinned toolchain; falls back to ambient rustup if unavailable (graceful).
+eval "$(direnv export bash 2>/dev/null)" 2>/dev/null || true
+
 echo "[pre-commit] cargo fmt --check"
 if ! cargo fmt --check; then
   echo "[pre-commit] FAILED: run 'cargo fmt' and re-stage." >&2

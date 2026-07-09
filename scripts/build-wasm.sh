@@ -13,6 +13,11 @@
 set -euo pipefail
 cd "$HOME/projects/dhilipsiva/uniblox"
 
+# Self-activate the flake devShell (DECISIONS.md ADR-0010) so wasm-bindgen/wasm-opt/
+# brotli/twiggy + the pinned cargo resolve however this script is invoked; falls back
+# to ambient rustup if the env is unavailable (graceful).
+eval "$(direnv export bash 2>/dev/null)" 2>/dev/null || true
+
 for t in wasm-bindgen wasm-opt brotli; do
   if ! command -v "$t" >/dev/null 2>&1; then
     echo "MISSING tool: $t"
@@ -33,7 +38,11 @@ emit () {
   local out="dist/${variant}"
   mkdir -p "${out}"
   wasm-bindgen --target web --no-typescript --out-dir "${out}" --out-name client "${RAW}"
-  wasm-opt -Oz --converge -o "${out}/client_bg.opt.wasm" "${out}/client_bg.wasm"
+  # `-all` enables all wasm features so validation accepts modern rustc output
+  # (bulk-memory/memory.copy, sign-ext, etc.); wasm-bindgen strips the
+  # target_features section wasm-opt would otherwise auto-detect. All these
+  # features are baseline in modern browsers.
+  wasm-opt -all -Oz --converge -o "${out}/client_bg.opt.wasm" "${out}/client_bg.wasm"
   brotli -f -q 11 "${out}/client_bg.opt.wasm"
   printf '  %-8s raw=%s  bindgen=%s  wasm-opt=%s  brotli=%s (bytes)\n' "${variant}" \
     "$(stat -c%s "${RAW}")" \

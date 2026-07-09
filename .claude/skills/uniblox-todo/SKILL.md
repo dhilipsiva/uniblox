@@ -21,22 +21,30 @@ anything.
 ## Environment
 
 This project lives on WSL2 (Ubuntu); the Windows working dir is a UNC view of the Linux filesystem, and
-git run from the Windows side fails with "dubious ownership." Run every shell command through the wrapper:
+git run from the Windows side fails with "dubious ownership." Run shell commands through the wrapper:
 
 ```
+# general (git, file, python3) commands:
 wsl -d Ubuntu -e bash -lc "cd ~/projects/dhilipsiva/uniblox && <CMD>"
+
+# cargo / WASM-tool / npx commands — prefix with `direnv exec .` to enter the flake env:
+wsl -d Ubuntu -e bash -lc "cd ~/projects/dhilipsiva/uniblox && direnv exec . <CMD>"
+# compound cargo chains: direnv exec . bash -lc '<a && b>'  (bare `direnv exec . a && b` runs b OUTSIDE the env)
 ```
 
-Toolchain notes (these differ from nibli — do not copy nibli's Nix/`just` habits):
+Toolchain notes (these differ from nibli — do not copy nibli's habits):
 
-- `cargo` is on PATH directly in the login shell (currently cargo 1.92; edition 2024 needs Rust ≥ 1.85).
-  There is **no Nix dev shell and no `just`** here — call `cargo` directly.
-- The **two-WASM-build** pipeline (WebGPU + WebGL2), `wasm-bindgen`, `wasm-opt`, and the `/build-wasm` and
-  `/slice-check` slash commands are `TODO.md` **Phase 1.1 deliverables — not scaffolded yet**. Use them
-  once they exist; until then verify with plain `cargo`. If a `flake.nix`/`Justfile` gets added later, wrap
-  toolchain commands accordingly.
-- `.claude/` is tracked (this skill file is committed); only `/target` and the local
-  `.claude/settings.local.json` are gitignored — no force-add needed.
+- **The toolchain comes from a Nix flake devShell** (`flake.nix`, `DECISIONS.md` ADR-0010): pinned Rust
+  (cargo/rustc/clippy/rustfmt, wasm32 target, currently 1.96) + `wasm-bindgen`/`wasm-opt`/`brotli`/`twiggy`/
+  `node`, all pinned by `flake.lock`. Run **`direnv allow`** once per clone. Interactive `cd` auto-activates
+  (direnv + nix-direnv, already installed); the WSL wrapper enters it via the `direnv exec .` prefix above.
+  Ambient rustup (cargo 1.92) is a benign fallback for un-routed commands. No `just` here.
+- The **two-WASM-build** pipeline (`scripts/build-wasm.sh`) + `/build-wasm` and `/slice-check` are
+  **scaffolded**; the WASM tools are present (via the flake), so `build-wasm.sh` **runs end-to-end**; on the
+  current stub the output is byte-identical, KB-sized wasm — **meaningless** for the size budget until the Bevy
+  client renders (Phase 1.3–1.6). Do NOT claim stub sizes as the size-budget measurement.
+- `.claude/` is tracked (this skill file is committed); `/target`, `/dist`, `/result`, `.direnv/`, and the
+  local `.claude/settings.local.json` are gitignored — no force-add needed.
 
 ## The loop
 

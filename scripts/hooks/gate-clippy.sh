@@ -6,6 +6,9 @@
 set -euo pipefail
 
 cd "$HOME/projects/dhilipsiva/uniblox"
+# Self-activate the flake devShell (ADR-0010) so clippy runs under the pinned
+# toolchain; falls back to ambient rustup if unavailable (graceful).
+eval "$(direnv export bash 2>/dev/null)" 2>/dev/null || true
 rm -f .claude/allow-test-edits   # safety net: never leave tests/ writable past a turn
 
 if ! cargo clippy --all-targets --quiet -- -D warnings 2>/tmp/uniblox-clippy.err; then

@@ -15,5 +15,8 @@ case "$fp" in
 esac
 
 cd "$HOME/projects/dhilipsiva/uniblox"
+# Self-activate the flake devShell (ADR-0010) so `cargo fmt` uses the pinned
+# rustfmt; falls back to ambient rustup if unavailable (graceful).
+eval "$(direnv export bash 2>/dev/null)" 2>/dev/null || true
 cargo fmt >/dev/null 2>&1 || true   # advisory; never block
 exit 0

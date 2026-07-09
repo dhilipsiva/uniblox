@@ -15,17 +15,21 @@ The **why** behind decisions lives in `DECISIONS.md`; the **what/how** lives in
   (`/build-wasm`, `/slice-check`, `/review-netcode`, `/new-crate`, `/write-tests`),
   four hooks (`.claude/settings.json` + `scripts/hooks/`), git pre-commit gate.
 - **Build-pipeline scaffolding** — `scripts/build-wasm.sh`, `scripts/slice-check.sh`,
-  `scripts/serve.sh`, `crates/client/web/index.html` (capability detection). Fail
-  gracefully until the WASM toolchain + a rendering Bevy client exist.
+  `scripts/serve.sh`, `crates/client/web/index.html` (capability detection). `build-wasm.sh`
+  runs end-to-end (tools via the flake); output is meaningless until a rendering Bevy client exists.
 - **`.mcp.json`** scaffold (github, read-only postgres, docs/Context7, playwright).
+- **Nix flake devShell + direnv** (ADR-0010) — `flake.nix`/`flake.lock`/`.envrc` provide a pinned
+  Rust toolchain (1.96.1, wasm32 target) + `wasm-bindgen`/`wasm-opt`/`brotli`/`twiggy`/`node`,
+  auto-activated on `cd` and via `direnv exec .`. Cargo/tool scripts self-activate.
 
 ## Blocked / deferred (prerequisites do not exist yet)
-- **Real two-build WASM artifacts + size table** — needs `wasm-bindgen`, `wasm-opt`,
-  `brotli`, `twiggy` (all ABSENT) installed, AND a Bevy client that renders (Phase 1.3–1.6).
+- **Real two-build WASM artifacts + size table** — WASM toolchain is now provided by the flake;
+  the remaining blocker is a Bevy client that renders (Phase 1.3–1.6). (Do NOT force artifacts from
+  the stub — the two builds are byte-identical and the sizes are meaningless until Bevy is in.)
 - **Bevy feature-prune + `wasm-opt --converge` size deltas** — needs Bevy added (Phase 1.3+).
-- **MCP reachability** (github / read-only postgres / docs / playwright) — needs `node`/`npx`
-  in WSL (ABSENT), a running read-only Postgres role, a GitHub PAT (in `settings.local.json`),
-  and Playwright browsers.
+- **MCP reachability** (github / read-only postgres / docs / playwright) — `node`/`npx` now provided by
+  the flake; still needs a running read-only Postgres role, a GitHub PAT (in `settings.local.json`), and
+  Playwright browsers. (`docs` should be reachable on the flake alone.)
 - **Web Audio worklet** investigation — needs a running WASM client with audio.
 
 ## Next
@@ -36,7 +40,12 @@ The **why** behind decisions lives in `DECISIONS.md`; the **what/how** lives in
   handoff are proven.
 
 ## Toolchain notes
-WSL2 Ubuntu; cargo/rustc 1.92 direct on PATH (edition 2024 OK). **No nix dev-shell, no `just`** —
-call `cargo` directly. Run everything through:
-`wsl -d Ubuntu -e bash -lc "cd ~/projects/dhilipsiva/uniblox && <CMD>"`. Hook/build scripts parse
-event JSON with `/usr/bin/python3` (the rye shim fails non-interactively; `jq` is absent).
+WSL2 Ubuntu. **The toolchain comes from the Nix flake devShell** (ADR-0010): pinned Rust 1.96.1
+(edition 2024, wasm32 target) + `wasm-bindgen`/`wasm-opt`/`brotli`/`twiggy`/`node`. Run `direnv allow`
+once per clone. Interactive `cd` auto-activates; for the WSL wrapper, prefix cargo/WASM-tool/npx
+commands with `direnv exec .`:
+`wsl -d Ubuntu -e bash -lc "cd ~/projects/dhilipsiva/uniblox && direnv exec . <CMD>"` (compound chains:
+`direnv exec . bash -lc '<a && b>'`). Pure git/file commands use the plain wrapper. Ambient rustup
+(cargo 1.92) still exists as a fallback for un-routed commands. Hook/build scripts self-activate the
+flake and parse event JSON with `/usr/bin/python3` (the rye shim fails non-interactively; `jq` is absent).
+No `just` here.

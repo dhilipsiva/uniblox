@@ -46,18 +46,20 @@ Cargo workspace, multi-crate. HIGH-RISK crates get plan-mode-first, TDD, and a d
 
 ## Commands
 
-Standard cargo across the workspace (run from repo root):
+**Dev environment:** the toolchain comes from the **Nix flake devShell** (`flake.nix`, `DECISIONS.md` ADR-0010) — pinned Rust (cargo/rustc/clippy/rustfmt, wasm32 target) + `wasm-bindgen`/`wasm-opt`/`brotli`/`twiggy`/`node`, all pinned by `flake.lock`. Run `direnv allow` once per clone. Interactive `cd` auto-activates the env (direnv + nix-direnv). For the WSL wrapper, **prefix cargo/WASM-tool/npx commands with `direnv exec .`** so they use the flake toolchain; pure git/file commands use the plain wrapper. Ambient rustup is a benign fallback for un-routed commands. The cargo/tool-bearing scripts (`build-wasm.sh`, the `gate-clippy`/`fmt-on-write` hooks, `pre-commit`) self-activate the flake.
+
+Standard cargo across the workspace (run from repo root, inside the flake env):
 
 ```bash
-cargo build
-cargo test                       # single test: cargo test <name> -- --exact
-cargo clippy --all-targets -- -D warnings
-cargo fmt
+direnv exec . cargo build
+direnv exec . cargo test                       # single test: ... cargo test <name> -- --exact
+direnv exec . cargo clippy --all-targets -- -D warnings
+direnv exec . cargo fmt
 ```
 
-Do **not** run `cargo test --release` — `[profile.release]` sets `panic="abort"`, which the test harness cannot use; plain `cargo test` builds under the dev/test profile (unwind). Requires a Rust toolchain new enough for **edition 2024** (Rust ≥ 1.85 / recent stable).
+Do **not** run `cargo test --release` — `[profile.release]` sets `panic="abort"`, which the test harness cannot use; plain `cargo test` builds under the dev/test profile (unwind). Toolchain is edition-2024-capable (flake pins Rust ≥ 1.85; currently 1.96).
 
-The **two-WASM-build pipeline is scaffolded** in `scripts/build-wasm.sh` (with `scripts/slice-check.sh`, `scripts/serve.sh`, and the capability-detection page `crates/client/web/index.html`), invoked by the `/build-wasm` and `/slice-check` slash commands. It runs two separate `cargo build --target wasm32-unknown-unknown` invocations — the WebGPU build enables the `webgpu` feature and needs `RUSTFLAGS=--cfg=web_sys_unstable_apis`; the WebGL2 build is the default — each followed by `wasm-bindgen`, then `wasm-opt -Oz --converge` on the *final* file, then brotli. It **fails gracefully** today (prints `MISSING tool: …`) because `wasm-bindgen`/`wasm-opt`/`brotli` are not installed and the client is a stub; it becomes meaningful once the toolchain is installed and the Bevy client renders (Phase 1.3–1.6). The size-optimized release profile is `opt-level="z"`, `lto=true`, `codegen-units=1`, `strip=true`, `panic="abort"`.
+The **two-WASM-build pipeline** is `scripts/build-wasm.sh` (with `scripts/slice-check.sh`, `scripts/serve.sh`, and the capability-detection page `crates/client/web/index.html`), invoked by the `/build-wasm` and `/slice-check` slash commands. It runs two separate `cargo build --target wasm32-unknown-unknown` invocations — the WebGPU build enables the `webgpu` feature and needs `RUSTFLAGS=--cfg=web_sys_unstable_apis`; the WebGL2 build is the default — each followed by `wasm-bindgen`, then `wasm-opt -Oz --converge` on the *final* file, then brotli. The WASM tools are now present (via the flake), so the pipeline **runs end-to-end** — but on the current stub client the two builds are byte-identical, KB-sized output, **meaningless** for the size budget until the Bevy client renders (Phase 1.3–1.6). Do NOT claim stub sizes as the size-budget measurement. The size-optimized release profile is `opt-level="z"`, `lto=true`, `codegen-units=1`, `strip=true`, `panic="abort"`.
 
 **AI workflow:** four subagents (`.claude/agents/`), five slash commands (`.claude/commands/`: `/build-wasm`, `/slice-check`, `/review-netcode`, `/new-crate`, `/write-tests`), and four hooks (`.claude/settings.json` → `scripts/hooks/`: fmt-on-write, destructive-command deny, `tests/`-edit guard, clippy Stop gate) plus the `scripts/git-hooks/pre-commit` clippy+test gate. `/new-crate <name> [--bin]` scaffolds a workspace crate (the `members = ["crates/*"]` glob picks it up automatically).
 
