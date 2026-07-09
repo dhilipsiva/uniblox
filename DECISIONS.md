@@ -17,7 +17,7 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   root control plane; glob avoids editing `members` on every new crate).
 - **Consequences:** `/new-crate` just drops a directory under `crates/`; the root stays
   a clean control plane (docs, .claude, scripts, trackers).
-- **Status:** Accepted (Phase 1.1).
+- **Status:** Accepted (Phase 1 scaffolding).
 
 ## ADR-0002 — Two WASM builds, not one
 - **Context:** Bevy cannot serve WebGPU and WebGL2 from one binary (issue #13168 open;
@@ -65,7 +65,7 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
 - **Decision:** every third-party version pin lives once in the root `[workspace.dependencies]`;
   member crates use `dep.workspace = true`.
 - **Consequences:** one place to bump per Bevy cycle; no cross-crate version skew.
-- **Status:** Accepted (table empty at 1.1 — zero deps).
+- **Status:** Accepted (table empty during scaffolding — zero deps).
 
 ## ADR-0008 — `tests/` edits gated by a `.claude/allow-test-edits` sentinel
 - **Context:** the AI workflow commits tests before implementation so `git diff tests/` proves the

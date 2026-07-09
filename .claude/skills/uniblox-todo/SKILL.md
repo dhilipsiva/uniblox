@@ -42,7 +42,7 @@ Toolchain notes (these differ from nibli — do not copy nibli's habits):
 - The **two-WASM-build** pipeline (`scripts/build-wasm.sh`) + `/build-wasm` and `/slice-check` are
   **scaffolded**; the WASM tools are present (via the flake), so `build-wasm.sh` **runs end-to-end**; on the
   current stub the output is byte-identical, KB-sized wasm — **meaningless** for the size budget until the Bevy
-  client renders (Phase 1.3–1.6). Do NOT claim stub sizes as the size-budget measurement.
+  client renders (later in Phase 1). Do NOT claim stub sizes as the size-budget measurement.
 - `.claude/` is tracked (this skill file is committed); `/target`, `/dist`, `/result`, `.direnv/`, and the
   local `.claude/settings.local.json` are gitignored — no force-add needed.
 
@@ -69,7 +69,7 @@ Toolchain notes (these differ from nibli — do not copy nibli's habits):
    - `cargo clippy --all-targets -- -D warnings` and `cargo test` (single test: `cargo test <name>`);
      `cargo fmt` before committing.
    - For `[HIGH]` netcode/sandbox items: write the tests **first**, then — if the auditor subagents are set
-     up (`TODO.md` Phase 1.1) — dispatch **netcode-auditor** / **sandbox-auditor** on the diff; otherwise
+     up (`TODO.md` Phase 1 scaffolding) — dispatch **netcode-auditor** / **sandbox-auditor** on the diff; otherwise
      do a fresh-context review. "Compiles but subtly wrong" is the dominant netcode risk and neither the
      compiler nor clippy catch it.
    - `/build-wasm` + `/slice-check` for WASM size / cold-load / instrumentation, once scaffolded.

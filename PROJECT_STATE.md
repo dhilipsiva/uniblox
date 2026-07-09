@@ -4,7 +4,7 @@ Living snapshot of where uniblox is. Update it when a phase's status changes.
 The **why** behind decisions lives in `DECISIONS.md`; the **what/how** lives in
 `docs/final-buildspec.md`; the backlog lives in `TODO.md`.
 
-**Current phase: 1.1 — scaffolding (landing).**
+**Current phase: Phase 1 (the vertical slice) — scaffolding done; next is the Rhai↔Bevy bridge.**
 
 ## Done
 - **Cargo workspace** — virtual manifest, 9 crates under `crates/*` (glob members),
@@ -24,20 +24,20 @@ The **why** behind decisions lives in `DECISIONS.md`; the **what/how** lives in
 
 ## Blocked / deferred (prerequisites do not exist yet)
 - **Real two-build WASM artifacts + size table** — WASM toolchain is now provided by the flake;
-  the remaining blocker is a Bevy client that renders (Phase 1.3–1.6). (Do NOT force artifacts from
+  the remaining blocker is a Bevy client that renders (built later in Phase 1). (Do NOT force artifacts from
   the stub — the two builds are byte-identical and the sizes are meaningless until Bevy is in.)
-- **Bevy feature-prune + `wasm-opt --converge` size deltas** — needs Bevy added (Phase 1.3+).
+- **Bevy feature-prune + `wasm-opt --converge` size deltas** — needs Bevy added (later in Phase 1).
 - **MCP reachability** (github / read-only postgres / docs / playwright) — `node`/`npx` now provided by
   the flake; still needs a running read-only Postgres role, a GitHub PAT (in `settings.local.json`), and
   Playwright browsers. (`docs` should be reachable on the flake alone.)
 - **Web Audio worklet** investigation — needs a running WASM client with audio.
 
 ## Next
-- **1.2 Rhai ↔ Bevy ECS bridge** (HIGH-RISK — plan-mode-first, `sandbox-auditor`, adversarial TDD).
-- Then **1.3–1.7**: the mode-agnostic mini-game, matchbox two-channel transport, the custom
-  replication protocol, and the authority-swap to Mode 3 + one A→B handoff. **1.5–1.7 is the
-  architecture go/no-go gate** — do not build services until the authority-swap and a clean
-  handoff are proven.
+- **The Rhai ↔ Bevy ECS bridge** (HIGH-RISK — plan-mode-first, `sandbox-auditor`, adversarial TDD).
+- Then the rest of the Phase 1 slice: the mode-agnostic mini-game, matchbox two-channel transport, the
+  custom replication protocol, and the authority-swap to Mode 3 + one A→B handoff. **The replication →
+  authority-swap → handoff items are the architecture go/no-go gate** — do not build services until the
+  authority-swap and a clean handoff are proven.
 
 ## Toolchain notes
 WSL2 Ubuntu. **The toolchain comes from the Nix flake devShell** (ADR-0010): pinned Rust 1.96.1

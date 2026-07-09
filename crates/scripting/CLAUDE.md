@@ -6,7 +6,7 @@ limits; the thin custom ECS bridge.
 `sandbox-auditor` + adversarial tests mandatory.
 
 ## Status
-Stub (Phase 1.1). No functional code yet.
+Stub (Phase 1 scaffolding). No functional code yet.
 
 ## Crate-local invariants
 - **Thin custom bridge, NOT `bevy_mod_scripting`** (BMS has no WASM support, issue #166).

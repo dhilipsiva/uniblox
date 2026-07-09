@@ -4,7 +4,7 @@
 **Risk tier:** standard.
 
 ## Status
-Stub (Phase 1.1). Prints a placeholder; no Bevy yet.
+Stub (Phase 1 scaffolding). Prints a placeholder; no Bevy yet.
 
 ## Crate-local invariants
 - **Two WASM builds, not one.** WebGL2 = default build; WebGPU = `--features webgpu`

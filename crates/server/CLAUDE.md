@@ -5,7 +5,7 @@ the Mode 3 authoritative hub.
 **Risk tier:** standard (Mode 3 validation logic becomes HIGH in Phases 9/11).
 
 ## Status
-Stub (Phase 1.1). Prints a placeholder; no Bevy yet.
+Stub (Phase 1 scaffolding). Prints a placeholder; no Bevy yet.
 
 ## Crate-local invariants
 - Runs the **identical simulation** as the client (same `engine-core` systems),

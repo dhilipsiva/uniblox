@@ -5,7 +5,7 @@ config — unreliable/unordered state + reliable/ordered events.
 **Risk tier:** standard (the str0m sans-IO poll/timeout loop is MIXED — human-review it in Phase 2).
 
 ## Status
-Stub (Phase 1.1). No functional code yet.
+Stub (Phase 1 scaffolding). No functional code yet.
 
 ## Crate-local invariants
 - **WebRTC DataChannels only — no media, no SFU, anywhere.**

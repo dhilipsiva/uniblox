@@ -4,7 +4,7 @@
 **Risk tier:** standard.
 
 ## Status
-Stub (Phase 1.1). No functional code yet.
+Stub (Phase 1 scaffolding). No functional code yet.
 
 ## Crate-local invariants
 - The `{engine, content, schema}` version triple lives here; it is the desync

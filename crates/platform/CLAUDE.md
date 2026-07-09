@@ -5,7 +5,7 @@ Becomes a binary in Phases 6–8.
 **Risk tier:** standard (MIXED — the entitlement/billing boundary is HIGH; wiring is LOW).
 
 ## Status
-Stub (Phase 1.1). No functional code yet.
+Stub (Phase 1 scaffolding). No functional code yet.
 
 ## Crate-local invariants
 - **Raw card data never touches our systems** — billing via a hosted payment

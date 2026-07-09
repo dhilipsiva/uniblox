@@ -5,7 +5,7 @@
 **Risk tier:** standard (LOW — delegate; host-migration election is MIXED, human-review).
 
 ## Status
-Stub (Phase 1.1). No functional code yet.
+Stub (Phase 1 scaffolding). No functional code yet.
 
 ## Crate-local invariants
 - Start from `matchbox_server`'s room-based signaling + crude `?next=N`

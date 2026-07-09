@@ -12,5 +12,5 @@ The script builds WebGL2 (default) and WebGPU (`--features webgpu` +
 `wasm-opt -Oz --converge` → brotli, and prints raw→bindgen→opt→brotli sizes.
 
 If `wasm-bindgen`, `wasm-opt`, or `brotli` is not installed, the script prints
-`MISSING tool: <name>` and exits non-zero — report that plainly (at Phase 1.1 the
+`MISSING tool: <name>` and exits non-zero — report that plainly (at Phase 1 scaffolding the
 toolchain and a rendering Bevy client do not exist yet, so this is the expected result).

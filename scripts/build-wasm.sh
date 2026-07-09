@@ -6,10 +6,10 @@
 # Each variant is FULLY processed (bindgen -> wasm-opt -> brotli) before the next
 # `cargo build` overwrites target/.../client.wasm.
 #
-# Phase 1.1 status: the toolchain (wasm-bindgen/wasm-opt/brotli) is not installed
-# and the client is a stub (no Bevy), so this exits early with a clear message.
-# It becomes meaningful once the toolchain is installed and the client renders
-# (Phase 1.3-1.6). See TODO.md §1.1 (remaining) and DECISIONS.md ADR-0002.
+# Status: the toolchain (wasm-bindgen/wasm-opt/brotli/twiggy) is provided by the flake devShell
+# (ADR-0010), so this runs end-to-end. On the current stub client (no Bevy) the two builds are
+# byte-identical and the sizes are meaningless; it becomes meaningful once the client renders
+# (built later in Phase 1). See TODO.md Phase 1 (Instrumentation) and DECISIONS.md ADR-0002.
 set -euo pipefail
 cd "$HOME/projects/dhilipsiva/uniblox"
 
@@ -20,11 +20,10 @@ eval "$(direnv export bash 2>/dev/null)" 2>/dev/null || true
 
 for t in wasm-bindgen wasm-opt brotli; do
   if ! command -v "$t" >/dev/null 2>&1; then
-    echo "MISSING tool: $t"
-    echo "Install the WASM toolchain before running the pipeline, e.g.:"
-    echo "  cargo install wasm-bindgen-cli wasm-opt"
-    echo "  sudo apt-get install -y brotli        # or: cargo install brotli"
-    echo "Aborting (Phase 1.1: expected — toolchain + Bevy client not yet present)."
+    echo "MISSING tool: $t — the flake devShell should provide it."
+    echo "Run inside the flake env: direnv exec . ./scripts/build-wasm.sh"
+    echo "(run 'direnv allow' once if you have not — see DECISIONS.md ADR-0010)."
+    echo "Aborting."
     exit 1
   fi
 done

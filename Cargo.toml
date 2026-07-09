@@ -12,7 +12,7 @@ members  = ["crates/*"]
 version = "0.1.0"
 edition = "2024"
 
-# Single source of truth for third-party version pins. EMPTY at Phase 1.1 (zero
+# Single source of truth for third-party version pins. EMPTY at Phase 1 scaffolding (zero
 # dependencies). Bevy 0.19 / matchbox / str0m / rhai / ed25519-dalek pins land
 # HERE (never per-crate) so versions cannot drift across the workspace.
 [workspace.dependencies]

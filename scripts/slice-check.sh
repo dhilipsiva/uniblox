@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Print the slice instrumentation table (TODO.md §"Measurement gaps to instrument").
 # Size columns come from the last dist/ build; runtime rows are populated once the
-# running slice emits metrics (Phase 1.8). Fails gracefully if nothing is built yet.
+# running slice emits metrics (the instrumentation step). Fails gracefully if nothing is built yet.
 set -euo pipefail
 cd "$HOME/projects/dhilipsiva/uniblox"
 
@@ -32,7 +32,7 @@ for m in \
   "STUN-only connection success" \
   "peer RTT" \
   "peer jitter"; do
-  printf '  %-32s %s\n' "$m" "pending (Phase 1.8)"
+  printf '  %-32s %s\n' "$m" "pending (instrumentation)"
 done
 echo
-echo "Note: real numbers require the WASM toolchain + a rendering Bevy client (Phase 1.3-1.8)."
+echo "Note: real numbers require a rendering Bevy client (built later in Phase 1)."

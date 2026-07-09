@@ -6,7 +6,7 @@ delta/baseline, authority, ownership handoff, anti-entropy resync.
 `netcode-auditor` on every diff (never the session that wrote the code).
 
 ## Status
-Stub (Phase 1.1). No functional code yet.
+Stub (Phase 1 scaffolding). No functional code yet.
 
 ## Crate-local invariants
 - **Single-ownership per entity ⇒ last-write-wins, NO CRDT.** One authority per

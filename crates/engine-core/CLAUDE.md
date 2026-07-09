@@ -5,7 +5,7 @@ simulation that all three modes run.
 **Risk tier:** standard (but load-bearing — the authority-swap thesis lives here).
 
 ## Status
-Stub (Phase 1.1). No functional code yet.
+Stub (Phase 1 scaffolding). No functional code yet.
 
 ## Crate-local invariants
 - **The SAME systems run in all three modes; only authority assignment differs.**
