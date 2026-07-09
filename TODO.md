@@ -18,7 +18,7 @@ uniblox is a browser-first, native-secondary Rust→WASM **platform** (not a fra
 
 ## AI-assisted engineering workflow (Claude Code operating manual)
 
-This project is built primarily by Claude Code sessions under human supervision. The mechanisms below exist to make LLM-authored netcode/sandbox code trustworthy. **Stand them up in Phase 1.1 before writing feature code.** (This section is reference; the concrete setup tasks live in Phase 1.1.)
+This project is built primarily by Claude Code sessions under human supervision. The mechanisms below exist to make LLM-authored netcode/sandbox code trustworthy. **Stand them up before writing feature code** — this scaffolding (subagents, hooks, slash commands, MCP, the flake devShell) is DONE; see `PROJECT_STATE.md`. (This section is reference.)
 
 **Subagents — four, with tool restrictions:**
 - **test-writer** (Read, Write, Edit, Bash) — writes tests FIRST; for HIGH-RISK areas the human specifies the cases.
@@ -32,7 +32,7 @@ This project is built primarily by Claude Code sessions under human supervision.
 - **PreToolUse deny** of destructive commands (`rm -rf`, force push, `DROP TABLE`).
 - Hook that **blocks edits to `tests/` during implementation turns** — guards the agent from editing tests to make them pass.
 
-**MCP servers:** GitHub; read-only Postgres; a docs/context (Context7-style) server to counter hallucinated Bevy/matchbox/str0m APIs; Playwright (browser E2E).
+**MCP servers:** GitHub; read-only Postgres; a docs/context (Context7-style) server to counter hallucinated Bevy/matchbox/str0m APIs; Playwright (browser E2E). *Scaffolded in `.mcp.json` (node/npx via the flake, routed through `direnv exec`). Reachability is the remaining task: it needs a running read-only Postgres role (see Phase 7), a GitHub PAT in `.claude/settings.local.json` (never in the tracked `.mcp.json`), and Playwright browsers; `docs` should be reachable on the flake alone.*
 
 **Slash commands:** `/build-wasm` (two-build pipeline), `/slice-check` (print the instrumentation table), `/review-netcode` (invoke netcode-auditor), `/new-crate` (scaffold a workspace crate).
 
@@ -147,47 +147,44 @@ Unknowns to **measure, not assume** — build instrumentation into Phase 1 and r
 
 **Workflow:** plan-mode-first for every replication/authority task; TDD (human specifies cases); netcode-auditor after each implementation; small commits.
 
-#### 1.1 (remaining) Meaningful WASM artifacts + Bevy feature-prune + MCP reachability + audio [LOW — delegate; blocked on the Bevy client / live services]
-Scaffolding + toolchain are **committed and verified**: the `crates/*` Cargo workspace (9 stubs, `cargo build`/`cargo test` green) + size-optimized `[profile.release]` + single-threaded stance (no COOP/COEP); the full `.claude/` AI workflow (per-crate `CLAUDE.md`, `PROJECT_STATE.md`, `DECISIONS.md`, four subagents, five slash commands, four hooks + `scripts/git-hooks/pre-commit`); the build-pipeline scripts + capability page + `.mcp.json`; and a **Nix flake devShell** (`flake.nix`/`flake.lock`/`.envrc`, ADR-0010) that pins Rust + provides `wasm-bindgen`/`wasm-opt`/`brotli`/`twiggy`/`node`, auto-activated via direnv. `scripts/build-wasm.sh` now runs **end-to-end** (verified on the stub — output is meaningless until Bevy). What remains needs the Bevy client or live services, NOT tooling:
-- Once the Bevy client renders (Phase 1.3–1.6), run `scripts/build-wasm.sh` to produce **meaningful** two-build artifacts (WebGPU: `--features webgpu` + `RUSTFLAGS=--cfg=web_sys_unstable_apis`; WebGL2: default) and confirm `crates/client/web/index.html` loads the correct bundle per `navigator.gpu`. *Acceptance:* both artifacts produced from the real client; the page loads the right one; the build prints raw→bindgen→wasm-opt→brotli sizes. (Do NOT claim the stub's byte-identical KB output as this.)
-- Feature-prune Bevy via its **`2d`/`3d`/`ui` cargo feature collections** (verify exact collection names against Bevy 0.19 docs) rather than hand-listing features, and record the **`wasm-opt -Oz --converge`** (fixed-point) size deltas. *Acceptance:* the build prints size deltas from feature-pruning and from `--converge`. (Blocked: Bevy is not added until the client renders.)
-- Bring the four **MCP servers** up (GitHub, read-only Postgres, docs/Context7-style to counter hallucinated Bevy/matchbox/str0m APIs, Playwright) — `node`/`npx` is now provided by the flake and the `.mcp.json` invocations route through it; still needs a running read-only Postgres role, a GitHub PAT in `.claude/settings.local.json` (never in the tracked `.mcp.json`), and Playwright browsers. (`docs` should be reachable on the flake alone.) *Acceptance:* each server is reachable from a session.
-- Investigate routing audio through a **Web Audio worklet** (runs on its own audio thread, needs no COOP/COEP cross-origin isolation) to decouple audio from main-thread simulation stalls, rather than accepting single-thread audio stutter unconditionally. *Acceptance:* audio does not glitch when the main thread stalls for a frame. (Blocked: needs a running WASM client with audio.)
+> **Project + build + AI-workflow scaffolding is DONE** (see `PROJECT_STATE.md`): the `crates/*` workspace + size-optimized release profile + single-threaded stance; the full `.claude/` AI workflow (four subagents, five slash commands, four hooks + the `pre-commit` gate); the build-pipeline scripts + capability page + `.mcp.json`; and a **Nix flake devShell** (`flake.nix`/`.envrc`, ADR-0010) that pins Rust + the WASM toolchain (`wasm-bindgen`/`wasm-opt`/`brotli`/`twiggy`/`node`) with direnv auto-activation. `scripts/build-wasm.sh` runs end-to-end. Its remaining follow-ups are distributed to their homes below: **Instrumentation** (meaningful two-build artifacts + Bevy feature-prune, once the client renders), the **AI-workflow → MCP servers** note (bring the servers up), and **Phase 14** (the Web Audio worklet).
 
-#### 1.2 Rhai ↔ Bevy ECS bridge (thin custom bridge) [HIGH]
+**Rhai ↔ Bevy ECS bridge (thin custom bridge)** [HIGH]
 Decision (research-confirmed): thin custom bridge, NOT `bevy_mod_scripting` (BMS lists WASM as unsupported — issue #166 — disqualifying for a browser-first project).
 - Build the `scripting` crate holding the Rhai `Engine` + compiled `AST` + `Scope` in a Bevy `Resource`. Register a minimal whitelisted API via `engine.register_type::<T>()` / `engine.register_fn(...)`; call per-tick logic with `engine.call_fn(...)` against the compiled `AST`. Use `Engine::new_raw()` for a locked-down surface (adds nothing by default, so every capability is explicit). *Acceptance:* a Rhai script mutates a whitelisted component each tick; unregistered calls fail.
 - Apply initial sandbox limits now (full hardening is Phase 12): `set_max_operations`, `set_max_call_levels`, `set_max_string_size`, `set_max_array_size`, `set_max_map_size`; no eval/fs/network. *Acceptance:* an infinite-loop script terminates with an error (`ErrorTerminated` on `max_operations`), not a hang.
 - Hot-reload: detect script file change → recompile `AST` → swap the stored `AST` (keep the `Engine`; reset/retain `Scope` as needed). *Acceptance:* editing the script changes behavior at runtime without restart.
 
-#### 1.3 The mini-game simulation (mode-agnostic) [MIXED]
+**The mini-game simulation (mode-agnostic)** [MIXED]
 - Define ECS components for a tiny game (positions/velocities, a couple of owned entities per peer) with explicit `Owner`/authority tags; **default ownership = the spawner/controller.** *Acceptance:* runs Standalone (Mode 1) with local authority; a spawned entity is owned by its spawner by default.
 - Split logic into "authority computes state" vs "receiver applies state" so the SAME systems run in all modes and only authority assignment differs. *Acceptance:* a single `authority_of(entity)` decision point; no mode-specific gameplay branches (proven by grep/audit).
 
-#### 1.4 Transport: matchbox two-channel [MIXED]
+**Transport: matchbox two-channel** [MIXED]
 - Wire `matchbox_socket`/`bevy_matchbox` with TWO channels — unreliable/unordered (positions/inputs) + reliable/ordered (events/handoffs/resync), e.g. `WebRtcSocketBuilder::new(url).add_channel(ChannelConfig::unreliable()).add_channel(ChannelConfig::reliable())`. Stand up a `matchbox_server` signaling server (room-based signaling with crude `?next=N` matchmaking, later extended for mode/version scoping — see Phase 5). *Acceptance:* two browser tabs connect P2P; data flows on both channels.
 
 > **Reusable prior art:** `github.com/dhilipsiva/nibli` is an existing browser-native WebRTC P2P gossip transport (NAT traversal, no central relay) — **directly reusable for the transport/signaling layer**. Evaluate it before hand-rolling transport plumbing here and in Phases 2/5.
 
-#### 1.5 The replication protocol (custom) [HIGH]
+**The replication protocol (custom)** [HIGH]
 - Wire format: bincode/postcard with **quantized floats** (fixed-point positions, quantized quaternions) + **per-component delta vs last-acked baseline**. TDD: write serialization round-trip and quantization-bound tests FIRST. *Acceptance:* round-trip within quantization tolerance; delta-vs-baseline verified.
 - Owner computes snapshot/delta → sends on the unreliable "state" channel (Channel 0, `unreliable()`, last-writer-wins entity state at the network tick — ~20–30 Hz default, measure); receiver applies directly (predict-own, interpolate-others). Last-write-wins, no causal metadata. *Acceptance:* two peers each authoritative over own entities; remote entities interpolate smoothly.
 - Durable events (spawn/despawn/ownership) on the reliable "events" channel (Channel 1, `reliable()`, carrying durable events, ownership handoffs, anti-entropy resync baselines). **Reserve a signature field in the wire format, but do NOT functionally sign in the slice** — the device keypair and op-signing land in Phase 6; the slice only **measures** sign/verify cost (see measurement gaps). *Acceptance:* events never lost; signature field present but unsigned in the slice.
 - Compute the per-tick dirty set from Bevy's native change detection (`Changed<T>` / component ticks) rather than diffing manually, and encode each entity update as `entity_id + generation + component-bitmask + changed-component bytes` so only changed components go on the wire. *Acceptance:* an entity with one changed component serializes only that component; the bitmask matches the changed set.
 - Carry the Bevy entity **generation** (u32) alongside the entity index in snapshots/deltas — Bevy recycles indices, so a bare index can alias a despawned-then-reused entity; receivers reject state addressed to a stale generation. *Acceptance:* state addressed to a recycled index with an old generation is rejected, not misapplied.
 
-#### 1.6 Authority-swap to Mode 3 (the proof) [HIGH]
+**Authority-swap to Mode 3 (the proof)** [HIGH]
 - Run the SAME simulation as a headless authoritative server: Bevy `MinimalPlugins` + `ScheduleRunnerPlugin::run_loop(Duration)` with sim systems in `FixedUpdate` and `Time::<Fixed>::from_hz(tick_rate)` (default fixed tick 64 Hz); server owns ALL entities; clients connect in a star. Caveat: fixed-timestep is not wall-clock, so drive network send timing separately, not off the fixed tick. *Acceptance:* identical gameplay to Mode 2 with authority reassigned to the server — NO logic fork (same systems crate).
 - Prove the thesis: a test/demo that boots the identical sim in Mode 2 and Mode 3 by changing *only* authority assignment. *Acceptance:* documented side-by-side run.
 
-#### 1.7 Ownership handoff (exercise once) [HIGH]
+**Ownership handoff (exercise once)** [HIGH]
 - Implement one explicit A→B ownership handoff mid-session as a reliable-channel event. *Acceptance:* authority transfers cleanly; no double-ownership; no dropped entity; the receiver switches from interpolate to predict.
 
-#### 1.8 Instrumentation [LOW — delegate]
+**Instrumentation** [LOW — delegate]
 - Emit the metrics (WASM size, cold-load, bandwidth/peer, sign/verify cost, connection success) from the running slice. *Acceptance:* the `/slice-check` step prints the table.
+- Once the Bevy client renders, run `scripts/build-wasm.sh` to produce **meaningful** two-build WASM artifacts (WebGPU: `--features webgpu` + `RUSTFLAGS=--cfg=web_sys_unstable_apis`; WebGL2: default) and confirm `crates/client/web/index.html` loads the correct bundle per `navigator.gpu`. *Acceptance:* both artifacts produced from the real client; the page loads the right one; the build prints raw→bindgen→wasm-opt→brotli sizes. (Do NOT claim the stub's byte-identical KB output as this.)
+- Feature-prune Bevy via its **`2d`/`3d`/`ui` cargo feature collections** (verify exact collection names against Bevy 0.19 docs) rather than hand-listing features, and record the **`wasm-opt -Oz --converge`** (fixed-point) size deltas. *Acceptance:* the build prints size deltas from feature-pruning and from `--converge`. (Blocked: Bevy is added only when the client renders.)
 
 ### PHASE 2 — Transport hardening [MIXED]
-**Goal:** production-grade transport across browser and native/server. (Reuse `nibli` where it fits — see Phase 1.4.)
+**Goal:** production-grade transport across browser and native/server. (Reuse `nibli` where it fits — see the Phase 1 transport item.)
 - str0m (sans-IO) integration for native/server WebRTC; browser (web-sys) ↔ native (str0m) DataChannel interop. **[MIXED — the sans-IO poll/timeout event loop is fiddly; human-review the driving loop.]** *Acceptance:* a native str0m peer exchanges data with a browser matchbox peer on both channels.
 - Record the raw DataChannel/SCTP parameters behind the `unreliable()`/`reliable()` helpers, needed to configure the **str0m** side directly (it lacks matchbox's helpers): unreliable state = `{ ordered: false, maxRetransmits: 0 }`; reliable events = `{ ordered: true }` with neither retransmit field set. Spec constraint: **set at most one of `maxRetransmits` / `maxPacketLifeTime`** (both is an error). *Acceptance:* a native str0m peer negotiates matching channel semantics with a browser matchbox peer on both channels.
 - Two-channel config parameterized (reliability/ordering/retransmit). [LOW] *Acceptance:* config test.
@@ -285,6 +282,7 @@ Decision (research-confirmed): thin custom bridge, NOT `bevy_mod_scripting` (BMS
 - Local mute/block. *Acceptance:* a muted peer's social payloads suppressed client-side.
 
 ### PHASE 14 — Native parity + scaling + observability [MIXED]
+- **Browser-client audio (single-thread stutter mitigation):** investigate routing audio through a **Web Audio worklet** (runs on its own audio thread, needs no COOP/COEP cross-origin isolation) to decouple audio from main-thread simulation stalls, rather than accepting single-thread audio stutter unconditionally. *Acceptance:* audio does not glitch when the main thread stalls for a frame. (Browser-only; needs a running WASM client with audio.)
 - Native parity: same Bevy binary, native winit + native wgpu; native can host the Mode 3 headless authoritative server. *Acceptance:* native client + native-hosted server run the slice.
 - Scaling: fleet autoscale; session registry under load. [LOW]
 - Observability: metrics/tracing/logging across services; keep reporting the instrumentation metrics in prod. [LOW] *Acceptance:* dashboards for bandwidth, session cold-start, connection success, and cold-load.
@@ -340,12 +338,12 @@ Compact list; see **docs/CONTEXT.md** for the full rationale.
 **Gates:**
 - **Size-budget gate (before Phase 1 netcode):** if the WebGPU+WebGL2 two-build size after `wasm-opt`+brotli is prohibitive for your cold-load target (the "upwards of 30MB → ~15MB" range unacceptable), pause and run a size-budget spike (feature-prune Bevy, lazy-load assets) before proceeding.
 - Define the currently-undefined cold-load target the size-budget gate tests against: **≤ ~8 MB brotli per WASM build**, aiming for a **playable first frame in ~2–5 s on ~5–10 Mbps** links (treat >~1 s first-contentful-paint on a high-end desktop as a signal to prune harder). These are post-`wasm-opt`+brotli *targets to validate*, not the refuted sub-3 MB uncompressed claim. *Acceptance:* the gate passes/fails against these numbers.
-- **Architecture go/no-go gate (Phase 1.5–1.7) — the gate for the whole architecture:** if you cannot demonstrate Mode 2 and Mode 3 from one simulation by changing only authority (1.6), or a clean A→B handoff (1.7), **STOP** and revisit the replication design before building any services — everything downstream assumes the authority-swap works.
+- **Architecture go/no-go gate (the replication → authority-swap → ownership-handoff items) — the gate for the whole architecture:** if you cannot demonstrate Mode 2 and Mode 3 from one simulation by changing only authority (the authority-swap item), or a clean A→B handoff (the ownership-handoff item), **STOP** and revisit the replication design before building any services — everything downstream assumes the authority-swap works.
 - **Benchmark thresholds that change the plan:** STUN-only failure materially above ~20–25% → prioritize TURN earlier / reconsider free-tier P2P expectations; per-frame sign/verify cost too high in-browser → default to reliable-channel-only signing; cold-load unacceptably slow → invest in binary-splitting/lazy assets before feature work.
 
 **Staged next steps:**
-1. **Start with Phase 1.1–1.2** — get build tooling, the AI-workflow scaffolding (CLAUDE.md, subagents, hooks, slash commands, MCP), the always-do gates, and the Rhai bridge working before any netcode. Apply the size-budget gate above.
-2. **Treat Phase 1.5–1.7 as the go/no-go gate for the whole architecture** (see gate above). Do not build services until the slice proves the authority-swap and a clean handoff.
+1. **Scaffolding is done; begin with the Rhai-bridge item** — build tooling, the AI-workflow scaffolding (CLAUDE.md, subagents, hooks, slash commands, MCP, flake), and the always-do gates are in place; get the Rhai bridge working before any netcode. Apply the size-budget gate above.
+2. **Treat the replication → authority-swap → ownership-handoff items as the go/no-go gate for the whole architecture** (see gate above). Do not build services until the slice proves the authority-swap and a clean handoff.
 3. **Only after the slice is green, fan out.** Phases 4–8 (Mode 1, services, identity/billing, persistence, publish) are LOW/MIXED and safe to delegate broadly with acceptance criteria as the contract; run them in parallel git worktrees if using multiple sessions.
 4. **Sequence the two HIGH-RISK deep passes (Phase 3 replication depth, Phase 12 sandbox) with a human owner each.** Never let these merge on auto-review alone; each goes to a fresh auditor subagent.
 5. **Instrument the measurement gaps in the slice and re-report every phase:** WASM binary size per build (before/after `wasm-opt -Oz` + brotli, within the wasm32 4 GB ceiling); cold-load time in-browser; replication bandwidth per peer at the network tick (~20–30 Hz default, measure 30–60 Hz); per-message sign/verify cost in-browser (ed25519); STUN-only connection failure rate (plan 15–25%; TURN provided only in Mode 3).
