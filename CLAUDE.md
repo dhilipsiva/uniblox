@@ -10,7 +10,7 @@ Engine: **Bevy 0.19** (ECS) on wgpu · UGC logic in sandboxed **Rhai** · transp
 
 ## Current state (read this first)
 
-The repo is **greenfield**: `src/main.rs` is a hello-world, `Cargo.toml` has no dependencies, and none of the architecture below exists in code yet. The design is fully specified in `docs/` and is the source of truth for *what* to build. When you scaffold real work, the first step is converting this single-crate package into the Cargo workspace described below.
+**Phase 1.1 scaffolding is done; feature code has not started.** The Cargo workspace exists (9 crate stubs under `crates/*`, each with a passing smoke test — `cargo build`/`cargo test` are green), along with the size-optimized `[profile.release]`, the AI-workflow scaffolding (`.claude/agents/`, `.claude/commands/`, `.claude/settings.json` hooks, per-crate `CLAUDE.md`, `PROJECT_STATE.md`, `DECISIONS.md`), and the build-pipeline scripts (`scripts/`, `crates/client/web/index.html`, `.mcp.json`) which fail gracefully until the WASM toolchain + a rendering Bevy client exist. **No dependencies are added yet** and no gameplay/netcode/scripting logic exists. See `PROJECT_STATE.md` for the live status and what's deferred; `DECISIONS.md` for the ADR log. The design is fully specified in `docs/` and is the source of truth for *what* to build; next is Phase 1.2 (the Rhai↔Bevy bridge).
 
 Design docs (read before non-trivial work — do not relitigate decisions they mark settled):
 - `docs/final-buildspec.md` — **the what/how**: resolved technical verdicts, stack table, risk register, phased build sequence.
@@ -46,7 +46,7 @@ Cargo workspace, multi-crate. HIGH-RISK crates get plan-mode-first, TDD, and a d
 
 ## Commands
 
-Standard cargo (works today on the hello-world; run from repo root):
+Standard cargo across the workspace (run from repo root):
 
 ```bash
 cargo build
@@ -55,9 +55,11 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt
 ```
 
-Requires a Rust toolchain new enough for **edition 2024** (Rust ≥ 1.85 / recent stable).
+Do **not** run `cargo test --release` — `[profile.release]` sets `panic="abort"`, which the test harness cannot use; plain `cargo test` builds under the dev/test profile (unwind). Requires a Rust toolchain new enough for **edition 2024** (Rust ≥ 1.85 / recent stable).
 
-**WASM builds are not scaffolded yet** — when you build the two-build pipeline (TODO Phase 1.1), the intended invocations are two separate `cargo build --target wasm32-unknown-unknown` runs: the WebGPU build enables the `webgpu` feature and needs `RUSTFLAGS=--cfg=web_sys_unstable_apis`; the WebGL2 build is the default. Each is followed by `wasm-bindgen`, then `wasm-opt -Oz` on the *final* file, then brotli. The size-optimized release profile is `opt-level="z"`, `lto=true`, `codegen-units=1`, `strip=true`, `panic="abort"`.
+The **two-WASM-build pipeline is scaffolded** in `scripts/build-wasm.sh` (with `scripts/slice-check.sh`, `scripts/serve.sh`, and the capability-detection page `crates/client/web/index.html`), invoked by the `/build-wasm` and `/slice-check` slash commands. It runs two separate `cargo build --target wasm32-unknown-unknown` invocations — the WebGPU build enables the `webgpu` feature and needs `RUSTFLAGS=--cfg=web_sys_unstable_apis`; the WebGL2 build is the default — each followed by `wasm-bindgen`, then `wasm-opt -Oz --converge` on the *final* file, then brotli. It **fails gracefully** today (prints `MISSING tool: …`) because `wasm-bindgen`/`wasm-opt`/`brotli` are not installed and the client is a stub; it becomes meaningful once the toolchain is installed and the Bevy client renders (Phase 1.3–1.6). The size-optimized release profile is `opt-level="z"`, `lto=true`, `codegen-units=1`, `strip=true`, `panic="abort"`.
+
+**AI workflow:** four subagents (`.claude/agents/`), five slash commands (`.claude/commands/`: `/build-wasm`, `/slice-check`, `/review-netcode`, `/new-crate`, `/write-tests`), and four hooks (`.claude/settings.json` → `scripts/hooks/`: fmt-on-write, destructive-command deny, `tests/`-edit guard, clippy Stop gate) plus the `scripts/git-hooks/pre-commit` clippy+test gate. `/new-crate <name> [--bin]` scaffolds a workspace crate (the `members = ["crates/*"]` glob picks it up automatically).
 
 ## Working rules
 

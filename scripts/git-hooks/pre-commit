@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Tracked git pre-commit gate (wired via: git config core.hooksPath scripts/git-hooks).
+# The commit boundary is where the full test suite runs — clippy AND tests must pass.
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+echo "[pre-commit] cargo fmt --check"
+if ! cargo fmt --check; then
+  echo "[pre-commit] FAILED: run 'cargo fmt' and re-stage." >&2
+  exit 1
+fi
+
+echo "[pre-commit] cargo clippy --all-targets -- -D warnings"
+if ! cargo clippy --all-targets -- -D warnings; then
+  echo "[pre-commit] FAILED: fix clippy warnings before committing." >&2
+  exit 1
+fi
+
+echo "[pre-commit] cargo test"
+if ! cargo test; then
+  echo "[pre-commit] FAILED: fix failing tests before committing." >&2
+  exit 1
+fi
+
+echo "[pre-commit] OK"
+exit 0

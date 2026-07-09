@@ -1,2 +1,4 @@
 /target
+/dist
 .claude/settings.local.json*
+.claude/allow-test-edits

@@ -1,0 +1,6 @@
+[package]
+name = "engine-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

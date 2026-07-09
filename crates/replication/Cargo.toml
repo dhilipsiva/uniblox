@@ -1,0 +1,6 @@
+[package]
+name = "replication"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

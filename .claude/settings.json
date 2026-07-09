@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "wsl -d Ubuntu -e bash -lc \"cd ~/projects/dhilipsiva/uniblox && ./scripts/hooks/fmt-on-write.sh\""
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "wsl -d Ubuntu -e bash -lc \"cd ~/projects/dhilipsiva/uniblox && ./scripts/hooks/deny-destructive.sh\""
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "wsl -d Ubuntu -e bash -lc \"cd ~/projects/dhilipsiva/uniblox && ./scripts/hooks/guard-tests.sh\""
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "wsl -d Ubuntu -e bash -lc \"cd ~/projects/dhilipsiva/uniblox && ./scripts/hooks/gate-clippy.sh\""
+          }
+        ]
+      }
+    ]
+  }
+}

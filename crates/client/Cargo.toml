@@ -1,0 +1,15 @@
+[package]
+name = "client"
+version.workspace = true
+edition.workspace = true
+
+[features]
+# WebGL2 is the implicit default build. The `webgpu` feature is enabled for the
+# WebGPU build and MUST be paired with `RUSTFLAGS=--cfg=web_sys_unstable_apis`
+# (see scripts/build-wasm.sh). No-op today; the flag exists so the two-build
+# pipeline invocation is valid before Bevy lands. Two builds, never one
+# (Bevy issue #13168 — enabling `webgpu` overrides `webgl2`).
+default = []
+webgpu  = []
+
+[dependencies]

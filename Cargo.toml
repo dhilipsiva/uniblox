@@ -1,6 +1,28 @@
-[package]
-name = "uniblox"
+# uniblox — Cargo workspace (virtual manifest).
+#
+# Multi-crate workspace per docs/final-todo.md §"Workspace layout (settled)".
+# `members = ["crates/*"]` is a glob, so scaffolding a new crate under crates/
+# never requires editing this list (see .claude/commands/new-crate.md).
+
+[workspace]
+resolver = "3"
+members  = ["crates/*"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
+# Single source of truth for third-party version pins. EMPTY at Phase 1.1 (zero
+# dependencies). Bevy 0.19 / matchbox / str0m / rhai / ed25519-dalek pins land
+# HERE (never per-crate) so versions cannot drift across the workspace.
+[workspace.dependencies]
+
+# Size-optimized ship profile (docs/final-todo.md §1.1). `panic = "abort"` is
+# scoped to release ONLY — `cargo test` builds under the dev/test profile
+# (unwind), so the test harness is unaffected. Do NOT run `cargo test --release`.
+[profile.release]
+opt-level     = "z"
+lto           = true
+codegen-units = 1
+strip         = true
+panic         = "abort"

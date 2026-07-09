@@ -1,0 +1,25 @@
+{
+  "//": "Project-scoped MCP servers for uniblox (TODO.md §1.1). Reachability is DEFERRED at Phase 1.1: node/npx is not installed in WSL, and the servers need live services/credentials. Secrets (GitHub PAT, Postgres DSN) go in .claude/settings.local.json (gitignored), NEVER here. On this Windows+WSL host each server runs via `wsl -e npx ...`.",
+  "mcpServers": {
+    "github": {
+      "//": "Counters nothing by itself; PRs/issues/CI. Needs GITHUB_PERSONAL_ACCESS_TOKEN (set in settings.local.json).",
+      "command": "wsl",
+      "args": ["-d", "Ubuntu", "-e", "npx", "-y", "@modelcontextprotocol/server-github"]
+    },
+    "postgres": {
+      "//": "READ-ONLY Postgres. Point the DSN at a read-only role once the platform DB exists (Phase 7).",
+      "command": "wsl",
+      "args": ["-d", "Ubuntu", "-e", "npx", "-y", "@modelcontextprotocol/server-postgres", "postgresql://readonly@localhost/uniblox"]
+    },
+    "docs": {
+      "//": "Context7-style docs server — counters hallucinated/version-drifted Bevy/matchbox/str0m/Rhai APIs. Verify APIs here, never from memory.",
+      "command": "wsl",
+      "args": ["-d", "Ubuntu", "-e", "npx", "-y", "@upstash/context7-mcp"]
+    },
+    "playwright": {
+      "//": "Browser E2E for the two WASM builds + capability detection. Needs Playwright browsers installed.",
+      "command": "wsl",
+      "args": ["-d", "Ubuntu", "-e", "npx", "-y", "@playwright/mcp@latest"]
+    }
+  }
+}

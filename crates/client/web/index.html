@@ -1,0 +1,41 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>uniblox</title>
+<!--
+  Capability detection for the two-build WASM pipeline (DECISIONS.md ADR-0002).
+  Bevy cannot serve WebGPU and WebGL2 from one binary (issue #13168), so we ship
+  two artifacts and pick one here by probing the browser.
+
+  Single-threaded at launch: NO SharedArrayBuffer, NO COOP/COEP (ADR-0003).
+  Do NOT add cross-origin-isolation headers when serving this — it would break
+  the OAuth/payment popups Mode 3 needs. See scripts/serve.sh.
+-->
+<main id="app">Loading uniblox…</main>
+<script type="module">
+  // navigator.gpu presence alone is insufficient — probe requestAdapter() and
+  // fall back to WebGL2 if no adapter is available.
+  async function pickBuild() {
+    if ("gpu" in navigator && navigator.gpu) {
+      try {
+        const adapter = await navigator.gpu.requestAdapter();
+        if (adapter) return "webgpu";
+      } catch (_) { /* fall through to webgl2 */ }
+    }
+    return "webgl2";
+  }
+
+  const build = await pickBuild();
+  document.getElementById("app").textContent = `uniblox — selected build: ${build}`;
+  console.log("uniblox: selected WASM build =", build);
+
+  // The wasm-bindgen ESM entry lives at dist/<build>/client.js after /build-wasm.
+  // Guarded so this page is useful even before any artifact is built.
+  try {
+    const mod = await import(`/${build}/client.js`);
+    await mod.default();
+    console.log("uniblox: wasm instantiated for", build);
+  } catch (e) {
+    console.warn("uniblox: no WASM artifact yet (run scripts/build-wasm.sh):", e.message);
+  }
+</script>
