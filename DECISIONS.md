@@ -192,3 +192,35 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   Phase 3's owner-drop reassignment + session lifecycle own this). Bevy-0.19 note: a long-lived
   `SystemState` outside schedules is not tick-clamped — recreate periodically on the Mode-3 server.
 - **Status:** Accepted (2026-07-10).
+
+## ADR-0014 — The authority-swap gate: PASSED
+- **Context:** the architecture go/no-go gate — demonstrate that the SAME simulation yields Mode 2 (P2P) and
+  Mode 3 (authoritative server) by changing ONLY authority assignment, with no logic fork. Failure would have
+  stopped everything downstream (services, billing, publish all assume the swap works).
+- **Decision / evidence — the documented side-by-side run (all green, netcode-audited):**
+  - **M1** `crates/replication/tests/mode_proof.rs`: ONE parameterized harness (`run_session(ids, spawns)`);
+    the mode-2 and mode-3 tests differ ONLY in the spawn/ownership DATA. Mode 2: both peers compute their own
+    entity, converge cross-wise. Mode 3: the server computes all; both clients emit ZERO state messages and
+    ZERO events for the entire session and converge to the server's truth.
+  - **M2** `crates/replication/tests/e2e_mode3_star.rs`: the same over REAL WebRTC + signaling (server + two
+    clients); clients' send counters end at zero.
+  - **M3/M4** `crates/server/tests/headless_app.rs`: the real headless App converges an external client,
+    FixedUpdate self-regulates to ~64 Hz (tick-counter evidence), and state sends track the ~20 Hz network
+    interval, decoupled from the fixed tick.
+  - Auditor verdict: no hidden mode fork — `authority_of` has exactly one gameplay call site plus
+    replication's documented gates; the server crate adds zero authority branches; no `Mode` type exists in
+    the workspace.
+- **The Mode-3 runtime (`crates/server`):** standalone `bevy_app` + `bevy_time` assembly (`TaskPoolPlugin` +
+  `TimePlugin` + `ScheduleRunnerPlugin::run_loop(1/64 s)`) — the `MinimalPlugins` equivalent without the
+  `bevy` umbrella (`MinimalPlugins` lives in `bevy_internal`). `TimePlugin` is mandatory (FixedUpdate
+  silently never runs without it). **0.19 renamed buffered Events→Messages**: exit = write `AppExit` to
+  `Messages<AppExit>` (never `EventWriter`). `SimDt` is fed from the fixed clock by a boundary adapter
+  (`sync_sim_dt`, chained before `simulate`) — engine-core stays free of bevy_app/bevy_time. Networking is a
+  NonSend `Net` bundle pumped by an exclusive Update system: receive every frame, collect+send on a
+  virtual-clock accumulator at `NET_INTERVAL` (50 ms ≈ 20 Hz, an ASSUMED value — the Instrumentation item
+  measures it). `Time<Virtual>` is max_delta-clamped (250 ms): stalls drop sends rather than bursting.
+- **Test-robustness findings baked in (auditor):** convergence predicates must not depend on proxy REPLAY
+  ORDER (HashMap iteration is arbitrary — all demo/test entities advance on x; a zero-x-velocity entity in
+  slot 0 hung the M2 predicate on ~1/6 runs before the fix); e2e deadlines are 120 s (they bound hangs, not
+  CPU contention); rate-measurement windows are 2 s (max_delta permanently drops ticks on >250 ms stalls).
+- **Status:** Accepted — GATE PASSED (2026-07-10).

@@ -4,7 +4,7 @@ Living snapshot of where uniblox is. Update it when a phase's status changes.
 The **why** behind decisions lives in `DECISIONS.md`; the **what/how** lives in
 `docs/final-buildspec.md`; the backlog lives in `TODO.md`.
 
-**Current phase: Phase 1 (the vertical slice) — scaffolding, the Rhai↔Bevy bridge, the mini-game, the transport core, and the custom replication protocol done; next is the authority-swap to Mode 3 [HIGH].**
+**Current phase: Phase 1 (the vertical slice) — THE AUTHORITY-SWAP GATE PASSED (ADR-0014). Scaffolding, the Rhai↔Bevy bridge, the mini-game, transport, replication, and the Mode-3 proof are done; next is the ownership handoff over a live session [HIGH].**
 
 ## Done
 - **Cargo workspace** — virtual manifest, 9 crates under `crates/*` (glob members),
@@ -41,6 +41,12 @@ The **why** behind decisions lives in `DECISIONS.md`; the **what/how** lives in
   late-join replay). **27-test battery green incl. e2e over real WebRTC** — tests committed before impl;
   netcode-audited (owned-ghost fix + documented cross-sender handoff gaps for Phase 3 resync). Snap-apply
   per decision — interpolation buffers are Phase 3.
+- **THE AUTHORITY-SWAP GATE: PASSED** (ADR-0014, HIGH) — `crates/server` is the Mode-3 headless runtime
+  (standalone bevy_app+bevy_time, 64 Hz FixedUpdate, exclusive net pump at ~20 Hz virtual-clock cadence,
+  Messages<AppExit>). The M1–M4 battery is the documented side-by-side run: same simulation, same
+  replication, Mode 2 vs Mode 3 differing ONLY in spawn/ownership data; Mode-3 clients emit zero
+  messages; ~64 ticks/s evidence; net cadence decoupled from the fixed tick. netcode-audited (no hidden
+  fork; its reproduced M2 replay-order flake fixed + soaked 6/6).
 
 ## Blocked / deferred (prerequisites do not exist yet)
 - **Real two-build WASM artifacts + size table** — WASM toolchain is now provided by the flake;
@@ -53,10 +59,11 @@ The **why** behind decisions lives in `DECISIONS.md`; the **what/how** lives in
 - **Web Audio worklet** investigation — needs a running WASM client with audio.
 
 ## Next
-- **Authority-swap to Mode 3 (the proof)** [HIGH]: the SAME sim headless-authoritative
-  (`MinimalPlugins` + fixed tick, server owns all), then the side-by-side Mode-2/Mode-3 demo — the
-  architecture go/no-go gate, together with the live A→B handoff item (whose `transfer_ownership`
-  machinery already exists and is e2e-tested).
+- **Ownership handoff (exercise once)** [HIGH]: one explicit A→B handoff mid-session as a
+  reliable-channel event. The `transfer_ownership` machinery already exists and is e2e-tested
+  (T18–T20, T26 phase 2) — this item exercises it as the named slice deliverable and closes the
+  go/no-go gate's second half.
+- Then **Instrumentation** [LOW]: emit the slice metrics (`/slice-check` table).
 
 ## Toolchain notes
 WSL2 Ubuntu. **The toolchain comes from the Nix flake devShell** (ADR-0010): pinned Rust 1.96.1

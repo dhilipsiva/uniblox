@@ -163,10 +163,6 @@ extension was disconnected).
   where headless gathering completes). *Acceptance:* both tabs' consoles log `[uniblox-demo][STATE]` and
   `[uniblox-demo][EVENT]` receipts from the other peer — two browser tabs connected P2P, data on both channels.
 
-**Authority-swap to Mode 3 (the proof)** [HIGH]
-- Run the SAME simulation as a headless authoritative server: Bevy `MinimalPlugins` + `ScheduleRunnerPlugin::run_loop(Duration)` with sim systems in `FixedUpdate` and `Time::<Fixed>::from_hz(tick_rate)` (default fixed tick 64 Hz); server owns ALL entities; clients connect in a star. Caveat: fixed-timestep is not wall-clock, so drive network send timing separately, not off the fixed tick. *Acceptance:* identical gameplay to Mode 2 with authority reassigned to the server — NO logic fork (same systems crate).
-- Prove the thesis: a test/demo that boots the identical sim in Mode 2 and Mode 3 by changing *only* authority assignment. *Acceptance:* documented side-by-side run.
-
 **Ownership handoff (exercise once)** [HIGH]
 - Implement one explicit A→B ownership handoff mid-session as a reliable-channel event. *Acceptance:* authority transfers cleanly; no double-ownership; no dropped entity; the receiver switches from interpolate to predict.
 
