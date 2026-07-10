@@ -308,6 +308,9 @@ async fn turn_relay_refuses_bad_credentials() {
 async fn transport_connects_with_turn_ice_config() {
     use matchbox_signaling::SignalingServer;
 
+    // RUST_LOG-driven diagnostics; captured by libtest, printed only on failure.
+    let _ = env_logger::builder().is_test(true).try_init();
+
     let turn = spawn_turnserver();
     let ice = IceConfig {
         urls: vec![turn_url(turn.port)],
@@ -321,8 +324,18 @@ async fn transport_connects_with_turn_ice_config() {
     let room = format!("ws://{addr}/turn_ice_config");
 
     let (mut a, a_loop) = Transport::connect_with_ice(&room, ice.clone());
-    let (mut b, b_loop) = Transport::connect_with_ice(&room, ice);
     tokio::spawn(a_loop);
+    // Sequence the joins (the repo-wide test pattern): wait until the room has
+    // registered peer A before B connects. Simultaneous joins can race the
+    // full-mesh signaling server into sending NEITHER side a NewPeer — nobody
+    // offers and the session stalls forever (reproduced under concurrent test
+    // load; the captured log shows both IdAssigned then only keepalives).
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    while a.id().is_none() {
+        assert!(tokio::time::Instant::now() < deadline, "no id for peer A");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let (mut b, b_loop) = Transport::connect_with_ice(&room, ice);
     tokio::spawn(b_loop);
 
     // Wait until each side reports the other Connected.

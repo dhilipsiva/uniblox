@@ -22,3 +22,4 @@ matchbox_signaling.workspace = true
 tokio = { workspace = true, features = ["time"] }
 # TURN-relay proof (ADR-0016): raw webrtc-rs peers with ice_transport_policy=Relay
 webrtc.workspace = true
+env_logger.workspace = true
