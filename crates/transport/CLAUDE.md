@@ -22,8 +22,11 @@ reconnect/ICE-restart (later Phase-2 items).
 - **WebRTC DataChannels only — no media, no SFU, anywhere.**
 - Exactly two channels: Channel 0 unreliable `{ ordered: false, maxRetransmits: 0 }`
   (state); Channel 1 reliable `{ ordered: true }` (events/handoffs/resync).
-  Channel index = builder insertion order — never reorder the two `add_*_channel`
-  calls, nor the two entries in `str0m_peer::channel_configs()`.
+  **Semantics are defined ONCE in `CHANNEL_SPECS` (`src/lib.rs`)** — both the
+  matchbox path (`Transport::build`) and the str0m path (`channel_configs()`)
+  derive from it (locked by unit tests). Array index = channel index =
+  insertion order = negotiated stream id — never reorder the entries; the
+  count is fixed at two (parameterize semantics there, never the layout).
 - **matchbox channels are `negotiated` (NO DCEP)**: stream id = channel index,
   labels `matchbox_socket_{i}`. `Str0mPeer` pre-declares both and never waits
   for DCEP opens. Connected = ALL channels open.

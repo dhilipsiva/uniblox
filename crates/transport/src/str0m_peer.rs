@@ -44,7 +44,10 @@ use str0m::channel::{ChannelConfig as Str0mChannelConfig, ChannelId, Reliability
 use str0m::net::{Protocol, Receive};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc};
 
-use crate::{CHANNEL_EVENTS, CHANNEL_STATE, ChannelSendError, Packet, PeerState, TransportClosed};
+use crate::{
+    CHANNEL_EVENTS, CHANNEL_SPECS, CHANNEL_STATE, ChannelSendError, ChannelSpec, Packet, PeerState,
+    TransportClosed,
+};
 
 /// matchbox's `PeerSignal` (defined in matchbox_socket, not exported) —
 /// identical shape ⇒ identical externally-tagged JSON.
@@ -423,25 +426,28 @@ fn spawn_connection(
 
 // ───────────────────────── connection thread ─────────────────────────
 
-/// The two matchbox channels, pre-negotiated (no DCEP): stream id == channel
-/// index; id 0 unreliable/unordered, id 1 reliable/ordered. NEVER reorder.
+/// The two matchbox channels, pre-negotiated (no DCEP), derived from the
+/// shared [`CHANNEL_SPECS`] source of truth: stream id == channel index ==
+/// spec index; labels follow matchbox's `matchbox_socket_{i}` convention.
 fn channel_configs() -> [Str0mChannelConfig; 2] {
     [
-        Str0mChannelConfig {
-            label: "matchbox_socket_0".to_string(),
-            ordered: false,
-            reliability: Reliability::MaxRetransmits { retransmits: 0 },
-            negotiated: Some(0),
-            protocol: String::new(),
-        },
-        Str0mChannelConfig {
-            label: "matchbox_socket_1".to_string(),
-            ordered: true,
-            reliability: Reliability::Reliable,
-            negotiated: Some(1),
-            protocol: String::new(),
-        },
+        str0m_config(&CHANNEL_SPECS[0], 0),
+        str0m_config(&CHANNEL_SPECS[1], 1),
     ]
+}
+
+/// Derive str0m's channel config from a [`ChannelSpec`] at stream id `index`.
+fn str0m_config(spec: &ChannelSpec, index: u16) -> Str0mChannelConfig {
+    Str0mChannelConfig {
+        label: format!("matchbox_socket_{index}"),
+        ordered: spec.ordered,
+        reliability: match spec.max_retransmits {
+            None => Reliability::Reliable,
+            Some(retransmits) => Reliability::MaxRetransmits { retransmits },
+        },
+        negotiated: Some(index),
+        protocol: String::new(),
+    }
 }
 
 fn run_connection(
@@ -707,4 +713,35 @@ fn encode_candidate(candidate: &Candidate) -> Result<String, String> {
         username_fragment: None,
     };
     serde_json::to_string(&init).map_err(|e| format!("candidate encode: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every str0m-derived config must match its [`ChannelSpec`] and the
+    /// matchbox wire contract (label `matchbox_socket_{i}`, negotiated stream
+    /// id == channel index) — the cross-stack semantics-parity proof.
+    #[test]
+    fn str0m_derivation_matches_specs_and_wire_contract() {
+        let configs = channel_configs();
+        assert_eq!(configs.len(), CHANNEL_SPECS.len());
+        for (index, (config, spec)) in configs.iter().zip(CHANNEL_SPECS.iter()).enumerate() {
+            assert_eq!(config.label, format!("matchbox_socket_{index}"));
+            assert_eq!(
+                config.negotiated,
+                Some(index as u16),
+                "negotiated stream id == channel index (no DCEP)"
+            );
+            assert_eq!(config.ordered, spec.ordered);
+            match spec.max_retransmits {
+                None => assert_eq!(config.reliability, Reliability::Reliable),
+                Some(retransmits) => assert_eq!(
+                    config.reliability,
+                    Reliability::MaxRetransmits { retransmits }
+                ),
+            }
+            assert!(config.protocol.is_empty(), "matchbox sets no protocol");
+        }
+    }
 }

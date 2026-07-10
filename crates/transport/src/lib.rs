@@ -16,7 +16,7 @@
 
 #[cfg(not(target_arch = "wasm32"))]
 use matchbox_socket::RtcIceServerConfig;
-use matchbox_socket::{WebRtcSocket, WebRtcSocketBuilder}; // only connect_hermetic (native-only) uses it
+use matchbox_socket::{ChannelConfig, WebRtcSocket, WebRtcSocketBuilder}; // RtcIceServerConfig: only connect_hermetic (native-only) uses it
 
 pub use matchbox_socket::{Error as TransportError, Packet, PeerId, PeerState};
 
@@ -36,6 +36,40 @@ pub type MessageLoopFuture = matchbox_socket::MessageLoopFuture;
 pub const CHANNEL_STATE: usize = 0;
 /// Channel 1 — reliable/ordered: durable events, handoffs, resync.
 pub const CHANNEL_EVENTS: usize = 1;
+
+/// One channel's delivery semantics (reliability/ordering/retransmit) — the
+/// single source of truth both stacks derive their configs from: the matchbox
+/// path in [`Transport`] and the str0m path in `Str0mPeer`. Semantics must
+/// match on both sides for the negotiated (no-DCEP) channels to interoperate.
+///
+/// `maxPacketLifeTime` is deliberately unexpressed: matchbox 0.14 cannot set
+/// it, and the WebRTC spec forbids setting both it and `maxRetransmits` — the
+/// "at most one" constraint holds by construction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChannelSpec {
+    /// Whether messages are guaranteed to arrive in order.
+    pub ordered: bool,
+    /// `None` = reliable (unlimited retransmits); `Some(n)` = unreliable,
+    /// giving up after `n` retransmit attempts.
+    pub max_retransmits: Option<u16>,
+}
+
+/// The settled two-channel layout. Array index = channel index = insertion
+/// order = negotiated stream id. NEVER reorder the entries; the count is
+/// fixed at two (a settled invariant — parameterize semantics here, never
+/// the layout).
+pub const CHANNEL_SPECS: [ChannelSpec; 2] = [
+    // CHANNEL_STATE: last-write-wins snapshots — stale retransmits are useless.
+    ChannelSpec {
+        ordered: false,
+        max_retransmits: Some(0),
+    },
+    // CHANNEL_EVENTS: durable events/handoffs/resync — must all arrive, in order.
+    ChannelSpec {
+        ordered: true,
+        max_retransmits: None,
+    },
+];
 
 /// Error sending on a channel: the channel is closed/taken or the index is
 /// invalid (the two-channel layout is fixed, so the latter is a programmer error
@@ -100,10 +134,10 @@ impl Transport {
     }
 
     fn build(builder: WebRtcSocketBuilder) -> (Self, MessageLoopFuture) {
-        // Channel index = insertion order: unreliable first (0), reliable second (1).
-        let (socket, loop_fut) = builder
-            .add_unreliable_channel()
-            .add_reliable_channel()
+        // Channel index = insertion order = CHANNEL_SPECS index.
+        let (socket, loop_fut) = CHANNEL_SPECS
+            .iter()
+            .fold(builder, |b, spec| b.add_channel(matchbox_config(spec)))
             .build();
         (Self { socket }, loop_fut)
     }
@@ -170,5 +204,57 @@ impl Transport {
     /// Close the socket (all channels).
     pub fn close(&mut self) {
         self.socket.close()
+    }
+}
+
+/// Derive matchbox's channel config from a [`ChannelSpec`].
+fn matchbox_config(spec: &ChannelSpec) -> ChannelConfig {
+    ChannelConfig {
+        ordered: spec.ordered,
+        max_retransmits: spec.max_retransmits,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Locks the settled two-channel layout: any change to count, order, or
+    /// semantics must fail here loudly and be a deliberate decision.
+    #[test]
+    fn channel_specs_lock_the_settled_layout() {
+        assert_eq!(CHANNEL_SPECS.len(), 2, "exactly two channels — settled");
+        let state = CHANNEL_SPECS[CHANNEL_STATE];
+        assert!(!state.ordered, "state channel is unordered");
+        assert_eq!(
+            state.max_retransmits,
+            Some(0),
+            "state channel never retransmits (LWW snapshots)"
+        );
+        let events = CHANNEL_SPECS[CHANNEL_EVENTS];
+        assert!(events.ordered, "events channel is ordered");
+        assert_eq!(
+            events.max_retransmits, None,
+            "events channel is reliable (unlimited retransmits)"
+        );
+    }
+
+    /// The matchbox derivation must equal what matchbox's own
+    /// `unreliable()`/`reliable()` helpers produced before parameterization —
+    /// the semantic no-change proof.
+    #[test]
+    fn matchbox_derivation_matches_matchbox_helpers() {
+        let derived_state = matchbox_config(&CHANNEL_SPECS[CHANNEL_STATE]);
+        let helper_state = ChannelConfig::unreliable();
+        assert_eq!(derived_state.ordered, helper_state.ordered);
+        assert_eq!(derived_state.max_retransmits, helper_state.max_retransmits);
+
+        let derived_events = matchbox_config(&CHANNEL_SPECS[CHANNEL_EVENTS]);
+        let helper_events = ChannelConfig::reliable();
+        assert_eq!(derived_events.ordered, helper_events.ordered);
+        assert_eq!(
+            derived_events.max_retransmits,
+            helper_events.max_retransmits
+        );
     }
 }

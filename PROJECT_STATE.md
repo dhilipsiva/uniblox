@@ -63,7 +63,9 @@ native/server peer is landed and matchbox-interoperable (ADR-0015).
   loop; matchbox's negotiated no-DCEP channels (ids 0/1, labels `matchbox_socket_{i}`) pre-declared both
   roles. Interop proven hermetically: str0m↔native-matchbox BOTH role directions + str0m↔str0m, both
   channels both ways (3 tests, soaked 4/4). Fresh-reviewer gate caught the trickle-order bug (candidates
-  before offer/answer are DROPPED by native matchbox — masked in tests by prflx discovery). Residuals:
+  before offer/answer are DROPPED by native matchbox — masked in tests by prflx discovery). Channel
+  semantics (reliability/ordering/retransmit) are parameterized in one `CHANNEL_SPECS` source of truth that
+  BOTH stacks derive from, locked by config tests (cross-stack parity by construction). Residuals:
   browser pairing (desktop-browser, ADR-0012), TLS signaling, non-loopback bind, reconnect (later items).
 - **Instrumentation (native core)** — `slice_metrics` example + `/slice-check` table. **Measured (native
   loopback, 2026-07-10):** state channel 742 B/s per peer @ 2 entities (19.4 msg/s at the 20 Hz net tick,
