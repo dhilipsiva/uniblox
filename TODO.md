@@ -147,13 +147,6 @@ trail is ADR-0011…ADR-0016 in `DECISIONS.md`, live status in `PROJECT_STATE.md
 phase needs an environment this dev setup lacks: a rendering Bevy client, a desktop browser (WSL2 headless
 never completes the matchbox handshake — ADR-0012), or real-network peers.
 
-**Browser-tab transport verification** [LOW]
-- Verify the wasm demo two-tab run in a real desktop browser (or non-WSL CI): `cargo run -p services`,
-  `./scripts/build-wasm.sh`, `./scripts/serve.sh`, open `http://localhost:8080/` in two tabs (or run
-  `node scripts/e2e-two-tab.mjs` where headless gathering completes). *Acceptance:* both tabs' consoles
-  log `[uniblox-demo][STATE]` and `[uniblox-demo][EVENT]` receipts from the other peer — two browser tabs
-  connected P2P, data on both channels.
-
 **Browser-side instrumentation** [LOW — needs the Bevy client / desktop browser / real network]
 - Measure in-browser: cold-load TTI, in-browser ed25519 sign/verify, and STUN-only connection success
   rate (real-network peers). *Acceptance:* the `/slice-check` table's pending rows fill with measured

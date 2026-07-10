@@ -153,7 +153,12 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   - tokio enters the tree (signaling + native webrtc); the client wasm demo gained `console_error_panic_hook`
     + `console_log` (Rust panics and matchbox internals visible in the browser console — essential for wasm
     debugging).
-- **Status:** Accepted (2026-07-10).
+- **Status:** Accepted (2026-07-10). **Browser-tab residual CLOSED (2026-07-11):** two tabs of a
+  desktop-class Chromium on the Windows host (WSL2 `networkingMode=mirrored`, so localhost is shared;
+  signaling + static server in WSL2) each logged the other peer `Connected` and received
+  `[uniblox-demo][STATE] state-hello` + `[uniblox-demo][EVENT] event-hello` — two real browser tabs P2P
+  over WebRTC, data on both channels (webgpu build). The WSL2-HEADLESS gathering limitation above still
+  holds for `scripts/e2e-two-tab.mjs` (needs a non-WSL host).
 
 ## ADR-0013 — The custom replication protocol: wire format + authority-gated sender/receiver
 - **Context:** the Phase-1 slice's HIGH-risk core — per-entity, authority-gated state replication over the

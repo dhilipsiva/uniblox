@@ -36,8 +36,11 @@ native/server peer is landed and matchbox-interoperable (ADR-0015).
 - **matchbox two-channel transport core** (ADR-0012) — `crates/transport` (matchbox 0.14; state=0
   unreliable, events=1 reliable), `crates/services` full-mesh signaling binary, hermetic native↔native
   two-peer datachannel test green, wasm client demo + `scripts/e2e-two-tab.mjs`. The nibli prior-art note
-  was resolved obsolete (repo repurposed). Residual: the browser-tab run — blocked in WSL2 headless (ICE
-  gathering never completes; matchbox wasm waits on it), verifiable on a desktop browser (see TODO).
+  was resolved obsolete (repo repurposed). **Browser-tab run VERIFIED (2026-07-11):** two tabs of a
+  desktop-class Chromium on the Windows host (WSL2 mirrored networking; services in WSL2) each logged the
+  other peer Connected plus `[STATE]`+`[EVENT]` receipts — real P2P WebRTC, data on both channels, webgpu
+  build. The WSL2-HEADLESS limitation (ICE gathering never completes; matchbox wasm waits on it) still
+  applies to headless CI — `scripts/e2e-two-tab.mjs` needs a non-WSL host.
 - **The custom replication protocol** (ADR-0013, HIGH) — `protocol` wire format (postcard, spawner-stable
   `NetEntityId`, quantized `QVec2`, reserved signature field) + `replication` (authority-gated cached-
   `SystemState` sender, newest-seq LWW receiver, current-Owner validity, keyframes, `transfer_ownership`,

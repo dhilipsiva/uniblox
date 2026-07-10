@@ -51,9 +51,11 @@ Phase-2 items); per-session TURN credential issuance is Phase 6.
 - Transport `PeerId` is matchbox's UUID (signaling-assigned) — distinct from
   `protocol::PeerId`; the mapping is a session-layer concern (replication/join).
 - matchbox 0.14 wasm sends its offer only after ICE-gathering-COMPLETE (non-trickle,
-  upstream TODO) — under WSL2 headless Chrome gathering never completes with any
-  iceServers set, so browser E2E must run on a desktop browser / non-WSL host
-  (`scripts/e2e-two-tab.mjs`).
+  upstream TODO) — under WSL2 HEADLESS Chrome gathering never completes with any
+  iceServers set, so headless browser E2E (`scripts/e2e-two-tab.mjs`) must run on a
+  non-WSL host. The two-tab DESKTOP run itself is verified (2026-07-11): Windows-host
+  Chromium tabs against the WSL2-hosted services (mirrored networking) exchanged
+  `[STATE]`+`[EVENT]` receipts both ways.
 
 ## Raw DataChannel/SCTP parameters (the record)
 
