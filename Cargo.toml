@@ -21,6 +21,9 @@ edition = "2024"
 rhai     = { version = "1.25", default-features = false, features = ["std"] }
 bevy_ecs = { version = "0.19" }
 log      = { version = "0.4" }
+# replication wire format (ADR-0013): postcard varint encoding, wasm-safe.
+serde    = { version = "1", default-features = false, features = ["derive", "alloc"] }
+postcard = { version = "1.1", default-features = false, features = ["use-std"] }
 # transport (matchbox two-channel WebRTC DataChannels, ADR-0012) + signaling
 matchbox_socket    = { version = "0.14" }
 matchbox_signaling = { version = "0.14" }

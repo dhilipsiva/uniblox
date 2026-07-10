@@ -4,9 +4,12 @@
 **Risk tier:** standard.
 
 ## Status
-Minimal: `PeerId(u64)` (shared peer identity; `Ord` for the Phase-3/5 lowest-peer-ID
-host-migration tiebreak). Wire messages, the version triple, and serde land with the
-replication wire format (later in Phase 1) and Phase 5.
+The replication wire format lives here (ADR-0013): `PeerId` (+serde, `from_uuid_bytes` — a PURE
+function of the transport UUID; all peers must agree), spawner-stable `NetEntityId`, quantization
+(`QUANT_SCALE`=1024, tolerance ≤1/2048 for |v|≤16384, saturating), `StateMsg`/`StateEntry`
+(Options-only presence, derived mask, ABSOLUTE values — never arithmetic deltas), `EventMsg` with
+the reserved-but-None signature field (Phase 6), versioned postcard codecs (mismatch → clean Err).
+The `{engine, content, schema}` version triple lands in Phase 5.
 
 ## Crate-local invariants
 - The `{engine, content, schema}` version triple lives here; it is the desync

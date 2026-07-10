@@ -4,3 +4,13 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+protocol = { path = "../protocol" }
+engine-core = { path = "../engine-core" }
+bevy_ecs.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+# e2e test only — transport stays OUT of the lib dependency graph.
+transport = { path = "../transport" }
+matchbox_signaling.workspace = true
+tokio = { workspace = true, features = ["time"] }
