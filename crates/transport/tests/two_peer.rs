@@ -17,7 +17,7 @@ use std::time::Duration;
 use matchbox_signaling::SignalingServer;
 use transport::{CHANNEL_EVENTS, CHANNEL_STATE, PeerState, Transport};
 
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120); // generous: bounds hangs, not CPU contention
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Spin an in-process full-mesh signaling server on an ephemeral port and

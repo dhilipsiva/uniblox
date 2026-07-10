@@ -4,3 +4,17 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+protocol = { path = "../protocol" }
+engine-core = { path = "../engine-core" }
+replication = { path = "../replication" }
+transport = { path = "../transport" }
+bevy_app.workspace = true
+bevy_time.workspace = true
+bevy_ecs.workspace = true
+futures.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+# headless-app tests embed an in-process signaling server + a raw test client
+matchbox_signaling.workspace = true
+tokio = { workspace = true, features = ["time"] }

@@ -20,6 +20,10 @@ edition = "2024"
 # WASM-safe. `unchecked`/`internals` are NOT defaults and MUST stay off (they void the sandbox).
 rhai     = { version = "1.25", default-features = false, features = ["std"] }
 bevy_ecs = { version = "0.19" }
+# headless server runtime (ADR-0014): standalone app/time crates — NOT the `bevy`
+# umbrella (MinimalPlugins lives in bevy_internal; we assemble the equivalent).
+bevy_app  = { version = "0.19" }
+bevy_time = { version = "0.19" }
 log      = { version = "0.4" }
 # replication wire format (ADR-0013): postcard varint encoding, wasm-safe.
 serde    = { version = "1", default-features = false, features = ["derive", "alloc"] }
