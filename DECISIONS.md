@@ -299,6 +299,7 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   UDP until answered.
 - **Residuals:** the **STUN-only failure RATE** is a real-network fleet metric (already a recorded
   measurement gap) — it cannot be measured hermetically; production coturn deployment + per-session
-  credential issuance land with Phase 6 entitlements; str0m-side srflx/TURN gathering (if native
-  CLIENTS ever sit behind NATs) rides the non-loopback-bind residual.
+  credential minting are Phase-9 bullets (gated on the Phase-6 entitlement boundary they authenticate
+  against); str0m-side srflx/TURN gathering (if native CLIENTS ever sit behind NATs) rides the
+  non-loopback-bind residual.
 - **Status:** Accepted (2026-07-10).

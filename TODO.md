@@ -10,15 +10,15 @@ uniblox is a browser-first, native-secondary Rust→WASM **platform** (not a fra
 
 ## How to use this file
 
-- **Drive this file top-to-bottom.** Build **Phase 1 (the vertical slice) first** — it de-risks replication, the authority-swap, handoff, matchbox transport, and Rhai integration all at once.
-- **Why slice-first:** roughly **10% of the system is novel and 90% is well-trodden**, and ~80% of the value sits in the ~15% authority-swap slice. That slice is simultaneously the highest-risk and highest-value part; everything else is delegable glue once it is proven.
+- **Drive this file top-to-bottom.** Phase 1 (the vertical slice) proved the authority-swap (ADR-0014); its remaining bullets are environment-gated residuals. Phases 2+ follow in order, fanning out per the staged next steps at the bottom.
+- **Why slice-first (kept as rationale):** roughly **10% of the system is novel and 90% is well-trodden**, and ~80% of the value sits in the ~15% authority-swap slice. That slice was simultaneously the highest-risk and highest-value part; everything else is delegable glue now that it is proven.
 - **Obey each task's risk tier.** HIGH-RISK tasks are human-verified, TDD-first, plan-mode-first, with a fresh independent auditor subagent mandatory. LOW/MIXED tasks are delegated heavily, with acceptance criteria as the contract.
 - **The architecture is settled. Record it; do not relitigate it.** Breaking a settled invariant silently re-opens a decision already made for a reason. Rejected alternatives are logged below so they are not re-proposed.
 - See **docs/CONTEXT.md** for the full "why" (rationale, trust envelope, rejected-alternative reasoning) and **docs/final-buildspec.md** for the technical verdicts.
 
 ## AI-assisted engineering workflow (Claude Code operating manual)
 
-This project is built primarily by Claude Code sessions under human supervision. The mechanisms below exist to make LLM-authored netcode/sandbox code trustworthy. **Stand them up before writing feature code** — this scaffolding (subagents, hooks, slash commands, MCP, the flake devShell) is DONE; see `PROJECT_STATE.md`. (This section is reference.)
+This project is built primarily by Claude Code sessions under human supervision. The mechanisms below exist to make LLM-authored netcode/sandbox code trustworthy. (Reference — live status in `PROJECT_STATE.md`.)
 
 **Subagents — four, with tool restrictions:**
 - **test-writer** (Read, Write, Edit, Bash) — writes tests FIRST; for HIGH-RISK areas the human specifies the cases.
@@ -96,16 +96,16 @@ Cargo workspace, multi-crate:
 |---|---|---|---|---|---|
 | Engine/ECS | Bevy | 0.19.0 (2026-06-19) | ✅ (2 builds) | ✅ | Fixed decision; ECS + wgpu |
 | Render | wgpu (via Bevy) | Bevy-vendored | WebGPU + WebGL2 | Vulkan/Metal/DX12 | Two-build fallback (Bevy #13168 open) |
-| Scripting | Rhai (thin custom bridge, not bevy_mod_scripting) | current | ✅ | ✅ | First-party sandbox limits; BMS lacks WASM support |
-| Browser transport | matchbox_socket / bevy_matchbox | 0.13.0 | ✅ | ✅ | Raw WebRTC-DataChannel, dual channels, ships signaling server |
-| Native/server WebRTC | str0m | current | ❌ | ✅ | Lock-free sans-IO hub/peer |
+| Scripting | Rhai (thin custom bridge, not bevy_mod_scripting) | 1.25 (pinned) | ✅ | ✅ | First-party sandbox limits; BMS lacks WASM support |
+| Browser transport | matchbox_socket | 0.14 (pinned) | ✅ | ✅ | Raw WebRTC-DataChannel, dual channels, ships signaling server |
+| Native/server WebRTC | str0m | 0.21 (pinned, rust-crypto) | ❌ | ✅ | Lock-free sans-IO hub/peer |
 | Replication | **custom** (over matchbox/str0m) | n/a | ✅ | ✅ | No crate does tri-mode over WebRTC-DC |
 | Physics | Avian **or** bevy_rapier | current | ✅ | ✅ | ECS-native; determinism not needed (rapier is more mature) |
-| Signing | ed25519-dalek | current | ✅ (slower) | ✅ | Tamper-evident ops |
+| Signing | ed25519-dalek | 3 (pinned) | ✅ (slower) | ✅ | Tamper-evident ops |
 | Persistence | Postgres + object storage | n/a | — | — | Durable-authoritative store |
 | Mode 3 orchestration | Managed session-fleet → Agones at scale | n/a | — | ✅ | Sub-second cold start, per-second billing |
 
-> **Re-verify before pinning versions** — the Bevy ecosystem moves fast. Every version and load-bearing fact above (Bevy release cadence ~3 months, pre-1.0; issue #13168 open; lightyear/aeronet lacking a WebRTC-DataChannel layer; bevy_replicon server→client-only; matchbox's dual-channel + signaling-server support; str0m sans-IO/lock-free with a less battle-tested P2P path; BMS issue #166; ed25519 ~15.6 µs sign / ~46 µs verify native, several× slower in WASM; STUN-only ~15–25% failure) is flagged for re-verification before locking crate versions.
+> **Remaining pins to verify when they land:** the full Bevy engine (client work) and the physics crate (Avian vs bevy_rapier) — the netcode/scripting pins above are locked in the workspace `Cargo.toml`. The Bevy ecosystem moves fast (release cadence ~3 months, pre-1.0): re-verify the load-bearing facts above (issue #13168 open; lightyear/aeronet lacking a WebRTC-DataChannel layer; bevy_replicon server→client-only; BMS issue #166; in-browser ed25519 cost; STUN-only ~15–25% failure) at each Bevy upgrade.
 
 ## Corrections to prior reports (do NOT re-propose)
 
@@ -119,7 +119,7 @@ The five source reports contained stale/incorrect claims that were refuted durin
 ## Open questions register (measure/decide before locking)
 
 Genuinely open technical unknowns (CONTEXT.md §9). None block starting the slice, but each must be resolved before the dependent decision is locked:
-- **Final crate version pins** — verify current Bevy (and matchbox/str0m/Rhai/Avian) compatibility before locking the workspace `Cargo.toml`.
+- **Remaining crate pins** — the full Bevy engine (when the client lands) and the physics crate (Avian vs bevy_rapier); verify compatibility then. (The netcode/scripting pins are locked in `Cargo.toml`.)
 - **Rhai performance escape-hatch trigger** — what measured cost (per-tick script time / ops budget) triggers stepping down the ladder (see Phase 12). Undecided.
 - **Network-tick default** — ~20–30 Hz is an **assumed, unmeasured starting point** (client interpolates to display rate); buildspec §C/§D cites up to 30–60 Hz. Measure in the slice and pick.
 - **Full-mesh session cap** — **~8 peers** is a soft, upstream-bandwidth-bound assumption, not a measured limit. Measure.
@@ -133,53 +133,38 @@ Unknowns to **measure, not assume** — build instrumentation into Phase 1 and r
 
 - **WASM binary size** per build (WebGPU vs WebGL2), **before and after `wasm-opt -Oz` + brotli.** Bevy WASM binaries are large ("upwards of 30MB, reduced to ~15MB with wasm-opt"; WebGPU fox demo ~22MB; unoptimized dev builds exceed 100MB — one tutorial build measured ~160MB). Distrust sub-3 MB figures. Budget within the wasm32 4 GB memory ceiling.
 - **Cold-load time** in-browser: download + instantiate + first frame (time-to-interactive).
-- **Replication bandwidth per peer** at the network tick (assume ~20–30 Hz default; also measure whether 30–60 Hz is affordable) — bytes/s pre- and post-delta-compression and interest management.
-- **In-browser ed25519 sign/verify cost** (via WebCrypto/WASM) — decides whether per-frame state-channel signing is affordable vs reliable-channel-only. (Native ~15.6 µs sign / ~46 µs verify single-signature; WASM single-thread, no AVX2, several× slower.)
+- **Replication bandwidth per peer** — the pre-delta native baseline is in `/slice-check` (742 B/s @ 2 entities, 20 Hz); still to measure: post-delta-compression and post-interest-management (Phase 3), whether 30–60 Hz is affordable, and realistic entity counts.
+- **In-browser ed25519 sign/verify cost** (via WebCrypto/WASM) — decides whether per-frame state-channel signing is affordable vs reliable-channel-only. (Native measured 13.4 µs sign / 25.7 µs verify with the opt-level=3 crypto override; WASM single-thread, no AVX2, several× slower — measure it.)
 - **STUN-only connection failure / P2P connection-success rate** — fraction of peers behind symmetric NAT / restrictive firewalls requiring TURN (est. ~15–25%, some up to ~30%). Silent failure accepted on free tiers; Mode 3 provides TURN.
 - Use **`twiggy`** to record per-function/section byte counts per release (not just total file size) so WASM-size regressions can be attributed to specific code, paired with the wasm-opt/brotli totals. *Acceptance:* `twiggy top` output is captured alongside the size table each release.
-- **Peer RTT / jitter** — measure via periodic DataChannel ping/echo; this is the input that sizes interpolation buffers and the reconciliation window (WebRTC P2P is typically <50 ms on good networks). Add it to the instrumentation table. *Acceptance:* RTT and jitter per peer appear in the `/slice-check` table.
 
 ## Phased build sequence
 
-### PHASE 1 — THE VERTICAL SLICE (build FIRST) [HIGH]
+### PHASE 1 — THE VERTICAL SLICE — remaining: environment-gated residuals [LOW]
 
-**Goal:** one ownership-explicit Bevy+Rhai mini-game; two peers over a matchbox WebRTC DataChannel, each authoritative over its own entities, replicating quantized snapshots (unreliable channel) + events (reliable channel) as Mode 2; run the SAME sim headless-authoritative as Mode 3; prove that swapping ONLY authority assignment yields both modes with NO logic fork; deliberately exercise one A→B ownership handoff. Instrument everything and de-risk replication, authority-swap, handoff, matchbox transport, and Rhai integration at once. **The slice does not functionally sign** — it only measures sign/verify cost (signing lands in Phase 6).
+**Scope note:** the slice exists to prove the authority-swap, and that gate PASSED (ADR-0014; the full
+trail is ADR-0011…ADR-0016 in `DECISIONS.md`, live status in `PROJECT_STATE.md`). Everything left in this
+phase needs an environment this dev setup lacks: a rendering Bevy client, a desktop browser (WSL2 headless
+never completes the matchbox handshake — ADR-0012), or real-network peers.
 
-**Workflow:** plan-mode-first for every replication/authority task; TDD (human specifies cases); netcode-auditor after each implementation; small commits.
+**Browser-tab transport verification** [LOW]
+- Verify the wasm demo two-tab run in a real desktop browser (or non-WSL CI): `cargo run -p services`,
+  `./scripts/build-wasm.sh`, `./scripts/serve.sh`, open `http://localhost:8080/` in two tabs (or run
+  `node scripts/e2e-two-tab.mjs` where headless gathering completes). *Acceptance:* both tabs' consoles
+  log `[uniblox-demo][STATE]` and `[uniblox-demo][EVENT]` receipts from the other peer — two browser tabs
+  connected P2P, data on both channels.
 
-> **Project + build + AI-workflow scaffolding is DONE** (see `PROJECT_STATE.md`): the `crates/*` workspace + size-optimized release profile + single-threaded stance; the full `.claude/` AI workflow (four subagents, five slash commands, four hooks + the `pre-commit` gate); the build-pipeline scripts + capability page + `.mcp.json`; and a **Nix flake devShell** (`flake.nix`/`.envrc`, ADR-0010) that pins Rust + the WASM toolchain (`wasm-bindgen`/`wasm-opt`/`brotli`/`twiggy`/`node`) with direnv auto-activation. `scripts/build-wasm.sh` runs end-to-end. Its remaining follow-ups are distributed to their homes below: **Instrumentation** (meaningful two-build artifacts + Bevy feature-prune, once the client renders), the **AI-workflow → MCP servers** note (bring the servers up), and **Phase 14** (the Web Audio worklet).
-
-**Transport: matchbox two-channel — residual: browser-tab verification** [LOW]
-The core is DONE (ADR-0012): `crates/transport` wraps matchbox 0.14 with the two settled channels
-(state=0 unreliable, events=1 reliable); `crates/services` is the room-based full-mesh signaling binary
-(`?next=N` lands with Phase 5's custom topology); a hermetic native↔native two-peer test proves data flows
-on both channels through real WebRTC + real signaling; the wasm client demo + `scripts/e2e-two-tab.mjs`
-exist. What remains is only the literal browser-tab run, blocked in THIS dev environment: matchbox 0.14's
-wasm handshake waits for ICE-gathering-complete before sending its offer, and WSL2 headless Chrome never
-fires 'complete' with any iceServers set (see ADR-0012; Playwright-MCP lacked a browser and the Chrome
-extension was disconnected).
-- Verify in a real desktop browser (or non-WSL CI): `cargo run -p services`, `./scripts/build-wasm.sh`,
-  `./scripts/serve.sh`, open `http://localhost:8080/` in two tabs (or run `node scripts/e2e-two-tab.mjs`
-  where headless gathering completes). *Acceptance:* both tabs' consoles log `[uniblox-demo][STATE]` and
-  `[uniblox-demo][EVENT]` receipts from the other peer — two browser tabs connected P2P, data on both channels.
-
-**Instrumentation — residual: browser-side metrics** [LOW — blocked on the Bevy client / desktop browser / real network]
-The native measurement core is DONE: `cargo run --release -p replication --example slice_metrics` measures
-replication bandwidth/peer at the ~20 Hz net tick (742 B/s state @ 2 entities, ~38 B/msg), DataChannel
-RTT/jitter (ping/echo), and native ed25519 sign/verify (13.4/25.7 µs — after the opt-level=3 crypto override;
-the size profile was ~35× slower on verify, a recorded Phase-6 consideration); `/slice-check` prints the table
-with labeled pendings. What remains is environment-gated:
-- Measure in-browser: cold-load TTI, in-browser ed25519 sign/verify (needs the rendering Bevy client and/or a
-  desktop browser — WSL2 headless cannot complete the matchbox handshake, ADR-0012), and STUN-only connection
-  success rate (needs real-network peers). *Acceptance:* the `/slice-check` table's pending rows fill with
-  measured values.
+**Browser-side instrumentation** [LOW — needs the Bevy client / desktop browser / real network]
+- Measure in-browser: cold-load TTI, in-browser ed25519 sign/verify, and STUN-only connection success
+  rate (real-network peers). *Acceptance:* the `/slice-check` table's pending rows fill with measured
+  values.
 - Once the Bevy client renders, run `scripts/build-wasm.sh` to produce **meaningful** two-build WASM artifacts (WebGPU: `--features webgpu` + `RUSTFLAGS=--cfg=web_sys_unstable_apis`; WebGL2: default) and confirm `crates/client/web/index.html` loads the correct bundle per `navigator.gpu`. *Acceptance:* both artifacts produced from the real client; the page loads the right one; the build prints raw→bindgen→wasm-opt→brotli sizes. (Do NOT claim the stub's byte-identical KB output as this.)
 - Feature-prune Bevy via its **`2d`/`3d`/`ui` cargo feature collections** (verify exact collection names against Bevy 0.19 docs) rather than hand-listing features, and record the **`wasm-opt -Oz --converge`** (fixed-point) size deltas. *Acceptance:* the build prints size deltas from feature-pruning and from `--converge`. (Blocked: Bevy is added only when the client renders.)
 
 ### PHASE 2 — Transport hardening [MIXED]
 **Goal:** production-grade transport across browser and native/server.
-- str0m ↔ BROWSER matchbox verification (the native core is DONE, ADR-0015: `Str0mPeer` speaks matchbox signaling + negotiated no-DCEP channels; str0m↔native-matchbox(webrtc-rs) and str0m↔str0m proven hermetically on both channels, both role directions; the raw channel parameters are recorded in `crates/transport/CLAUDE.md` and derived from `CHANNEL_SPECS`). The browser pairing is environment-gated exactly like the ADR-0012 browser-tab residual — WSL2 headless cannot complete the matchbox handshake; run on a desktop browser: wasm demo tab + `Str0mPeer` in the same room. *Acceptance:* a native str0m peer exchanges data with a browser matchbox peer on both channels, with matching channel semantics (unreliable/unordered state, reliable/ordered events) confirmed on both.
-- STUN/TURN residuals (the policy + relay proof are DONE, ADR-0016: `IceConfig` tiers, `connect_with_ice`, hermetic coturn relay/negative/pass-through tests): **measure the STUN-only failure rate** — a real-network fleet metric (the §"measurement gaps" entry), needs peers behind real NATs; **production coturn deployment + per-session TURN credential issuance** land with the Phase-6 entitlement boundary. [MIXED] *Acceptance:* failure-rate telemetry exists once real sessions run; Mode-3 join hands the client short-lived TURN credentials.
+- Verify str0m ↔ BROWSER matchbox on a desktop browser (environment-gated like the Phase-1 browser residuals — ADR-0012): the wasm demo tab + a `Str0mPeer` (ADR-0015) in the same room. [LOW] *Acceptance:* a native str0m peer exchanges data with a browser matchbox peer on both channels, with matching channel semantics (unreliable/unordered state, reliable/ordered events) confirmed on both.
+- Measure the STUN-only failure rate and real-network RTT/jitter — fleet metrics (§"Measurement gaps"); need peers behind real NATs (the loopback RTT baseline is not a sizing input for Phase-3 interpolation buffers). [LOW] *Acceptance:* telemetry reports the STUN-only connection-success fraction and per-peer RTT/jitter distributions once real sessions run. (Production TURN deployment + per-session credential minting are Phase-9 bullets; the transport side — `IceConfig`/`connect_with_ice`, ADR-0016 — is ready for them.)
 - Reconnect / ICE-restart handling. [MIXED]
 
 ### PHASE 3 — Replication depth [HIGH]
@@ -211,7 +196,7 @@ with labeled pendings. What remains is environment-gated:
 ### PHASE 6 — Identity + accounts + billing [MIXED]
 - Device keypair per install: browser WebCrypto **non-extractable** key in IndexedDB; native OS keyring. This is the keypair the "reliable channel always signed" invariant depends on. **[HIGH for key handling.]** *Acceptance:* key persists; never exportable in browser.
 - Mode 2 op signing (`ed25519-dalek`): **always sign the reliable channel** (now that the Phase 6 keypair exists); per-frame state-channel signing configurable and measured. **[HIGH.]** *Acceptance:* tamper-evident ops; verify cost measured; reliable-channel events are signed and verified.
-- Evaluate **`ed25519-dalek` batch verification (`verify_batch`)** for per-frame verification — verification, not signing, is the cost center. At ~30 Hz in an 8-peer mesh a peer verifies ~210 sig/s; batching a tick's packets amortizes far below sequential single-verify (native single ~46 µs), which decides whether per-frame state-channel signing fits the frame budget vs defaulting to reliable-channel-only. *Acceptance:* measured batched verify/sig in-browser is recorded in the instrumentation table.
+- Evaluate **`ed25519-dalek` batch verification (`verify_batch`)** for per-frame verification — verification, not signing, is the cost center. At ~30 Hz in an 8-peer mesh a peer verifies ~210 sig/s; batching a tick's packets amortizes far below sequential single-verify (native measured 25.7 µs — and ONLY with the opt-level=3 crypto override; the size profile is ~35× slower, a live wasm size-vs-speed tradeoff for this phase), which decides whether per-frame state-channel signing fits the frame budget vs defaulting to reliable-channel-only. *Acceptance:* measured batched verify/sig in-browser is recorded in the instrumentation table.
 - OAuth account for Mode 3; billing via a hosted payment provider (raw card data never touches our systems). **[MIXED — entitlement boundary is HIGH; wiring is LOW.]** *Acceptance:* entitlement gates Mode 3 join; no PAN in our systems.
 
 ### PHASE 7 — Persistence [LOW]
@@ -304,7 +289,7 @@ with labeled pendings. What remains is environment-gated:
 | STUN-only Mode 2 failures | 15–25% peers excluded | Accept; upsell Mode 3 (TURN) |
 | WASM 4GB memory cap | Asset streaming required | Accept; memory64 immature |
 | Browser storage evictable | Local caches can vanish under storage pressure | Request persistent storage; re-fetch from content-addressed store |
-| Slower WASM crypto | Per-frame signing several× native ~15.6µs | Sign reliable channel; make state-sign configurable |
+| Slower WASM crypto | Per-frame signing several× native (13.4 µs sign / 25.7 µs verify measured) | Sign reliable channel; make state-sign configurable |
 | Cross-owner interactions laggy | Remote-vs-remote interactions interpolated, higher latency | Accept; documented ceiling, do not re-simulate locally |
 | Un-attestable browser client | Mode 3 AC weaker than kernel-AC | Accept; document ceiling |
 
@@ -329,14 +314,13 @@ Compact list; see **docs/CONTEXT.md** for the full rationale.
 ## Go/no-go gates & staged next steps
 
 **Gates:**
-- **Size-budget gate (before Phase 1 netcode):** if the WebGPU+WebGL2 two-build size after `wasm-opt`+brotli is prohibitive for your cold-load target (the "upwards of 30MB → ~15MB" range unacceptable), pause and run a size-budget spike (feature-prune Bevy, lazy-load assets) before proceeding.
+- **Size-budget gate (when the Bevy client lands):** if the WebGPU+WebGL2 two-build size after `wasm-opt`+brotli is prohibitive for your cold-load target (the "upwards of 30MB → ~15MB" range unacceptable), pause and run a size-budget spike (feature-prune Bevy, lazy-load assets) before proceeding.
 - Define the currently-undefined cold-load target the size-budget gate tests against: **≤ ~8 MB brotli per WASM build**, aiming for a **playable first frame in ~2–5 s on ~5–10 Mbps** links (treat >~1 s first-contentful-paint on a high-end desktop as a signal to prune harder). These are post-`wasm-opt`+brotli *targets to validate*, not the refuted sub-3 MB uncompressed claim. *Acceptance:* the gate passes/fails against these numbers.
-- **Architecture go/no-go gate (the replication → authority-swap → ownership-handoff items) — the gate for the whole architecture:** if you cannot demonstrate Mode 2 and Mode 3 from one simulation by changing only authority (the authority-swap item), or a clean A→B handoff (the ownership-handoff item), **STOP** and revisit the replication design before building any services — everything downstream assumes the authority-swap works.
 - **Benchmark thresholds that change the plan:** STUN-only failure materially above ~20–25% → prioritize TURN earlier / reconsider free-tier P2P expectations; per-frame sign/verify cost too high in-browser → default to reliable-channel-only signing; cold-load unacceptably slow → invest in binary-splitting/lazy assets before feature work.
 
 **Staged next steps:**
-1. **Scaffolding is done; begin with the Rhai-bridge item** — build tooling, the AI-workflow scaffolding (CLAUDE.md, subagents, hooks, slash commands, MCP, flake), and the always-do gates are in place; get the Rhai bridge working before any netcode. Apply the size-budget gate above.
-2. **Treat the replication → authority-swap → ownership-handoff items as the go/no-go gate for the whole architecture** (see gate above). Do not build services until the slice proves the authority-swap and a clean handoff.
-3. **Only after the slice is green, fan out.** Phases 4–8 (Mode 1, services, identity/billing, persistence, publish) are LOW/MIXED and safe to delegate broadly with acceptance criteria as the contract; run them in parallel git worktrees if using multiple sessions.
+1. **Finish Phase 2 (transport hardening)** — reconnect/ICE-restart, plus the environment-gated verifications (desktop-browser pairings, real-network failure-rate telemetry) as environments become available.
+2. **The Bevy client work** closes the client-gated Phase-1 residuals: meaningful two-build WASM sizes against the size-budget gate above, cold-load, in-browser metrics, and unblocks the Phase-14 Web Audio worklet. (The desktop-browser and real-network residuals have their own environment gates.)
+3. **Fan out Phases 4–8** (Mode 1, services, identity/billing, persistence, publish) — LOW/MIXED, safe to delegate broadly with acceptance criteria as the contract; run them in parallel git worktrees if using multiple sessions.
 4. **Sequence the two HIGH-RISK deep passes (Phase 3 replication depth, Phase 12 sandbox) with a human owner each.** Never let these merge on auto-review alone; each goes to a fresh auditor subagent.
-5. **Instrument the measurement gaps in the slice and re-report every phase:** WASM binary size per build (before/after `wasm-opt -Oz` + brotli, within the wasm32 4 GB ceiling); cold-load time in-browser; replication bandwidth per peer at the network tick (~20–30 Hz default, measure 30–60 Hz); per-message sign/verify cost in-browser (ed25519); STUN-only connection failure rate (plan 15–25%; TURN provided only in Mode 3).
+5. **Keep instrumenting the measurement gaps and re-report every phase:** WASM binary size per build (before/after `wasm-opt -Oz` + brotli, within the wasm32 4 GB ceiling); cold-load time in-browser; replication bandwidth per peer post-delta/AOI (and whether 30–60 Hz is affordable); per-message sign/verify cost in-browser (ed25519); STUN-only connection failure rate (plan 15–25%; TURN provided only in Mode 3).
