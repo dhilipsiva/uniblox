@@ -171,21 +171,31 @@ async fn e2e_two_peer_replication_and_handoff() {
     }
 
     // Post-handoff: B computes the entity (it advances under B's authority)
-    // and replicates it BACK to A under the same identity.
+    // and replicates it BACK to A under the same identity — A's view of e_a
+    // must ADVANCE too (A now applies B's state through the same gates).
+    // NOTE: checking A's Owner view alone would be trivially true from A's
+    // local flip at transfer time (auditor finding) — the position advance is
+    // the real replicate-back evidence.
     let (proxy_e, before) = b.entity_owned_by(b.id).unwrap();
+    let a_before = *a.world.get::<Position>(e_a).unwrap();
     let deadline = tokio::time::Instant::now() + DEADLINE;
     loop {
         a.pump();
         b.pump();
         let now = *b.world.get::<Position>(proxy_e).unwrap();
-        let a_view = a.world.get::<Owner>(e_a).map(|o| o.0);
-        if now.x > before.x + 1.0 && a_view == Some(b.id) {
+        let a_now = *a.world.get::<Position>(e_a).unwrap();
+        if now.x > before.x + 1.0 && a_now.x > a_before.x + 1.0 {
             break;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "adopted entity never advanced under B's authority"
+            "adopted entity never advanced under B's authority AND replicated back to A"
         );
         tokio::time::sleep(POLL).await;
     }
+    assert_eq!(
+        a.world.get::<Owner>(e_a).map(|o| o.0),
+        Some(b.id),
+        "A must regard B as the owner"
+    );
 }

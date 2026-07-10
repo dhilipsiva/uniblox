@@ -4,7 +4,7 @@ Living snapshot of where uniblox is. Update it when a phase's status changes.
 The **why** behind decisions lives in `DECISIONS.md`; the **what/how** lives in
 `docs/final-buildspec.md`; the backlog lives in `TODO.md`.
 
-**Current phase: Phase 1 (the vertical slice) — THE AUTHORITY-SWAP GATE PASSED (ADR-0014). Scaffolding, the Rhai↔Bevy bridge, the mini-game, transport, replication, and the Mode-3 proof are done; next is the ownership handoff over a live session [HIGH].**
+**Current phase: Phase 1 (the vertical slice) — THE AUTHORITY-SWAP GATE PASSED (ADR-0014) and the ownership-handoff item is closed (auditor-verified). Only Instrumentation remains in the slice.**
 
 ## Done
 - **Cargo workspace** — virtual manifest, 9 crates under `crates/*` (glob members),
@@ -47,6 +47,13 @@ The **why** behind decisions lives in `DECISIONS.md`; the **what/how** lives in
   replication, Mode 2 vs Mode 3 differing ONLY in spawn/ownership data; Mode-3 clients emit zero
   messages; ~64 ticks/s evidence; net cadence decoupled from the fixed tick. netcode-audited (no hidden
   fork; its reproduced M2 replay-order flake fixed + soaked 6/6).
+- **Ownership handoff (exercise once)** — CLOSED, auditor-verified against committed tests: reliable-channel
+  Transfer mid-session (T26, matchbox channel config verified in source), clean transfer + stable identity
+  (T18), no double-ownership (same-tick local flip + T19/T24 gates), no dropped entity (T18/T20/T26/T27),
+  apply→compute switch (T10 before / T18 after — the slice's interpolate→predict stand-in per ADR-0013).
+  Auditor findings actioned: T26 now genuinely asserts the replicate-back to A (the old Owner-view predicate
+  was trivially true); T18 asserts the old owner's entity freezes; new T28 covers the mint-on-transfer arm.
+  Phase-3 carries: adoption-switch re-verification with real buffers; hand-back/repeated/loss handoffs.
 
 ## Blocked / deferred (prerequisites do not exist yet)
 - **Real two-build WASM artifacts + size table** — WASM toolchain is now provided by the flake;
@@ -59,11 +66,8 @@ The **why** behind decisions lives in `DECISIONS.md`; the **what/how** lives in
 - **Web Audio worklet** investigation — needs a running WASM client with audio.
 
 ## Next
-- **Ownership handoff (exercise once)** [HIGH]: one explicit A→B handoff mid-session as a
-  reliable-channel event. The `transfer_ownership` machinery already exists and is e2e-tested
-  (T18–T20, T26 phase 2) — this item exercises it as the named slice deliverable and closes the
-  go/no-go gate's second half.
-- Then **Instrumentation** [LOW]: emit the slice metrics (`/slice-check` table).
+- **Instrumentation** [LOW]: emit the slice metrics (`/slice-check` table) — the last Phase-1 item
+  (meaningful WASM artifacts + Bevy feature-prune remain gated on the Bevy client rendering).
 
 ## Toolchain notes
 WSL2 Ubuntu. **The toolchain comes from the Nix flake devShell** (ADR-0010): pinned Rust 1.96.1

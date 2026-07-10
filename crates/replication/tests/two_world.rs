@@ -436,7 +436,17 @@ fn handoff_clean_authority_transfer() {
         .expect("A owns e_a");
     assert_eq!(a.owner(e_a), b.id, "A's local Owner must flip immediately");
 
-    a.sim_tick(); // A must NOT integrate e_a anymore (Remote arm on A now)
+    // A must NOT integrate e_a anymore (Remote arm on A now) — assert the
+    // freeze directly, not just the empty collect (auditor hardening).
+    let frozen = a.pos(e_a);
+    a.sim_tick();
+    let after_tick = a.pos(e_a);
+    assert_eq!(
+        frozen.x.to_bits(),
+        after_tick.x.to_bits(),
+        "the old owner must stop computing a transferred entity"
+    );
+    assert_eq!(frozen.y.to_bits(), after_tick.y.to_bits());
     let out_a = a.collect();
     assert!(
         state_entries(&out_a).is_empty(),
@@ -677,6 +687,67 @@ fn receiver_rejects_unowned_sender_state() {
         5.0f32.to_bits(),
         "own authority must never be overwritten"
     );
+}
+
+// ───────────────────────────── T28 ─────────────────────────────
+
+/// T28 (auditor test-debt) — transferring an entity that was NEVER collected
+/// (no NetEntityId minted yet) must mint + announce it first: the reliable
+/// channel carries Spawn THEN OwnershipTransfer, in that order, so receivers
+/// can resolve the transfer. The receiver ends with one proxy owned by B.
+#[test]
+fn transfer_of_uncollected_entity_mints_then_transfers() {
+    let mut a = TestPeer::new(1);
+    let mut b = TestPeer::new(2);
+    let e = a.spawn(3.0, 4.0, 2.0, 0.0);
+
+    // NO collect between spawn and transfer: the mint-on-transfer arm.
+    a.repl
+        .transfer_ownership(&mut a.world, e, b.id)
+        .expect("A owns e");
+    let out = a.collect();
+
+    let events: Vec<NetEvent> = out
+        .events
+        .iter()
+        .map(|bytes| decode_event(bytes).unwrap().event)
+        .collect();
+    let spawn_idx = events
+        .iter()
+        .position(|ev| matches!(ev, NetEvent::Spawn { .. }))
+        .expect("a Spawn must be announced for the unmapped entity");
+    let transfer_idx = events
+        .iter()
+        .position(|ev| matches!(ev, NetEvent::OwnershipTransfer { .. }))
+        .expect("the OwnershipTransfer must be announced");
+    assert!(
+        spawn_idx < transfer_idx,
+        "Spawn must precede Transfer on the reliable channel"
+    );
+    let spawn_id = match events[spawn_idx] {
+        NetEvent::Spawn { id, .. } => id,
+        _ => unreachable!(),
+    };
+    match events[transfer_idx] {
+        NetEvent::OwnershipTransfer { id, new_owner } => {
+            assert_eq!(id, spawn_id, "both events must address the same identity");
+            assert_eq!(new_owner, b.id);
+        }
+        _ => unreachable!(),
+    }
+    // A no longer owns it at collect time — no state entry.
+    assert!(state_entries(&out).is_empty());
+
+    // Receiver resolves the pair: one proxy, owned by B, at the announced state.
+    b.deliver_all(a.id, &out);
+    assert_eq!(b.entity_count(), 1);
+    let proxy = b.entity_owned_by(b.id);
+    let pos = b.pos(proxy);
+    assert!(approx(pos.x, 3.0) && approx(pos.y, 4.0));
+
+    // B is now the authority: its sim computes the adopted entity.
+    b.sim_tick();
+    assert!(b.pos(proxy).x > 3.0, "B must compute the adopted entity");
 }
 
 // ───────────────────────────── T27 ─────────────────────────────

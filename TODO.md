@@ -163,9 +163,6 @@ extension was disconnected).
   where headless gathering completes). *Acceptance:* both tabs' consoles log `[uniblox-demo][STATE]` and
   `[uniblox-demo][EVENT]` receipts from the other peer — two browser tabs connected P2P, data on both channels.
 
-**Ownership handoff (exercise once)** [HIGH]
-- Implement one explicit A→B ownership handoff mid-session as a reliable-channel event. *Acceptance:* authority transfers cleanly; no double-ownership; no dropped entity; the receiver switches from interpolate to predict.
-
 **Instrumentation** [LOW — delegate]
 - Emit the metrics (WASM size, cold-load, bandwidth/peer, sign/verify cost, connection success) from the running slice. *Acceptance:* the `/slice-check` step prints the table.
 - Once the Bevy client renders, run `scripts/build-wasm.sh` to produce **meaningful** two-build WASM artifacts (WebGPU: `--features webgpu` + `RUSTFLAGS=--cfg=web_sys_unstable_apis`; WebGL2: default) and confirm `crates/client/web/index.html` loads the correct bundle per `navigator.gpu`. *Acceptance:* both artifacts produced from the real client; the page loads the right one; the build prints raw→bindgen→wasm-opt→brotli sizes. (Do NOT claim the stub's byte-identical KB output as this.)
@@ -183,7 +180,8 @@ extension was disconnected).
 **Goal:** turn the slice's replication into a robust layer. Every task: plan-mode + netcode-auditor + TDD + deterministic replay tests.
 - Delta compression vs last-acked baseline, per-peer ack tracking. *Acceptance:* bandwidth drops measurably vs full snapshots.
 - Interest management (AOI, spatial grid) as a separate bandwidth+visibility layer. *Acceptance:* out-of-range entities not replicated; structurally withholds out-of-view state (feeds the Mode 3 read-cheat defense).
-- Prediction/reconciliation/interpolation buffers (predict-own, interpolate-others). *Acceptance:* smooth remote motion; own-entity correction on divergence.
+- Prediction/reconciliation/interpolation buffers (predict-own, interpolate-others). *Acceptance:* smooth remote motion; own-entity correction on divergence. **Re-verify the handoff adoption switch once these exist** (buffer flush + prediction-history seeding on adoption have failure modes the slice's snap-apply tests cannot see — Phase-1 auditor note).
+- Handoff depth beyond the slice's exercise-once: hand-back (A→B→A) and repeated transfers; handoff under real packet loss; chained-transfer observer reordering (the documented ADR-0013 R6-class gaps). *Acceptance:* each scenario has a deterministic test; the reordering gaps heal via resync.
 - Anti-entropy resync: periodic state-hash + full-snapshot refetch from the owning peer (no CRDT). *Acceptance:* injected desync self-heals.
 - Ownership-handoff failure modes: **double-ownership resolved by coordinator sequence number** (the coordinator's monotonic seq is the tiebreak; in Mode 2 ownership transfer is **coordinator-arbitrated**), plus orphaned-entity-on-owner-drop reassignment via host-migration election (lowest-peer-ID tiebreak / oldest-survivor join-order). *Acceptance:* kill an owner mid-session → entity reassigned exactly once; two simultaneous claims resolve to one by coordinator sequence number.
 - Document the **cross-owner interaction quality gap** as an **accepted limitation** (not a bug): interactions between two remotely-owned entities are interpolated/laggy — each client sees both through interpolation and neither predicts them, so remote-vs-remote interactions have inherently higher latency. *Acceptance:* limitation documented; no attempt to re-simulate remote-vs-remote interactions locally.
