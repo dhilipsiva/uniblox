@@ -4,7 +4,7 @@ Living snapshot of where uniblox is. Update it when a phase's status changes.
 The **why** behind decisions lives in `DECISIONS.md`; the **what/how** lives in
 `docs/final-buildspec.md`; the backlog lives in `TODO.md`.
 
-**Current phase: Phase 1 (the vertical slice) — scaffolding, the Rhai↔Bevy bridge, the mode-agnostic mini-game, and the matchbox two-channel transport core done; next is the custom replication protocol [HIGH].**
+**Current phase: Phase 1 (the vertical slice) — scaffolding, the Rhai↔Bevy bridge, the mini-game, the transport core, and the custom replication protocol done; next is the authority-swap to Mode 3 [HIGH].**
 
 ## Done
 - **Cargo workspace** — virtual manifest, 9 crates under `crates/*` (glob members),
@@ -35,6 +35,12 @@ The **why** behind decisions lives in `DECISIONS.md`; the **what/how** lives in
   two-peer datachannel test green, wasm client demo + `scripts/e2e-two-tab.mjs`. The nibli prior-art note
   was resolved obsolete (repo repurposed). Residual: the browser-tab run — blocked in WSL2 headless (ICE
   gathering never completes; matchbox wasm waits on it), verifiable on a desktop browser (see TODO).
+- **The custom replication protocol** (ADR-0013, HIGH) — `protocol` wire format (postcard, spawner-stable
+  `NetEntityId`, quantized `QVec2`, reserved signature field) + `replication` (authority-gated cached-
+  `SystemState` sender, newest-seq LWW receiver, current-Owner validity, keyframes, `transfer_ownership`,
+  late-join replay). **27-test battery green incl. e2e over real WebRTC** — tests committed before impl;
+  netcode-audited (owned-ghost fix + documented cross-sender handoff gaps for Phase 3 resync). Snap-apply
+  per decision — interpolation buffers are Phase 3.
 
 ## Blocked / deferred (prerequisites do not exist yet)
 - **Real two-build WASM artifacts + size table** — WASM toolchain is now provided by the flake;
@@ -47,11 +53,10 @@ The **why** behind decisions lives in `DECISIONS.md`; the **what/how** lives in
 - **Web Audio worklet** investigation — needs a running WASM client with audio.
 
 ## Next
-- **The custom replication protocol** [HIGH — plan-mode-first, TDD with human-specified cases,
-  netcode-auditor]: wire format with quantized floats + delta/baseline over the transport's two channels.
-- Then the authority-swap to Mode 3 + one A→B handoff. **The replication → authority-swap → handoff items
-  are the architecture go/no-go gate** — do not build services until the authority-swap and a clean handoff
-  are proven.
+- **Authority-swap to Mode 3 (the proof)** [HIGH]: the SAME sim headless-authoritative
+  (`MinimalPlugins` + fixed tick, server owns all), then the side-by-side Mode-2/Mode-3 demo — the
+  architecture go/no-go gate, together with the live A→B handoff item (whose `transfer_ownership`
+  machinery already exists and is e2e-tested).
 
 ## Toolchain notes
 WSL2 Ubuntu. **The toolchain comes from the Nix flake devShell** (ADR-0010): pinned Rust 1.96.1

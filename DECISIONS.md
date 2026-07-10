@@ -154,3 +154,41 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
     + `console_log` (Rust panics and matchbox internals visible in the browser console — essential for wasm
     debugging).
 - **Status:** Accepted (2026-07-10).
+
+## ADR-0013 — The custom replication protocol: wire format + authority-gated sender/receiver
+- **Context:** the Phase-1 slice's HIGH-risk core — per-entity, authority-gated state replication over the
+  two-channel transport, with no existing crate to adopt (settled). Designed adversarially (out-of-order
+  delivery, cross-channel and cross-sender races, entity-identity aliasing, echo-back); full 26-test battery
+  user-specified and committed before implementation; fresh netcode-auditor on the diff.
+- **Decision:**
+  - **Wire format (postcard, `crates/protocol`):** versioned messages (postcard is not self-describing);
+    `NetEntityId{spawner, index, generation}` is a **spawner-stable identity** minted once — identity ≠
+    authority (current authority lives only in the proxy's `Owner`, mutated only by reliable
+    `OwnershipTransfer` events). Quantized fixed-point `QVec2` (scale 1024; tolerance ≤1/2048 for |v|≤16384;
+    saturating). `StateEntry` uses **Options-only presence** (mask is derived — cannot disagree with payload)
+    and **ABSOLUTE values, never arithmetic deltas** (lossy channel; Phase 3's acked baselines own those).
+    `EventMsg.sig` is reserved (always None) for Phase-6 signing. `PeerId::from_uuid_bytes` = first 8 bytes
+    BE of the transport UUID — a pure function so all peers agree; interim until Phase-5 session join.
+  - **Sender (`crates/replication`):** ONE cached `SystemState` for change detection (a fresh
+    `Changed<T>` query in a manually-driven World anchors to `last_change_tick` and reports everything
+    changed forever); authority gate (`authority_of`) strictly precedes any `is_changed` consult and no
+    `Changed` filter exists in the crate (echo-back structurally impossible); ids resolved via the
+    bidirectional map, minting reachable only for self-spawned entities (adopted ones are mapped at Spawn
+    receipt — no namespace aliasing); keyframe (full masks) every 30 collects as the interim
+    stale-forever guard; per-message size warn above ~1150B (SCTP fragmentation loss amplification;
+    splitting is Phase 3). Same-tick transfer-then-despawn purges the queued corpse events and announces a
+    valid Despawn instead (auditor F1 — prevents an unhealable owned ghost).
+  - **Receiver:** whole-message newest-seq-wins LWW (unordered channel; `last_seq` advances even when all
+    entries drop); full-`NetEntityId` map keying makes stale-generation/post-despawn/pre-spawn state inert
+    with no tombstones; **ownership validity: sender must be the CURRENT owner** (the only sound arbiter for
+    handoff races — per-sender seq streams are incomparable); `authority_of == Remote` apply-gate;
+    **snap-apply** (interpolation buffers are Phase 3; smoothing is the render boundary's job).
+  - **Handoff:** initiator flips local `Owner` the same tick it queues the reliable Transfer ⇒ no
+    double-authority window (≤½-RTT nobody-simulates freeze is the safe direction).
+- **Accepted gaps (documented + warn-logged; healed by Phase-3 anti-entropy resync — do NOT fix ad hoc):**
+  cross-sender event reordering after handoffs (Despawn-before-Spawn orphan; chained A→B→C transfers can
+  leave a fourth peer with a frozen wrong-owner proxy); late-join replay excludes entities the spawner no
+  longer owns; no peer-departure cleanup yet (`last_seq`/proxy maps grow; departed peers' proxies freeze —
+  Phase 3's owner-drop reassignment + session lifecycle own this). Bevy-0.19 note: a long-lived
+  `SystemState` outside schedules is not tick-clamped — recreate periodically on the Mode-3 server.
+- **Status:** Accepted (2026-07-10).
