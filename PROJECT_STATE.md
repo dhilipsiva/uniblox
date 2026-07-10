@@ -4,11 +4,10 @@ Living snapshot of where uniblox is. Update it when a phase's status changes.
 The **why** behind decisions lives in `DECISIONS.md`; the **what/how** lives in
 `docs/final-buildspec.md`; the backlog lives in `TODO.md`.
 
-**Current phase: THE PHASE-1 SLICE'S NATIVE CORE IS COMPLETE.** The authority-swap gate passed (ADR-0014),
-the handoff item is closed (auditor-verified), and instrumentation measures everything the slice can measure
-natively. Remaining Phase-1 work is exactly the client-gated residuals (Bevy client renders → real WASM
-sizes, cold-load, browser metrics; see TODO). Next up per the staged plan: **the Rhai↔Bevy bridge is done, so
-Phase 2+ fan-out is unblocked** — or the Bevy client work to close the residuals.
+**Current phase: PHASE 2 (transport hardening) IN PROGRESS.** The Phase-1 slice's native core is complete
+(authority-swap gate PASSED, ADR-0014); its remaining work is exactly the client-gated residuals (Bevy
+client renders → real WASM sizes, cold-load, browser metrics; see TODO). Phase 2 has begun: the str0m
+native/server peer is landed and matchbox-interoperable (ADR-0015).
 
 ## Done
 - **Cargo workspace** — virtual manifest, 9 crates under `crates/*` (glob members),
@@ -58,6 +57,14 @@ Phase 2+ fan-out is unblocked** — or the Bevy client work to close the residua
   Auditor findings actioned: T26 now genuinely asserts the replicate-back to A (the old Owner-view predicate
   was trivially true); T18 asserts the old owner's entity freezes; new T28 covers the mint-on-transfer arm.
   Phase-3 carries: adoption-switch re-verification with real buffers; hand-back/repeated/loss handoffs.
+- **str0m native/server WebRTC peer** (ADR-0015, Phase 2) — `transport::Str0mPeer` (native-only): sans-IO
+  str0m 0.21 (`rust-crypto`, Nix-friendly) speaking matchbox's exact signaling wire (via `matchbox_protocol`
+  + blocking tungstenite) with one connection thread per remote peer running the canonical drain-to-Timeout
+  loop; matchbox's negotiated no-DCEP channels (ids 0/1, labels `matchbox_socket_{i}`) pre-declared both
+  roles. Interop proven hermetically: str0m↔native-matchbox BOTH role directions + str0m↔str0m, both
+  channels both ways (3 tests, soaked 4/4). Fresh-reviewer gate caught the trickle-order bug (candidates
+  before offer/answer are DROPPED by native matchbox — masked in tests by prflx discovery). Residuals:
+  browser pairing (desktop-browser, ADR-0012), TLS signaling, non-loopback bind, reconnect (later items).
 - **Instrumentation (native core)** — `slice_metrics` example + `/slice-check` table. **Measured (native
   loopback, 2026-07-10):** state channel 742 B/s per peer @ 2 entities (19.4 msg/s at the 20 Hz net tick,
   ~38 B/msg — comfortably inside the ~1150 B datagram budget); events steady 0 B/s; RTT 4.3 ms ± 0.6 ms
@@ -77,11 +84,11 @@ Phase 2+ fan-out is unblocked** — or the Bevy client work to close the residua
 - **Web Audio worklet** investigation — needs a running WASM client with audio.
 
 ## Next
-The slice's native core is complete — per the staged plan ("only after the slice is green, fan out"),
-candidates are: the **Bevy client rendering work** (closes every Phase-1 residual: real WASM sizes,
-cold-load, browser metrics, Web Audio) or the **Phase 2+ fan-out** (transport hardening; Phases 4–8 are
-LOW/MIXED and delegate-friendly). Phase 3 (replication depth) and Phase 12 (sandbox hardening) each need a
-human-owned HIGH pass.
+Phase 2 (transport hardening) is underway — str0m is landed; remaining Phase-2 items: two-channel config
+parameterization, STUN/TURN, reconnect/ICE-restart, plus the browser-pairing residuals. Other candidates:
+the **Bevy client rendering work** (closes every Phase-1 residual: real WASM sizes, cold-load, browser
+metrics, Web Audio); Phases 4–8 are LOW/MIXED and delegate-friendly. Phase 3 (replication depth) and
+Phase 12 (sandbox hardening) each need a human-owned HIGH pass.
 
 ## Toolchain notes
 WSL2 Ubuntu. **The toolchain comes from the Nix flake devShell** (ADR-0010): pinned Rust 1.96.1

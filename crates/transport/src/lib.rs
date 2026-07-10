@@ -20,6 +20,12 @@ use matchbox_socket::{WebRtcSocket, WebRtcSocketBuilder}; // only connect_hermet
 
 pub use matchbox_socket::{Error as TransportError, Packet, PeerId, PeerState};
 
+/// The native/server str0m peer (ADR-0015) — sans-IO WebRTC, matchbox-interoperable.
+#[cfg(not(target_arch = "wasm32"))]
+mod str0m_peer;
+#[cfg(not(target_arch = "wasm32"))]
+pub use str0m_peer::Str0mPeer;
+
 /// The message-loop future returned by [`Transport::connect`]. It drives
 /// signaling + WebRTC and MUST be polled (natively: spawn it on the executor;
 /// on wasm: `wasm_bindgen_futures::spawn_local`). It resolves only on

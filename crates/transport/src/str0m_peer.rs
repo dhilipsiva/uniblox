@@ -1,0 +1,710 @@
+//! `Str0mPeer` — the native/server WebRTC peer built on sans-IO str0m
+//! (ADR-0015). Speaks matchbox's signaling protocol and negotiates matchbox's
+//! pre-negotiated (no-DCEP) DataChannels, so it interoperates with matchbox
+//! peers (native webrtc-rs and browser) in the same room.
+//!
+//! The matchbox wire contract this implements (verified from vendored 0.14
+//! sources — see ADR-0015):
+//! - Signaling: WS text JSON, externally tagged. In: `{"IdAssigned":uuid}`,
+//!   `{"NewPeer":uuid}`, `{"PeerLeft":uuid}`, `{"Signal":{"sender":..,"data":..}}`.
+//!   Out: `{"Signal":{"receiver":..,"data":..}}`, bare `"KeepAlive"` (~10 s).
+//!   `PeerSignal::{Offer,Answer}` carry RAW SDP strings; `IceCandidate` carries
+//!   a DOUBLE-ENCODED JSON `RTCIceCandidateInit`; browsers also send the
+//!   `"null"` end-of-candidates sentinel (tolerated).
+//! - Roles: existing peers receive `NewPeer(joiner)` and OFFER; the newcomer
+//!   answers unsolicited offers. Both directions are implemented here.
+//! - Channels are `negotiated` (NO DCEP): both sides pre-create stream id 0
+//!   (label `matchbox_socket_0`, unreliable/unordered, max_retransmits=0) and
+//!   stream id 1 (`matchbox_socket_1`, reliable/ordered) — matching
+//!   [`crate::CHANNEL_STATE`]/[`crate::CHANNEL_EVENTS`]. NEVER reorder.
+//! - A peer is Connected when ALL channels are open.
+//!
+//! Threading model ("the driving loop", human-reviewed per the Phase-2 item):
+//! one blocking signaling thread (tungstenite; read-timeout loop that also
+//! drains an outbound queue and keeps alive) + ONE CONNECTION THREAD PER
+//! REMOTE PEER, each owning a UDP socket and an `Rtc`, running the canonical
+//! sans-IO loop. str0m's hard invariant is honored structurally: after EVERY
+//! mutation (`handle_input`, command application, SDP change) the loop drains
+//! `poll_output()` to `Output::Timeout` before the next mutation.
+//!
+//! Limitations (slice scope): `ws://` signaling only (no TLS); loopback/local
+//! UDP binding; peer threads exit on disconnect and are not restarted
+//! (reconnect/ICE-restart is a later Phase-2 item).
+
+use std::collections::HashMap;
+use std::net::{Ipv4Addr, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Mutex, Once};
+use std::time::{Duration, Instant};
+
+use matchbox_protocol::{PeerEvent, PeerId as MbPeerId, PeerRequest};
+use serde::{Deserialize, Serialize};
+use str0m::channel::{ChannelConfig as Str0mChannelConfig, ChannelId, Reliability};
+use str0m::net::{Protocol, Receive};
+use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc};
+
+use crate::{CHANNEL_EVENTS, CHANNEL_STATE, ChannelSendError, Packet, PeerState, TransportClosed};
+
+/// matchbox's `PeerSignal` (defined in matchbox_socket, not exported) —
+/// identical shape ⇒ identical externally-tagged JSON.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+enum PeerSignal {
+    IceCandidate(String),
+    Offer(String),
+    Answer(String),
+}
+
+/// The inner JSON of `PeerSignal::IceCandidate` (webrtc-rs `RTCIceCandidateInit`).
+#[derive(Serialize, Deserialize, Debug)]
+struct IceCandidateJson {
+    candidate: String,
+    #[serde(rename = "sdpMid", default, skip_serializing_if = "Option::is_none")]
+    sdp_mid: Option<String>,
+    #[serde(
+        rename = "sdpMLineIndex",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    sdp_mline_index: Option<u16>,
+    #[serde(rename = "usernameFragment", default)]
+    username_fragment: Option<String>,
+}
+
+enum Cmd {
+    Send { channel: usize, data: Box<[u8]> },
+    Signal(PeerSignal),
+    Close,
+}
+
+enum Role {
+    /// We received `NewPeer` for this remote — we make the offer.
+    Offerer,
+    /// The remote's offer arrives via `Signal` — we answer.
+    Answerer,
+}
+
+struct Shared {
+    id: Mutex<Option<MbPeerId>>,
+    conns: Mutex<HashMap<MbPeerId, Sender<Cmd>>>,
+    closed: AtomicBool,
+}
+
+/// The native str0m peer. Mirrors [`crate::Transport`]'s method surface so
+/// pump code is transport-agnostic.
+pub struct Str0mPeer {
+    shared: Arc<Shared>,
+    updates_rx: Receiver<(MbPeerId, PeerState)>,
+    state_rx: Receiver<(MbPeerId, Packet)>,
+    events_rx: Receiver<(MbPeerId, Packet)>,
+}
+
+impl Str0mPeer {
+    /// Connect to a matchbox signaling room (`ws://host:port/<room>`) and
+    /// negotiate with every peer in it. Non-blocking: threads run inside.
+    pub fn connect(room_url: &str) -> Str0mPeer {
+        install_crypto_provider();
+
+        let shared = Arc::new(Shared {
+            id: Mutex::new(None),
+            conns: Mutex::new(HashMap::new()),
+            closed: AtomicBool::new(false),
+        });
+        let (updates_tx, updates_rx) = std::sync::mpsc::channel();
+        let (state_tx, state_rx) = std::sync::mpsc::channel();
+        let (events_tx, events_rx) = std::sync::mpsc::channel();
+
+        let url = room_url.to_string();
+        let shared2 = Arc::clone(&shared);
+        std::thread::spawn(move || {
+            run_signaling(&url, &shared2, updates_tx, state_tx, events_tx);
+            shared2.closed.store(true, Ordering::SeqCst);
+        });
+
+        Str0mPeer {
+            shared,
+            updates_rx,
+            state_rx,
+            events_rx,
+        }
+    }
+
+    /// Drain peer connect/disconnect updates. Mirrors `Transport::poll_peers`.
+    pub fn poll_peers(&mut self) -> Result<Vec<(MbPeerId, PeerState)>, TransportClosed> {
+        let mut updates = Vec::new();
+        loop {
+            match self.updates_rx.try_recv() {
+                Ok(update) => updates.push(update),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    if updates.is_empty() {
+                        return Err(TransportClosed);
+                    }
+                    break;
+                }
+            }
+        }
+        if updates.is_empty() && self.shared.closed.load(Ordering::SeqCst) {
+            return Err(TransportClosed);
+        }
+        Ok(updates)
+    }
+
+    /// Our signaling-assigned id — `None` until `IdAssigned` arrives.
+    pub fn id(&mut self) -> Option<MbPeerId> {
+        match self.shared.id.lock() {
+            Ok(id) => *id,
+            Err(_) => None,
+        }
+    }
+
+    pub fn send_state(&mut self, peer: MbPeerId, data: Packet) -> Result<(), ChannelSendError> {
+        self.send_on(CHANNEL_STATE, peer, data)
+    }
+
+    pub fn send_event(&mut self, peer: MbPeerId, data: Packet) -> Result<(), ChannelSendError> {
+        self.send_on(CHANNEL_EVENTS, peer, data)
+    }
+
+    fn send_on(
+        &mut self,
+        channel: usize,
+        peer: MbPeerId,
+        data: Packet,
+    ) -> Result<(), ChannelSendError> {
+        let conns = self.shared.conns.lock().map_err(|_| ChannelSendError)?;
+        let tx = conns.get(&peer).ok_or(ChannelSendError)?;
+        tx.send(Cmd::Send { channel, data })
+            .map_err(|_| ChannelSendError)
+    }
+
+    pub fn recv_state(&mut self) -> Vec<(MbPeerId, Packet)> {
+        self.state_rx.try_iter().collect()
+    }
+
+    pub fn recv_events(&mut self) -> Vec<(MbPeerId, Packet)> {
+        self.events_rx.try_iter().collect()
+    }
+
+    /// Close all connections and the signaling loop.
+    pub fn close(&mut self) {
+        self.shared.closed.store(true, Ordering::SeqCst);
+        if let Ok(conns) = self.shared.conns.lock() {
+            for tx in conns.values() {
+                let _ = tx.send(Cmd::Close);
+            }
+        }
+    }
+}
+
+impl Drop for Str0mPeer {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+fn install_crypto_provider() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        str0m::crypto::from_feature_flags().install_process_default();
+    });
+}
+
+// ───────────────────────── signaling thread ─────────────────────────
+
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const WS_POLL: Duration = Duration::from_millis(20);
+
+fn run_signaling(
+    url: &str,
+    shared: &Arc<Shared>,
+    updates_tx: Sender<(MbPeerId, PeerState)>,
+    state_tx: Sender<(MbPeerId, Packet)>,
+    events_tx: Sender<(MbPeerId, Packet)>,
+) {
+    let (mut ws, _resp) = match tungstenite::connect(url) {
+        Ok(ok) => ok,
+        Err(err) => {
+            log::error!("[str0m] signaling connect failed: {err}");
+            return;
+        }
+    };
+    // Read with a timeout so the loop can also drain outbound signals.
+    if let tungstenite::stream::MaybeTlsStream::Plain(stream) = ws.get_ref()
+        && stream.set_read_timeout(Some(WS_POLL)).is_err()
+    {
+        log::error!("[str0m] cannot set WS read timeout");
+        return;
+    }
+
+    // Connection threads push outbound requests here; we own the WS writer.
+    let (out_tx, out_rx) = std::sync::mpsc::channel::<PeerRequest<PeerSignal>>();
+    let mut last_keepalive = Instant::now();
+
+    loop {
+        if shared.closed.load(Ordering::SeqCst) {
+            return;
+        }
+
+        // Outbound: signals from connection threads + keepalive.
+        while let Ok(request) = out_rx.try_recv() {
+            match serde_json::to_string(&request) {
+                Ok(text) => {
+                    if let Err(err) = ws.send(tungstenite::Message::text(text)) {
+                        log::error!("[str0m] signaling send failed: {err}");
+                        return;
+                    }
+                }
+                Err(err) => log::error!("[str0m] signaling encode failed: {err}"),
+            }
+        }
+        if last_keepalive.elapsed() >= KEEPALIVE_INTERVAL {
+            last_keepalive = Instant::now();
+            let keepalive: PeerRequest<PeerSignal> = PeerRequest::KeepAlive;
+            match serde_json::to_string(&keepalive) {
+                Ok(text) => {
+                    if let Err(err) = ws.send(tungstenite::Message::text(text)) {
+                        log::error!("[str0m] keepalive failed: {err}");
+                        return;
+                    }
+                }
+                Err(err) => log::error!("[str0m] keepalive encode failed: {err}"),
+            }
+        }
+
+        // Inbound.
+        let message = match ws.read() {
+            Ok(message) => message,
+            Err(tungstenite::Error::Io(err))
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
+            Err(err) => {
+                log::error!("[str0m] signaling read failed: {err}");
+                close_all(shared);
+                return;
+            }
+        };
+        let text = match message {
+            tungstenite::Message::Text(text) => text,
+            tungstenite::Message::Close(_) => {
+                log::info!("[str0m] signaling closed by server");
+                close_all(shared);
+                return;
+            }
+            _ => continue, // ping/pong/binary — tungstenite handles ping replies
+        };
+        let event: PeerEvent<PeerSignal> = match serde_json::from_str(&text) {
+            Ok(event) => event,
+            Err(err) => {
+                log::warn!("[str0m] undecodable signaling frame ({err}): {text}");
+                continue;
+            }
+        };
+
+        match event {
+            PeerEvent::IdAssigned(id) => {
+                if let Ok(mut slot) = shared.id.lock() {
+                    *slot = Some(id);
+                }
+            }
+            PeerEvent::NewPeer(remote) => {
+                // We are the existing peer — we offer.
+                spawn_connection(
+                    Role::Offerer,
+                    remote,
+                    shared,
+                    &out_tx,
+                    &updates_tx,
+                    &state_tx,
+                    &events_tx,
+                );
+            }
+            PeerEvent::PeerLeft(remote) => {
+                if let Ok(mut conns) = shared.conns.lock()
+                    && let Some(tx) = conns.remove(&remote)
+                {
+                    let _ = tx.send(Cmd::Close);
+                }
+                let _ = updates_tx.send((remote, PeerState::Disconnected));
+            }
+            PeerEvent::Signal { sender, data } => {
+                let tx = {
+                    let conns = match shared.conns.lock() {
+                        Ok(conns) => conns,
+                        Err(_) => {
+                            log::error!("[str0m] conns lock poisoned — closing signaling");
+                            close_all(shared);
+                            return;
+                        }
+                    };
+                    conns.get(&sender).cloned()
+                };
+                let tx = match tx {
+                    Some(tx) => tx,
+                    None => {
+                        // Unsolicited OFFER from an unknown peer: we are the
+                        // newcomer and they initiate. Anything else from an
+                        // unknown sender is a stray (e.g. a signal racing
+                        // PeerLeft) — spawning an answerer for it would create
+                        // a ghost connection that waits on an offer that never
+                        // comes.
+                        if !matches!(data, PeerSignal::Offer(_)) {
+                            log::debug!("[str0m] stray non-offer signal from unknown {sender}");
+                            continue;
+                        }
+                        spawn_connection(
+                            Role::Answerer,
+                            sender,
+                            shared,
+                            &out_tx,
+                            &updates_tx,
+                            &state_tx,
+                            &events_tx,
+                        )
+                    }
+                };
+                let _ = tx.send(Cmd::Signal(data));
+            }
+        }
+    }
+}
+
+fn close_all(shared: &Arc<Shared>) {
+    if let Ok(conns) = shared.conns.lock() {
+        for tx in conns.values() {
+            let _ = tx.send(Cmd::Close);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_connection(
+    role: Role,
+    remote: MbPeerId,
+    shared: &Arc<Shared>,
+    out_tx: &Sender<PeerRequest<PeerSignal>>,
+    updates_tx: &Sender<(MbPeerId, PeerState)>,
+    state_tx: &Sender<(MbPeerId, Packet)>,
+    events_tx: &Sender<(MbPeerId, Packet)>,
+) -> Sender<Cmd> {
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Cmd>();
+    if let Ok(mut conns) = shared.conns.lock() {
+        conns.insert(remote, cmd_tx.clone());
+    }
+    let out_tx = out_tx.clone();
+    let updates_tx = updates_tx.clone();
+    let state_tx = state_tx.clone();
+    let events_tx = events_tx.clone();
+    let shared = Arc::clone(shared);
+    std::thread::spawn(move || {
+        if let Err(err) = run_connection(
+            role,
+            remote,
+            cmd_rx,
+            &out_tx,
+            &updates_tx,
+            &state_tx,
+            &events_tx,
+        ) {
+            log::warn!("[str0m] connection to {remote} ended: {err}");
+        }
+        if let Ok(mut conns) = shared.conns.lock() {
+            conns.remove(&remote);
+        }
+        let _ = updates_tx.send((remote, PeerState::Disconnected));
+    });
+    cmd_tx
+}
+
+// ───────────────────────── connection thread ─────────────────────────
+
+/// The two matchbox channels, pre-negotiated (no DCEP): stream id == channel
+/// index; id 0 unreliable/unordered, id 1 reliable/ordered. NEVER reorder.
+fn channel_configs() -> [Str0mChannelConfig; 2] {
+    [
+        Str0mChannelConfig {
+            label: "matchbox_socket_0".to_string(),
+            ordered: false,
+            reliability: Reliability::MaxRetransmits { retransmits: 0 },
+            negotiated: Some(0),
+            protocol: String::new(),
+        },
+        Str0mChannelConfig {
+            label: "matchbox_socket_1".to_string(),
+            ordered: true,
+            reliability: Reliability::Reliable,
+            negotiated: Some(1),
+            protocol: String::new(),
+        },
+    ]
+}
+
+fn run_connection(
+    role: Role,
+    remote: MbPeerId,
+    cmd_rx: Receiver<Cmd>,
+    out_tx: &Sender<PeerRequest<PeerSignal>>,
+    updates_tx: &Sender<(MbPeerId, PeerState)>,
+    state_tx: &Sender<(MbPeerId, Packet)>,
+    events_tx: &Sender<(MbPeerId, Packet)>,
+) -> Result<(), String> {
+    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).map_err(|e| format!("udp bind: {e}"))?;
+    let local_addr = socket
+        .local_addr()
+        .map_err(|e| format!("local addr: {e}"))?;
+
+    let mut rtc = Rtc::new(Instant::now());
+    let candidate =
+        Candidate::host(local_addr, "udp").map_err(|e| format!("host candidate: {e}"))?;
+    rtc.add_local_candidate(candidate.clone());
+    let candidate_json = encode_candidate(&candidate)?;
+
+    let mut chan_ids: [Option<ChannelId>; 2] = [None, None];
+    let mut chan_open: [bool; 2] = [false, false];
+    let mut pending_offer = None;
+
+    if let Role::Offerer = role {
+        let mut sdp = rtc.sdp_api();
+        let [cfg0, cfg1] = channel_configs();
+        chan_ids[0] = Some(sdp.add_channel_with_config(cfg0));
+        chan_ids[1] = Some(sdp.add_channel_with_config(cfg1));
+        let (offer, pending) = sdp
+            .apply()
+            .ok_or_else(|| "offer apply produced no changes".to_string())?;
+        pending_offer = Some(pending);
+        send_signal(out_tx, remote, PeerSignal::Offer(offer.to_sdp_string()));
+        // Trickle our host candidate AFTER the offer: native matchbox drops
+        // candidates that arrive before it has the offer/answer it is waiting
+        // on (its handshake loops ignore out-of-phase signals). The answerer
+        // trickles after sending its Answer, in `apply_signal`.
+        send_signal(
+            out_tx,
+            remote,
+            PeerSignal::IceCandidate(candidate_json.clone()),
+        );
+    }
+
+    let mut connected_reported = false;
+    let mut buf = vec![0u8; 2000];
+
+    loop {
+        // Drain the Rtc to Timeout (the sans-IO invariant: a full drain after
+        // every mutation; `handle_input` at the bottom of the loop and each
+        // command application below are followed by re-entering this drain).
+        let deadline = loop {
+            match rtc.poll_output().map_err(|e| format!("poll_output: {e}"))? {
+                Output::Timeout(deadline) => break deadline,
+                Output::Transmit(transmit) => {
+                    if let Err(err) = socket.send_to(&transmit.contents, transmit.destination) {
+                        log::warn!("[str0m] udp send to {} failed: {err}", transmit.destination);
+                    }
+                }
+                Output::Event(event) => match event {
+                    Event::ChannelOpen(id, label) => {
+                        // Negotiated channels: map by stream id via our configs'
+                        // order (label carries the index for belt-and-braces).
+                        for (index, slot) in chan_ids.iter_mut().enumerate() {
+                            let expected = format!("matchbox_socket_{index}");
+                            if label == expected {
+                                *slot = Some(id);
+                                chan_open[index] = true;
+                            }
+                        }
+                        if chan_open.iter().all(|open| *open) && !connected_reported {
+                            connected_reported = true;
+                            let _ = updates_tx.send((remote, PeerState::Connected));
+                        }
+                    }
+                    Event::ChannelData(data) => {
+                        let index = chan_ids.iter().position(|slot| *slot == Some(data.id));
+                        match index {
+                            Some(CHANNEL_STATE) => {
+                                let _ = state_tx.send((remote, data.data.into_boxed_slice()));
+                            }
+                            Some(CHANNEL_EVENTS) => {
+                                let _ = events_tx.send((remote, data.data.into_boxed_slice()));
+                            }
+                            _ => log::warn!("[str0m] data on unknown channel {:?}", data.id),
+                        }
+                    }
+                    Event::ChannelClose(_) => {
+                        return Err("channel closed".to_string());
+                    }
+                    Event::IceConnectionStateChange(IceConnectionState::Disconnected) => {
+                        return Err("ice disconnected".to_string());
+                    }
+                    _ => {}
+                },
+            }
+        };
+
+        if !rtc.is_alive() {
+            return Err("rtc no longer alive".to_string());
+        }
+
+        // Service commands; each application mutates the Rtc, and the `continue`
+        // re-enters the drain above before any further mutation.
+        match cmd_rx.try_recv() {
+            Ok(Cmd::Close) => return Ok(()),
+            Ok(Cmd::Send { channel, data }) => {
+                if let Some(id) = chan_ids.get(channel).copied().flatten()
+                    && let Some(mut ch) = rtc.channel(id)
+                {
+                    match ch.write(true, &data) {
+                        Ok(false) => {
+                            log::warn!("[str0m] channel {channel} buffer full — dropped")
+                        }
+                        Ok(true) => {}
+                        Err(err) => log::warn!("[str0m] channel {channel} write failed: {err}"),
+                    }
+                } else {
+                    // Channel not open yet (handshake window) — the message is
+                    // lost. Callers must gate sends on PeerState::Connected,
+                    // exactly as with the matchbox Transport.
+                    log::warn!(
+                        "[str0m] send on channel {channel} to {remote} before open — dropped"
+                    );
+                }
+                continue; // drain after mutation
+            }
+            Ok(Cmd::Signal(signal)) => {
+                apply_signal(
+                    &mut rtc,
+                    signal,
+                    &mut chan_ids,
+                    &mut pending_offer,
+                    &candidate_json,
+                    out_tx,
+                    remote,
+                )?;
+                continue; // drain after mutation
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => return Ok(()),
+        }
+
+        // Wait for input: bounded by the Rtc's own deadline, capped so the
+        // command queue stays responsive, floored to avoid a busy loop.
+        let now = Instant::now();
+        let wait = deadline
+            .saturating_duration_since(now)
+            .min(Duration::from_millis(10))
+            .max(Duration::from_millis(1));
+        socket
+            .set_read_timeout(Some(wait))
+            .map_err(|e| format!("set timeout: {e}"))?;
+
+        let input = match socket.recv_from(&mut buf) {
+            Ok((n, source)) => match buf[..n].try_into() {
+                Ok(contents) => Input::Receive(
+                    Instant::now(),
+                    Receive {
+                        proto: Protocol::Udp,
+                        source,
+                        destination: local_addr,
+                        contents,
+                    },
+                ),
+                Err(err) => {
+                    log::debug!("[str0m] unparseable datagram from {source}: {err}");
+                    Input::Timeout(Instant::now())
+                }
+            },
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                Input::Timeout(Instant::now())
+            }
+            Err(err) => return Err(format!("udp recv: {e}", e = err)),
+        };
+        rtc.handle_input(input)
+            .map_err(|e| format!("handle_input: {e}"))?;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_signal(
+    rtc: &mut Rtc,
+    signal: PeerSignal,
+    chan_ids: &mut [Option<ChannelId>; 2],
+    pending_offer: &mut Option<str0m::change::SdpPendingOffer>,
+    candidate_json: &str,
+    out_tx: &Sender<PeerRequest<PeerSignal>>,
+    remote: MbPeerId,
+) -> Result<(), String> {
+    match signal {
+        PeerSignal::Offer(sdp) => {
+            let offer = str0m::change::SdpOffer::from_sdp_string(&sdp)
+                .map_err(|e| format!("offer parse: {e}"))?;
+            let answer = rtc
+                .sdp_api()
+                .accept_offer(offer)
+                .map_err(|e| format!("accept_offer: {e}"))?;
+            // Pre-negotiated channels (no DCEP): declare ours now, matching
+            // matchbox's fixed stream ids.
+            let [cfg0, cfg1] = channel_configs();
+            let mut direct = rtc.direct_api();
+            chan_ids[0] = Some(direct.create_data_channel(cfg0));
+            chan_ids[1] = Some(direct.create_data_channel(cfg1));
+            send_signal(out_tx, remote, PeerSignal::Answer(answer.to_sdp_string()));
+            // Trickle our host candidate AFTER the answer — native matchbox
+            // drops candidates that arrive before the answer it is waiting on.
+            send_signal(
+                out_tx,
+                remote,
+                PeerSignal::IceCandidate(candidate_json.to_string()),
+            );
+            Ok(())
+        }
+        PeerSignal::Answer(sdp) => {
+            let answer = str0m::change::SdpAnswer::from_sdp_string(&sdp)
+                .map_err(|e| format!("answer parse: {e}"))?;
+            let pending = pending_offer
+                .take()
+                .ok_or_else(|| "answer without a pending offer".to_string())?;
+            rtc.sdp_api()
+                .accept_answer(pending, answer)
+                .map_err(|e| format!("accept_answer: {e}"))?;
+            Ok(())
+        }
+        PeerSignal::IceCandidate(json) => {
+            if json == "null" {
+                return Ok(()); // browser end-of-candidates sentinel
+            }
+            let init: IceCandidateJson =
+                serde_json::from_str(&json).map_err(|e| format!("candidate json: {e}"))?;
+            match Candidate::from_sdp_string(&init.candidate) {
+                Ok(candidate) => {
+                    rtc.add_remote_candidate(candidate);
+                }
+                Err(err) => log::warn!("[str0m] unparseable remote candidate ({err}): {json}"),
+            }
+            Ok(())
+        }
+    }
+}
+
+fn send_signal(out_tx: &Sender<PeerRequest<PeerSignal>>, remote: MbPeerId, data: PeerSignal) {
+    let _ = out_tx.send(PeerRequest::Signal {
+        receiver: remote,
+        data,
+    });
+}
+
+fn encode_candidate(candidate: &Candidate) -> Result<String, String> {
+    let init = IceCandidateJson {
+        candidate: candidate.to_sdp_string(),
+        sdp_mid: Some("0".to_string()),
+        sdp_mline_index: Some(0),
+        username_fragment: None,
+    };
+    serde_json::to_string(&init).map_err(|e| format!("candidate encode: {e}"))
+}

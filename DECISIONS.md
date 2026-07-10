@@ -224,3 +224,47 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   slot 0 hung the M2 predicate on ~1/6 runs before the fix); e2e deadlines are 120 s (they bound hangs, not
   CPU contention); rate-measurement windows are 2 s (max_delta permanently drops ticks on >250 ms stalls).
 - **Status:** Accepted — GATE PASSED (2026-07-10).
+
+## ADR-0015 — str0m native/server WebRTC peer: matchbox-interoperable, thread-per-peer sans-IO
+- **Context:** Phase 2 needs native/server WebRTC without a browser stack. The settled stack picks sans-IO
+  **str0m** for native (lock-free, no tokio requirement; drives Mode 3's authoritative hub). It must
+  interoperate with matchbox peers (browser wasm + native webrtc-rs) — same rooms, same channels, same wire.
+- **Decision:** `transport::Str0mPeer` (native-only module; the wasm build gains nothing — verified dep
+  tree) mirroring `Transport`'s method surface. **str0m 0.21, `default-features = false,
+  features = ["rust-crypto"]`** — pure-Rust DTLS (no aws-lc-sys/cmake/libclang; Nix-friendly); the crypto
+  provider is installed process-wide once (`str0m::crypto::from_feature_flags().install_process_default()`,
+  idempotent OnceLock).
+- **The matchbox wire contract implemented** (verified from vendored 0.14 sources, not docs):
+  - Signaling: WS text JSON, externally tagged — in `IdAssigned`/`NewPeer`/`PeerLeft`/`Signal{sender,data}`,
+    out `Signal{receiver,data}` + bare `"KeepAlive"` (~10 s). Wire types come from a **`matchbox_protocol`
+    dep** (compat by construction); `PeerSignal` (not exported by matchbox) is re-declared shape-identical:
+    `Offer`/`Answer` carry RAW SDP strings, `IceCandidate` carries DOUBLE-ENCODED `RTCIceCandidateInit`
+    JSON; the browser `"null"` end-of-candidates sentinel is tolerated.
+  - **Negotiated channels — NO DCEP** (the key constraint): both sides pre-create stream id 0
+    (`matchbox_socket_0`, unreliable/unordered `MaxRetransmits{0}`) and id 1 (`matchbox_socket_1`,
+    reliable/ordered) — never reorder. Offerer declares via `sdp_api().add_channel_with_config`; answerer
+    via `direct_api().create_data_channel` after `accept_offer`. Connected = ALL channels open (matchbox's
+    criterion).
+  - Roles both ways: existing peers get `NewPeer` and OFFER (str0m = DTLS server); newcomers answer
+    unsolicited offers (str0m = DTLS client). Only an `Offer` from an unknown sender spawns a connection —
+    stray non-offer signals (racing `PeerLeft`) are dropped, not answered.
+  - **Candidate trickle ORDER matters:** native matchbox DROPS candidates arriving before the offer/answer
+    it is waiting on (its handshake loops ignore out-of-phase signals) — so our host candidate is trickled
+    AFTER the Offer (offerer) / AFTER the Answer (answerer). Caught by the reviewer: a pre-offer trickle
+    "worked" in tests only via peer-reflexive discovery, masking a dead trickle path on real networks.
+- **The driving loop (the human-reviewed design):** one blocking-tungstenite signaling thread (read-timeout
+  loop that also drains an outbound signal queue + keepalive) and ONE CONNECTION THREAD PER REMOTE PEER,
+  each owning a UDP socket + `Rtc`. str0m's hard invariant — after EVERY mutation, drain `poll_output()` to
+  `Output::Timeout` before the next mutation — is honored structurally: every command application
+  `continue`s back into the drain, and `handle_input` sits at the loop bottom feeding the loop-top drain.
+  Socket wait = rtc deadline clamped to [1 ms, 10 ms] (no busy-loop; the command queue stays responsive).
+  The API side is non-blocking mpsc drains, mirroring `Transport`'s poll model. Sends before channel-open
+  are dropped WITH a warn — callers gate on `PeerState::Connected`, as with matchbox.
+- **Evidence** (`crates/transport/tests/str0m_interop.rs`, locked first, TDD): str0m↔native-matchbox in BOTH
+  role directions + str0m↔str0m (our encode → our decode), each exchanging distinct payloads on BOTH
+  channels BOTH ways through an in-process signaling server; soaked 4/4. The reviewer (fresh session)
+  traced the drain invariant per mutation site and verified the wasm dep tree gained nothing.
+- **Scope/residuals:** `ws://` signaling only (no TLS yet); loopback UDP bind (real binds + STUN/TURN are
+  later Phase-2 items); no reconnect/ICE-restart (separate item); the BROWSER matchbox pairing is
+  environment-gated (WSL2 headless, ADR-0012) — desktop-browser residual recorded in TODO.
+- **Status:** Accepted (2026-07-10).
