@@ -163,8 +163,16 @@ extension was disconnected).
   where headless gathering completes). *Acceptance:* both tabs' consoles log `[uniblox-demo][STATE]` and
   `[uniblox-demo][EVENT]` receipts from the other peer — two browser tabs connected P2P, data on both channels.
 
-**Instrumentation** [LOW — delegate]
-- Emit the metrics (WASM size, cold-load, bandwidth/peer, sign/verify cost, connection success) from the running slice. *Acceptance:* the `/slice-check` step prints the table.
+**Instrumentation — residual: browser-side metrics** [LOW — blocked on the Bevy client / desktop browser / real network]
+The native measurement core is DONE: `cargo run --release -p replication --example slice_metrics` measures
+replication bandwidth/peer at the ~20 Hz net tick (742 B/s state @ 2 entities, ~38 B/msg), DataChannel
+RTT/jitter (ping/echo), and native ed25519 sign/verify (13.4/25.7 µs — after the opt-level=3 crypto override;
+the size profile was ~35× slower on verify, a recorded Phase-6 consideration); `/slice-check` prints the table
+with labeled pendings. What remains is environment-gated:
+- Measure in-browser: cold-load TTI, in-browser ed25519 sign/verify (needs the rendering Bevy client and/or a
+  desktop browser — WSL2 headless cannot complete the matchbox handshake, ADR-0012), and STUN-only connection
+  success rate (needs real-network peers). *Acceptance:* the `/slice-check` table's pending rows fill with
+  measured values.
 - Once the Bevy client renders, run `scripts/build-wasm.sh` to produce **meaningful** two-build WASM artifacts (WebGPU: `--features webgpu` + `RUSTFLAGS=--cfg=web_sys_unstable_apis`; WebGL2: default) and confirm `crates/client/web/index.html` loads the correct bundle per `navigator.gpu`. *Acceptance:* both artifacts produced from the real client; the page loads the right one; the build prints raw→bindgen→wasm-opt→brotli sizes. (Do NOT claim the stub's byte-identical KB output as this.)
 - Feature-prune Bevy via its **`2d`/`3d`/`ui` cargo feature collections** (verify exact collection names against Bevy 0.19 docs) rather than hand-listing features, and record the **`wasm-opt -Oz --converge`** (fixed-point) size deltas. *Acceptance:* the build prints size deltas from feature-pruning and from `--converge`. (Blocked: Bevy is added only when the client renders.)
 

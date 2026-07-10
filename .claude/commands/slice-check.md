@@ -1,5 +1,5 @@
 ---
-description: Print the slice instrumentation table (WASM sizes now; runtime metrics once the slice runs).
+description: Print the slice instrumentation table (measured native metrics + labeled pendings).
 allowed-tools: Bash
 ---
 
@@ -7,9 +7,15 @@ Print the instrumentation table through the WSL wrapper and report it verbatim:
 
 `wsl -d Ubuntu -e bash -lc "cd ~/projects/dhilipsiva/uniblox && ./scripts/slice-check.sh"`
 
-The table covers the measurement gaps from `TODO.md` §"Measurement gaps": per-build
-WASM size (before/after wasm-opt + brotli), cold-load time, replication bandwidth/peer,
-in-browser ed25519 sign/verify cost, STUN-only connection-success rate, and peer RTT/jitter.
+If the measured rows say "no metrics yet", generate them first (a ~10 s native
+run: bandwidth session + ping/echo + ed25519 micro-bench), then re-print:
 
-At Phase 1 scaffolding only the size columns can be populated (and only once `/build-wasm` has run);
-the runtime rows print `pending (instrumentation)` until the running slice emits them.
+`wsl -d Ubuntu -e bash -lc "cd ~/projects/dhilipsiva/uniblox && direnv exec . cargo run --release -p replication --example slice_metrics"`
+
+Notes when reporting:
+- The WASM size rows are the STUB client until Bevy renders — never quote them
+  as the size-budget measurement.
+- Measured rows are native/loopback (annotated); the pending rows list their
+  concrete environment blockers (browser client, desktop browser, real network).
+- ed25519 verify depends on the crypto opt-level=3 override in the workspace
+  Cargo.toml (the size profile is ~35x slower — a real Phase-6 consideration).

@@ -45,6 +45,8 @@ console_log              = { version = "1" }
 # dev-only
 tempfile = { version = "3" }
 filetime = { version = "0.2" }
+ed25519-dalek = { version = "3" }   # slice instrumentation (sign/verify cost); op-signing itself is Phase 6
+serde_json = { version = "1" }
 
 # Size-optimized ship profile (docs/final-todo.md §1.1). `panic = "abort"` is
 # scoped to release ONLY — `cargo test` builds under the dev/test profile
@@ -55,3 +57,14 @@ lto           = true
 codegen-units = 1
 strip         = true
 panic         = "abort"
+
+# Crypto is speed-critical and opt-level="z" cripples curve25519 field
+# arithmetic (~35x slower ed25519 verify, measured by the slice_metrics
+# harness). Override to speed for these packages only. NOTE for Phase 6
+# (op-signing ships in wasm): re-measure the size-vs-speed tradeoff then.
+[profile.release.package.curve25519-dalek]
+opt-level = 3
+[profile.release.package.ed25519-dalek]
+opt-level = 3
+[profile.release.package.sha2]
+opt-level = 3

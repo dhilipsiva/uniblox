@@ -10,7 +10,10 @@ bevy_ecs.workspace = true
 log.workspace = true
 
 [dev-dependencies]
-# e2e test only — transport stays OUT of the lib dependency graph.
+# e2e tests + the slice_metrics example only — transport stays OUT of the
+# lib dependency graph.
 transport = { path = "../transport" }
 matchbox_signaling.workspace = true
 tokio = { workspace = true, features = ["time"] }
+ed25519-dalek.workspace = true
+serde_json.workspace = true

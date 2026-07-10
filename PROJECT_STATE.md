@@ -4,7 +4,11 @@ Living snapshot of where uniblox is. Update it when a phase's status changes.
 The **why** behind decisions lives in `DECISIONS.md`; the **what/how** lives in
 `docs/final-buildspec.md`; the backlog lives in `TODO.md`.
 
-**Current phase: Phase 1 (the vertical slice) — THE AUTHORITY-SWAP GATE PASSED (ADR-0014) and the ownership-handoff item is closed (auditor-verified). Only Instrumentation remains in the slice.**
+**Current phase: THE PHASE-1 SLICE'S NATIVE CORE IS COMPLETE.** The authority-swap gate passed (ADR-0014),
+the handoff item is closed (auditor-verified), and instrumentation measures everything the slice can measure
+natively. Remaining Phase-1 work is exactly the client-gated residuals (Bevy client renders → real WASM
+sizes, cold-load, browser metrics; see TODO). Next up per the staged plan: **the Rhai↔Bevy bridge is done, so
+Phase 2+ fan-out is unblocked** — or the Bevy client work to close the residuals.
 
 ## Done
 - **Cargo workspace** — virtual manifest, 9 crates under `crates/*` (glob members),
@@ -54,6 +58,13 @@ The **why** behind decisions lives in `DECISIONS.md`; the **what/how** lives in
   Auditor findings actioned: T26 now genuinely asserts the replicate-back to A (the old Owner-view predicate
   was trivially true); T18 asserts the old owner's entity freezes; new T28 covers the mint-on-transfer arm.
   Phase-3 carries: adoption-switch re-verification with real buffers; hand-back/repeated/loss handoffs.
+- **Instrumentation (native core)** — `slice_metrics` example + `/slice-check` table. **Measured (native
+  loopback, 2026-07-10):** state channel 742 B/s per peer @ 2 entities (19.4 msg/s at the 20 Hz net tick,
+  ~38 B/msg — comfortably inside the ~1150 B datagram budget); events steady 0 B/s; RTT 4.3 ms ± 0.6 ms
+  (loopback, ~1 ms poll-bounded); **ed25519 native sign 13.4 µs / verify 25.7 µs** — AFTER adding an
+  opt-level=3 override for the crypto crates (the size-optimized `opt-level="z"` profile made verify ~35×
+  slower, 1600 µs — recorded in Cargo.toml as a Phase-6 wasm size-vs-speed consideration). Browser-side
+  metrics remain pending (see TODO residual).
 
 ## Blocked / deferred (prerequisites do not exist yet)
 - **Real two-build WASM artifacts + size table** — WASM toolchain is now provided by the flake;
@@ -66,8 +77,11 @@ The **why** behind decisions lives in `DECISIONS.md`; the **what/how** lives in
 - **Web Audio worklet** investigation — needs a running WASM client with audio.
 
 ## Next
-- **Instrumentation** [LOW]: emit the slice metrics (`/slice-check` table) — the last Phase-1 item
-  (meaningful WASM artifacts + Bevy feature-prune remain gated on the Bevy client rendering).
+The slice's native core is complete — per the staged plan ("only after the slice is green, fan out"),
+candidates are: the **Bevy client rendering work** (closes every Phase-1 residual: real WASM sizes,
+cold-load, browser metrics, Web Audio) or the **Phase 2+ fan-out** (transport hardening; Phases 4–8 are
+LOW/MIXED and delegate-friendly). Phase 3 (replication depth) and Phase 12 (sandbox hardening) each need a
+human-owned HIGH pass.
 
 ## Toolchain notes
 WSL2 Ubuntu. **The toolchain comes from the Nix flake devShell** (ADR-0010): pinned Rust 1.96.1
