@@ -21,6 +21,20 @@ edition = "2024"
 rhai     = { version = "1.25", default-features = false, features = ["std"] }
 bevy_ecs = { version = "0.19" }
 log      = { version = "0.4" }
+# transport (matchbox two-channel WebRTC DataChannels, ADR-0012) + signaling
+matchbox_socket    = { version = "0.14" }
+matchbox_signaling = { version = "0.14" }
+futures            = { version = "0.3" }
+tokio              = { version = "1", features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# wasm client glue. wasm-bindgen is pinned EXACTLY to match the flake's
+# wasm-bindgen-cli (0.2.121) — CLI and crate versions must agree.
+wasm-bindgen         = { version = "=0.2.121" }
+wasm-bindgen-futures = { version = "0.4" }
+web-sys              = { version = "0.3" }
+gloo-timers          = { version = "0.3", features = ["futures"] }
+console_error_panic_hook = { version = "0.1" }
+console_log              = { version = "1" }
 # dev-only
 tempfile = { version = "3" }
 filetime = { version = "0.2" }
