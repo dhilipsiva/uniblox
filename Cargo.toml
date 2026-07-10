@@ -31,8 +31,13 @@ postcard = { version = "1.1", default-features = false, features = ["use-std"] }
 # transport (matchbox two-channel WebRTC DataChannels, ADR-0012) + signaling
 matchbox_socket    = { version = "0.14" }
 matchbox_signaling = { version = "0.14" }
+matchbox_protocol  = { version = "0.14", features = ["json"] }   # signaling wire types for the str0m peer (ADR-0015)
 futures            = { version = "0.3" }
 tokio              = { version = "1", features = ["macros", "rt-multi-thread"] }
+# native/server WebRTC via sans-IO str0m (ADR-0015). rust-crypto backend: pure
+# Rust DTLS — no aws-lc-sys/cmake/libclang (Nix-friendly).
+str0m       = { version = "0.21", default-features = false, features = ["rust-crypto"] }
+tungstenite = { version = "0.29" }          # blocking WS client for the str0m signaling thread
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # wasm client glue. wasm-bindgen is pinned EXACTLY to match the flake's
 # wasm-bindgen-cli (0.2.121) — CLI and crate versions must agree.

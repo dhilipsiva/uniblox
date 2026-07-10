@@ -5,8 +5,18 @@ edition.workspace = true
 
 [dependencies]
 matchbox_socket.workspace = true
+log.workspace = true
+
+# The str0m native/server peer (ADR-0015) — native-only; the wasm build must
+# stay clean (matchbox_socket alone).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+str0m.workspace = true
+tungstenite.workspace = true
+matchbox_protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
-# the two-peer datachannel test embeds an in-process signaling server
+# the two-peer datachannel + str0m interop tests embed an in-process signaling server
 matchbox_signaling.workspace = true
 tokio = { workspace = true, features = ["time"] }
