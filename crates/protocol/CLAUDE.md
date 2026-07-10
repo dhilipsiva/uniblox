@@ -4,7 +4,9 @@
 **Risk tier:** standard.
 
 ## Status
-Stub (Phase 1 scaffolding). No functional code yet.
+Minimal: `PeerId(u64)` (shared peer identity; `Ord` for the Phase-3/5 lowest-peer-ID
+host-migration tiebreak). Wire messages, the version triple, and serde land with the
+replication wire format (later in Phase 1) and Phase 5.
 
 ## Crate-local invariants
 - The `{engine, content, schema}` version triple lives here; it is the desync
