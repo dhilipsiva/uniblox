@@ -35,6 +35,14 @@
     const mod = await import(`/${build}/client.js`);
     await mod.default();
     console.log("uniblox: wasm instantiated for", build);
+    // Cold-load harness: ms from navigation start to wasm-instantiated
+    // (performance.now() is relative to timeOrigin). On the STUB client this
+    // number is NOT the budget cold-load — it validates the measurement path;
+    // re-measure when the Bevy client renders (the budget gate's input).
+    console.log(
+      `[uniblox-metrics] cold-load to wasm-instantiated: ${performance.now().toFixed(0)} ms` +
+      ` (${build}, STUB client — not the Bevy cold-load)`
+    );
   } catch (e) {
     console.warn("uniblox: no WASM artifact yet (run scripts/build-wasm.sh):", e.message);
   }

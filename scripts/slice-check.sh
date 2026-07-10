@@ -49,8 +49,13 @@ else
 fi
 echo
 
+echo "-- Measured (in-browser, desktop Chromium on the Windows host; re-measure per release) --"
+printf '  %-36s %s\n' "ed25519 sign (wasm, browser)"   "19.6-23.6 us/op  (2026-07-11, release + opt-level=3 crypto override)"
+printf '  %-36s %s\n' "ed25519 verify (wasm, browser)" "44.5-45.6 us/op  (~1.7x native 25.7 us; 8-peer mesh @30Hz ~= 1% of a core)"
+printf '  %-36s %s\n' "crypto wasm size cost"          "+106 KB wasm-opt / +55 KB brotli (dalek+override delta on the stub)"
+echo
+
 echo "-- Pending (environment-gated) --"
-printf '  %-36s %s\n' "cold-load time (TTI)"          "needs the rendering Bevy browser client"
-printf '  %-36s %s\n' "ed25519 sign/verify (browser)" "needs a desktop browser (WSL2 headless blocked, ADR-0012)"
+printf '  %-36s %s\n' "cold-load time (TTI)"          "needs the rendering Bevy client (harness in index.html prints [uniblox-metrics] cold-load; stub ~0.9-1.2 s is NOT the budget number)"
 printf '  %-36s %s\n' "STUN-only connection success"  "needs real-network peers (loopback is meaningless)"
 printf '  %-36s %s\n' "real WASM size / feature-prune" "needs the Bevy client (later in Phase 1)"

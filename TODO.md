@@ -147,10 +147,12 @@ trail is ADR-0011…ADR-0016 in `DECISIONS.md`, live status in `PROJECT_STATE.md
 phase needs an environment this dev setup lacks: a rendering Bevy client, a desktop browser (WSL2 headless
 never completes the matchbox handshake — ADR-0012), or real-network peers.
 
-**Browser-side instrumentation** [LOW — needs the Bevy client / desktop browser / real network]
-- Measure in-browser: cold-load TTI, in-browser ed25519 sign/verify, and STUN-only connection success
-  rate (real-network peers). *Acceptance:* the `/slice-check` table's pending rows fill with measured
-  values.
+**Browser-side instrumentation** [LOW — needs the Bevy client / real network]
+- Measure the remaining in-browser rows: **cold-load TTI with the rendering Bevy client** (the harness is
+  in `web/index.html` — `[uniblox-metrics] cold-load`; the stub's ~0.9–1.2 s is NOT the budget number)
+  and the **STUN-only connection success rate** (real-network peers). *Acceptance:* the `/slice-check`
+  table's remaining pending rows fill with measured values. (In-browser ed25519 is measured:
+  sign ~20–24 µs / verify ~45 µs, in the table.)
 - Once the Bevy client renders, run `scripts/build-wasm.sh` to produce **meaningful** two-build WASM artifacts (WebGPU: `--features webgpu` + `RUSTFLAGS=--cfg=web_sys_unstable_apis`; WebGL2: default) and confirm `crates/client/web/index.html` loads the correct bundle per `navigator.gpu`. *Acceptance:* both artifacts produced from the real client; the page loads the right one; the build prints raw→bindgen→wasm-opt→brotli sizes. (Do NOT claim the stub's byte-identical KB output as this.)
 - Feature-prune Bevy via its **`2d`/`3d`/`ui` cargo feature collections** (verify exact collection names against Bevy 0.19 docs) rather than hand-listing features, and record the **`wasm-opt -Oz --converge`** (fixed-point) size deltas. *Acceptance:* the build prints size deltas from feature-pruning and from `--converge`. (Blocked: Bevy is added only when the client renders.)
 

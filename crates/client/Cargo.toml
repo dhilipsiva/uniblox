@@ -20,8 +20,12 @@ webgpu  = []
 transport = { path = "../transport" }
 wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
-web-sys = { workspace = true, features = ["console"] }
+# Window + Performance: performance.now() for the in-browser metrics harness.
+web-sys = { workspace = true, features = ["console", "Window", "Performance"] }
 gloo-timers.workspace = true
 console_error_panic_hook.workspace = true
 console_log.workspace = true
 log.workspace = true
+# In-browser ed25519 sign/verify measurement (the slice's measurement gap —
+# decides Phase-6 per-frame signing affordability). Fixed key, no RNG.
+ed25519-dalek.workspace = true

@@ -83,8 +83,14 @@ native/server peer is landed and matchbox-interoperable (ADR-0015).
   ~38 B/msg — comfortably inside the ~1150 B datagram budget); events steady 0 B/s; RTT 4.3 ms ± 0.6 ms
   (loopback, ~1 ms poll-bounded); **ed25519 native sign 13.4 µs / verify 25.7 µs** — AFTER adding an
   opt-level=3 override for the crypto crates (the size-optimized `opt-level="z"` profile made verify ~35×
-  slower, 1600 µs — recorded in Cargo.toml as a Phase-6 wasm size-vs-speed consideration). Browser-side
-  metrics remain pending (see TODO residual).
+  slower, 1600 µs — recorded in Cargo.toml as a Phase-6 wasm size-vs-speed consideration). **In-browser
+  ed25519 MEASURED (2026-07-11, desktop Chromium, release wasm + the same crypto override): sign
+  19.6–23.6 µs / verify 44.5–45.6 µs — only ~1.5–1.8× native, far better than the "several×" estimate;
+  an 8-peer mesh at 30 Hz costs ~1% of a core to verify sequentially, so per-frame state-channel signing
+  is affordable in-browser before batching.** The crypto's wasm SIZE cost (dalek + override, measured as
+  the stub build delta): +106 KB wasm-opt / +55 KB brotli — the Phase-6 tradeoff inputs are now both
+  real numbers. A cold-load harness is in `web/index.html` (`[uniblox-metrics] cold-load`); the real TTI
+  and STUN success rate remain gated (Bevy client / real network — see TODO).
 
 ## Blocked / deferred (prerequisites do not exist yet)
 - **Real two-build WASM artifacts + size table** — WASM toolchain is now provided by the flake;

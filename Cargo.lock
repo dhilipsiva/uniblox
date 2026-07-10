@@ -928,6 +928,7 @@ version = "0.1.0"
 dependencies = [
  "console_error_panic_hook",
  "console_log",
+ "ed25519-dalek",
  "gloo-timers 0.3.0",
  "log",
  "transport",

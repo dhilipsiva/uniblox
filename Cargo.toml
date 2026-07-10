@@ -69,8 +69,10 @@ panic         = "abort"
 
 # Crypto is speed-critical and opt-level="z" cripples curve25519 field
 # arithmetic (~35x slower ed25519 verify, measured by the slice_metrics
-# harness). Override to speed for these packages only. NOTE for Phase 6
-# (op-signing ships in wasm): re-measure the size-vs-speed tradeoff then.
+# harness). Override to speed for these packages only. Measured wasm tradeoff
+# (2026-07-11, stub-build delta): the override'd crypto costs +106 KB wasm-opt
+# / +55 KB brotli and buys sign ~20-24 us / verify ~45 us in-browser (~1.7x
+# native) — see /slice-check. Phase 6 revisits if the size budget tightens.
 [profile.release.package.curve25519-dalek]
 opt-level = 3
 [profile.release.package.ed25519-dalek]
