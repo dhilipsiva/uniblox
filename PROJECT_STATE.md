@@ -4,10 +4,12 @@ Living snapshot of where uniblox is. Update it when a phase's status changes.
 The **why** behind decisions lives in `DECISIONS.md`; the **what/how** lives in
 `docs/final-buildspec.md`; the backlog lives in `TODO.md`.
 
-**Current phase: PHASE 2 (transport hardening) IN PROGRESS.** The Phase-1 slice's native core is complete
-(authority-swap gate PASSED, ADR-0014); its remaining work is exactly the client-gated residuals (Bevy
-client renders → real WASM sizes, cold-load, browser metrics; see TODO). Phase 2 has begun: the str0m
-native/server peer is landed and matchbox-interoperable (ADR-0015).
+**Current phase: PHASE 1 COMPLETE; PHASE 2 (transport hardening) IN PROGRESS.** The slice proved the
+authority-swap (gate PASSED, ADR-0014) and **the Bevy client renders in-browser (ADR-0017)** with every
+slice measurement taken — real two-build sizes (3.38/3.40 MB brotli), cold-load, in-browser ed25519 —
+and the size-budget gate PASSES. The only measurement the slice could not take (STUN-only success rate)
+is real-network-gated and lives in Phase 2's telemetry bullet. Phase 2 so far: the str0m native/server
+peer (ADR-0015) + ICE policy tiers with the TURN relay proof (ADR-0016).
 
 ## Done
 - **Cargo workspace** — virtual manifest, 9 crates under `crates/*` (glob members),
@@ -92,15 +94,24 @@ native/server peer is landed and matchbox-interoperable (ADR-0015).
   real numbers. A cold-load harness is in `web/index.html` (`[uniblox-metrics] cold-load`); the real TTI
   and STUN success rate remain gated (Bevy client / real network — see TODO).
 
+- **The Bevy client renders + all client-gated measurements** (ADR-0017) — Bevy 0.19 as a wasm32-ONLY
+  client dep (`2d`+`bevy_winit`+`webgl2`; `webgpu` feature for build 2), minimal Camera2d + bouncing
+  sprite into `#uniblox-canvas`, first-frame metric. Fixed two live pipeline bugs (the page served the
+  UNOPTIMIZED wasm; `wasm-opt -all` emitted stable-browser-rejected encodings — baseline feature flags
+  now, which also un-broke twiggy). **Measured:** brotli 3.38/3.40 MB per build (wasm-opt ~15.6 MB);
+  feature-prune saves 34% wire size (5.16→3.38 MB); --converge −0.27%; cold-load 351 ms instantiate /
+  381 ms first frame local (headless webgl2), ~2.7 s download @10 Mbps. **Size-budget gate PASS**
+  (≤ ~8 MB brotli; first frame in target @10 Mbps, marginal @5 Mbps). Two-tab [STATE]/[EVENT] receipts
+  re-verified with Bevy in-binary. PHASE 1 COMPLETE.
+
 ## Blocked / deferred (prerequisites do not exist yet)
-- **Real two-build WASM artifacts + size table** — WASM toolchain is now provided by the flake;
-  the remaining blocker is a Bevy client that renders (built later in Phase 1). (Do NOT force artifacts from
-  the stub — the two builds are byte-identical and the sizes are meaningless until Bevy is in.)
-- **Bevy feature-prune + `wasm-opt --converge` size deltas** — needs Bevy added (later in Phase 1).
 - **MCP reachability** (github / read-only postgres / docs / playwright) — `node`/`npx` now provided by
   the flake; still needs a running read-only Postgres role, a GitHub PAT (in `settings.local.json`), and
-  Playwright browsers. (`docs` should be reachable on the flake alone.)
-- **Web Audio worklet** investigation — needs a running WASM client with audio.
+  Playwright browsers. (`docs` should be reachable on the flake alone; playwright's chromium is now
+  installed in `~/.cache/ms-playwright` and drives the headless render/metrics runs.)
+- **Web Audio worklet** investigation — needs audio added to the client (the render core exists now,
+  ADR-0017; the `2d` prune excludes bevy_audio).
+- **STUN-only connection success rate** — real-network peers (Phase-2 telemetry bullet).
 
 ## Next
 Phase 2 (transport hardening) is underway — str0m is landed; remaining Phase-2 items: two-channel config

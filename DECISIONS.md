@@ -308,3 +308,44 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   against); str0m-side srflx/TURN gathering (if native CLIENTS ever sit behind NATs) rides the
   non-loopback-bind residual.
 - **Status:** Accepted (2026-07-10).
+
+## ADR-0017 — The Bevy client renders (wasm-only); real sizes; size-budget gate PASSED
+- **Context:** every remaining Phase-1 measurement (cold-load TTI, meaningful two-build sizes,
+  feature-prune deltas) was gated on a rendering Bevy client. This lands the minimal one and takes the
+  measurements.
+- **Decision — Bevy 0.19 as a `wasm32`-ONLY dependency of `client`:** native Bevy/winit would drag
+  alsa/udev/X11 system libs into the Nix devShell and every native test/clippy run; nothing before
+  Phase 14 (native parity) needs native rendering. Native `client` main stays the stub. Feature set:
+  `default-features = false, features = ["2d", "bevy_winit", "webgl2"]`; the crate's `webgpu` cargo
+  feature forwards to `bevy/webgpu` for the second build (webgpu OVERRIDES webgl2 — the two-build split,
+  ADR-0002). Minimal scene: `Camera2d` + one asset-free bouncing sprite into canvas `#uniblox-canvas`
+  (`fit_canvas_to_parent`), a run-once `[uniblox-metrics] first-frame` marker; the transport demo +
+  metrics harness start before `app.run()` (which never returns on wasm). wasm-bindgen stayed at the
+  pinned =0.2.121 — no CLI lockstep move needed.
+- **Two pipeline bugs found live and fixed in `build-wasm.sh`:**
+  1. **The page served the UNOPTIMIZED wasm**: `client.js` fetches `client_bg.wasm`, but the pipeline
+     wrote the optimized artifact to `client_bg.opt.wasm` — the optimized file was never loaded. Fixed:
+     the optimized artifact takes the `client_bg.wasm` name.
+  2. **`wasm-opt -all` emitted encodings stable browsers REJECT** (`invalid heap type 'exact'` — an
+     experimental custom-descriptors proposal): the optimized artifact had been unloadable all along,
+     masked by bug 1. Fixed: enumerate exactly the BASELINE features rustc emits
+     (bulk-memory(+opt), sign-ext, mutable-globals, nontrapping-fptoint, reference-types, multivalue) —
+     wasm-bindgen strips `target_features`, so auto-detection cannot work. This also un-broke twiggy.
+- **Measured (2026-07-11; local server; headless chromium for webgl2, SwiftShader):**
+  - Sizes per build: raw ~21 MB → bindgen ~18.3 MB → wasm-opt ~15.6 MB → **brotli 3.38 (webgl2) /
+    3.40 (webgpu) MB**; the two builds now genuinely differ.
+  - **Feature-prune delta** (default features vs `2d` prune, webgl2): brotli **5.16 → 3.38 MB (−34%)**,
+    wasm-opt 18.7 → 15.6 MB. `--converge` delta: −35 KB (~0.27%) vs plain `-Oz`.
+  - **Cold-load** (optimized artifact, localhost): wasm instantiate **351 ms**, **first Bevy frame
+    381 ms** from navigation start. Computed download at link speed: ~2.7 s @10 Mbps / ~5.4 s @5 Mbps.
+  - **Size-budget gate: PASS** — 3.38/3.40 ≤ ~8 MB brotli; first frame ≈ 3.1 s @10 Mbps (inside the
+    2–5 s target), ≈ 5.8 s @5 Mbps (marginal — prune further when real assets land). Re-check per
+    release (the gate is standing, TODO §Gates).
+  - Two-tab `[STATE]`/`[EVENT]` receipts re-verified with Bevy in-binary; ed25519 numbers unchanged.
+- **Environment gotchas (recorded):** Bevy's derive macros scan `[dependencies]` for the facade and
+  emit `bevy_ecs::` paths when the dep is target-scoped — `use bevy::ecs as bevy_ecs;` fixes it.
+  winit's web loop runs on requestAnimationFrame, which browsers SUSPEND for hidden tabs — the app
+  pauses when not visible (transport keeps running on setTimeout); headless chromium fires rAF, so
+  the render metrics run headless (playwright chromium in `~/.cache/ms-playwright`).
+- **Status:** Accepted (2026-07-11). PHASE 1 IS COMPLETE — the only untaken slice measurement
+  (STUN-only success rate) is real-network-gated and lives in Phase 2's telemetry bullet.

@@ -24,6 +24,11 @@ bevy_ecs = { version = "0.19" }
 # umbrella (MinimalPlugins lives in bevy_internal; we assemble the equivalent).
 bevy_app  = { version = "0.19" }
 bevy_time = { version = "0.19" }
+# The full engine — CLIENT wasm32 ONLY (ADR-0017): native Bevy would drag
+# alsa/udev/X11 into the devShell and every native test run; native parity is
+# Phase 14. Feature-pruned per build in crates/client (2d collection; webgpu
+# overrides webgl2 — two builds, ADR-0002).
+bevy = { version = "0.19", default-features = false }
 log      = { version = "0.4" }
 # replication wire format (ADR-0013): postcard varint encoding, wasm-safe.
 serde    = { version = "1", default-features = false, features = ["derive", "alloc"] }

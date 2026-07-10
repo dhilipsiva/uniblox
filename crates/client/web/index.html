@@ -11,7 +11,15 @@
   Do NOT add cross-origin-isolation headers when serving this — it would break
   the OAuth/payment popups Mode 3 needs. See scripts/serve.sh.
 -->
+<style>
+  html, body { margin: 0; height: 100%; background: #111; color: #ddd; font-family: system-ui; }
+  #app { padding: 8px; }
+  /* Bevy renders into this canvas (Window.canvas = "#uniblox-canvas"); the
+     wrapper gives fit_canvas_to_parent a sized parent. */
+  #canvas-wrap { width: 100%; height: 70vh; }
+</style>
 <main id="app">Loading uniblox…</main>
+<div id="canvas-wrap"><canvas id="uniblox-canvas"></canvas></div>
 <script type="module">
   // navigator.gpu presence alone is insufficient — probe requestAdapter() and
   // fall back to WebGL2 if no adapter is available.
@@ -36,12 +44,11 @@
     await mod.default();
     console.log("uniblox: wasm instantiated for", build);
     // Cold-load harness: ms from navigation start to wasm-instantiated
-    // (performance.now() is relative to timeOrigin). On the STUB client this
-    // number is NOT the budget cold-load — it validates the measurement path;
-    // re-measure when the Bevy client renders (the budget gate's input).
+    // (performance.now() is relative to timeOrigin). Local-server numbers —
+    // real-network cold-load adds the download at link speed (see the
+    // computed 5/10 Mbps figures in /slice-check).
     console.log(
-      `[uniblox-metrics] cold-load to wasm-instantiated: ${performance.now().toFixed(0)} ms` +
-      ` (${build}, STUB client — not the Bevy cold-load)`
+      `[uniblox-metrics] cold-load to wasm-instantiated: ${performance.now().toFixed(0)} ms (${build})`
     );
   } catch (e) {
     console.warn("uniblox: no WASM artifact yet (run scripts/build-wasm.sh):", e.message);

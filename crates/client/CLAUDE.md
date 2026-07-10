@@ -4,17 +4,26 @@
 **Risk tier:** standard.
 
 ## Status
-No Bevy yet. The wasm build runs the interim **transport two-tab demo**: connects
-to `ws://127.0.0.1:3536/uniblox-demo`, exchanges greetings on both channels, logs
-to the console (`[uniblox-demo][STATE]/[EVENT]` markers — asserted by
-`scripts/e2e-two-tab.mjs`; two-tab desktop run verified 2026-07-11). Panics and
-matchbox internals surface in the console (`console_error_panic_hook` +
-`console_log`). It also runs the **in-browser metrics harness**
-(`[uniblox-metrics]` markers): an ed25519 sign/verify micro-bench mirroring the
-native `slice_metrics` harness (measured: sign ~20–24 µs / verify ~45 µs — in
-`/slice-check`), plus a cold-load timer in `web/index.html` (stub numbers are
-NOT the budget cold-load; re-measure when Bevy renders). Native main is still
-the stub.
+**Bevy 0.19 renders (ADR-0017)** — wasm32-ONLY dependency (native Bevy would
+drag alsa/udev/X11 into the devShell; native parity is Phase 14), pruned to
+`["2d", "bevy_winit", "webgl2"]` (+`bevy/webgpu` via the crate's `webgpu`
+feature for the second build). Minimal scene: `Camera2d` + one asset-free
+bouncing sprite into canvas `#uniblox-canvas`, plus a `first-frame` metric.
+Alongside it the wasm build runs the **transport two-tab demo**
+(`[uniblox-demo][STATE]/[EVENT]` markers; re-verified with Bevy in-binary
+2026-07-11) and the **metrics harness** (`[uniblox-metrics]`: ed25519 sign
+~20–25 µs / verify ~45 µs; cold-load 351 ms instantiate / 381 ms first frame,
+local headless — see `/slice-check`). Native main is still the stub.
+
+## Gotchas (learned here)
+- **Bevy's derive macros miss target-scoped deps** — they scan `[dependencies]`
+  for the `bevy` facade and emit `bevy_ecs::` paths; `use bevy::ecs as
+  bevy_ecs;` in the module fixes it.
+- **Hidden tabs never tick**: winit's web loop runs on requestAnimationFrame,
+  which browsers suspend for hidden tabs — the app pauses (transport keeps
+  running on setTimeout). Expected behavior, not a bug.
+- The transport demo + metrics run BEFORE `render::run()` — Bevy's `run()`
+  never returns on wasm.
 
 ## Crate-local invariants
 - **Two WASM builds, not one.** WebGL2 = default build; WebGPU = `--features webgpu`

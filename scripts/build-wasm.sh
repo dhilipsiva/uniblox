@@ -37,20 +37,33 @@ emit () {
   local out="dist/${variant}"
   mkdir -p "${out}"
   wasm-bindgen --target web --no-typescript --out-dir "${out}" --out-name client "${RAW}"
-  # `-all` enables all wasm features so validation accepts modern rustc output
-  # (bulk-memory/memory.copy, sign-ext, etc.); wasm-bindgen strips the
-  # target_features section wasm-opt would otherwise auto-detect. All these
-  # features are baseline in modern browsers.
-  wasm-opt -all -Oz --converge -o "${out}/client_bg.opt.wasm" "${out}/client_bg.wasm"
-  brotli -f -q 11 "${out}/client_bg.opt.wasm"
+  local bindgen_bytes
+  bindgen_bytes="$(stat -c%s "${out}/client_bg.wasm")"
+  # Enable exactly the BASELINE wasm features rustc emits (wasm-bindgen strips
+  # the target_features section, so wasm-opt cannot auto-detect them). Do NOT
+  # use `-all`: it also enables experimental proposals and wasm-opt then emits
+  # encodings stable browsers reject (found live: 'invalid heap type exact,
+  # enable with --experimental-wasm-custom-descriptors' — the optimized
+  # artifact was unloadable in Chrome).
+  local wasm_features=(
+    --enable-bulk-memory --enable-bulk-memory-opt --enable-sign-ext
+    --enable-mutable-globals --enable-nontrapping-float-to-int
+    --enable-reference-types --enable-multivalue
+  )
+  wasm-opt "${wasm_features[@]}" -Oz --converge -o "${out}/client_bg.opt.wasm" "${out}/client_bg.wasm"
+  # The optimized artifact MUST take the client_bg.wasm name — that is what
+  # wasm-bindgen's client.js fetches. (Found live: the page was serving the
+  # unoptimized bindgen output while the optimized one sat unused.)
+  mv "${out}/client_bg.opt.wasm" "${out}/client_bg.wasm"
+  brotli -f -q 11 "${out}/client_bg.wasm"   # -> client_bg.wasm.br (input kept)
   printf '  %-8s raw=%s  bindgen=%s  wasm-opt=%s  brotli=%s (bytes)\n' "${variant}" \
     "$(stat -c%s "${RAW}")" \
+    "${bindgen_bytes}" \
     "$(stat -c%s "${out}/client_bg.wasm")" \
-    "$(stat -c%s "${out}/client_bg.opt.wasm")" \
-    "$(stat -c%s "${out}/client_bg.opt.wasm.br")"
+    "$(stat -c%s "${out}/client_bg.wasm.br")"
   if command -v twiggy >/dev/null 2>&1; then
     echo "  -- twiggy top (${variant}) --"
-    twiggy top -n 15 "${out}/client_bg.opt.wasm" 2>/dev/null \
+    twiggy top -n 15 "${out}/client_bg.wasm" 2>/dev/null \
       || echo "  (twiggy could not parse this wasm — newer feature set; per-function sizes skipped)"
   else
     echo "  (twiggy absent — per-function byte attribution skipped)"

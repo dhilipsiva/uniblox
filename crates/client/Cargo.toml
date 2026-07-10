@@ -6,11 +6,10 @@ edition.workspace = true
 [features]
 # WebGL2 is the implicit default build. The `webgpu` feature is enabled for the
 # WebGPU build and MUST be paired with `RUSTFLAGS=--cfg=web_sys_unstable_apis`
-# (see scripts/build-wasm.sh). No-op today; the flag exists so the two-build
-# pipeline invocation is valid before Bevy lands. Two builds, never one
-# (Bevy issue #13168 — enabling `webgpu` overrides `webgl2`).
+# (see scripts/build-wasm.sh). Two builds, never one (Bevy issue #13168 —
+# enabling `webgpu` overrides `webgl2`).
 default = []
-webgpu  = []
+webgpu  = ["bevy/webgpu"]
 
 [dependencies]
 
@@ -29,3 +28,8 @@ log.workspace = true
 # In-browser ed25519 sign/verify measurement (the slice's measurement gap —
 # decides Phase-6 per-frame signing affordability). Fixed key, no RNG.
 ed25519-dalek.workspace = true
+# The full engine — wasm32 ONLY (ADR-0017; native parity is Phase 14, and
+# native Bevy would drag alsa/udev/X11 into the devShell). Pruned to the 2d
+# collection; webgl2 is the default build's backend, and the `webgpu` cargo
+# feature above swaps it (overrides webgl2 — hence the two builds, ADR-0002).
+bevy = { workspace = true, features = ["2d", "bevy_winit", "webgl2"] }

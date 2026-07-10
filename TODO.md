@@ -10,7 +10,7 @@ uniblox is a browser-first, native-secondary Rust→WASM **platform** (not a fra
 
 ## How to use this file
 
-- **Drive this file top-to-bottom.** Phase 1 (the vertical slice) proved the authority-swap (ADR-0014); its remaining bullets are environment-gated residuals. Phases 2+ follow in order, fanning out per the staged next steps at the bottom.
+- **Drive this file top-to-bottom.** Phase 1 (the vertical slice) is COMPLETE — it proved the authority-swap (ADR-0014) and the client renders with all slice measurements taken (ADR-0017). Phases 2+ follow in order, fanning out per the staged next steps at the bottom.
 - **Why slice-first (kept as rationale):** roughly **10% of the system is novel and 90% is well-trodden**, and ~80% of the value sits in the ~15% authority-swap slice. That slice was simultaneously the highest-risk and highest-value part; everything else is delegable glue now that it is proven.
 - **Obey each task's risk tier.** HIGH-RISK tasks are human-verified, TDD-first, plan-mode-first, with a fresh independent auditor subagent mandatory. LOW/MIXED tasks are delegated heavily, with acceptance criteria as the contract.
 - **The architecture is settled. Record it; do not relitigate it.** Breaking a settled invariant silently re-opens a decision already made for a reason. Rejected alternatives are logged below so they are not re-proposed.
@@ -131,7 +131,7 @@ Genuinely open technical unknowns (CONTEXT.md §9). None block starting the slic
 
 Unknowns to **measure, not assume** — build instrumentation into Phase 1 and re-report every phase.
 
-- **WASM binary size** per build (WebGPU vs WebGL2), **before and after `wasm-opt -Oz` + brotli.** Bevy WASM binaries are large ("upwards of 30MB, reduced to ~15MB with wasm-opt"; WebGPU fox demo ~22MB; unoptimized dev builds exceed 100MB — one tutorial build measured ~160MB). Distrust sub-3 MB figures. Budget within the wasm32 4 GB memory ceiling.
+- **WASM binary size** per build (WebGPU vs WebGL2), **before and after `wasm-opt -Oz` + brotli** — measured baseline 2026-07-11 (ADR-0017, 2d-pruned, no assets yet): raw ~21 MB → wasm-opt ~15.6 MB → **brotli 3.38/3.40 MB**. Re-report per release as assets/features land; budget within the wasm32 4 GB memory ceiling.
 - **Cold-load time** in-browser: download + instantiate + first frame (time-to-interactive).
 - **Replication bandwidth per peer** — the pre-delta native baseline is in `/slice-check` (742 B/s @ 2 entities, 20 Hz); still to measure: post-delta-compression and post-interest-management (Phase 3), whether 30–60 Hz is affordable, and realistic entity counts.
 - **In-browser ed25519 sign/verify cost** (via WebCrypto/WASM) — decides whether per-frame state-channel signing is affordable vs reliable-channel-only. (Native measured 13.4 µs sign / 25.7 µs verify with the opt-level=3 crypto override; WASM single-thread, no AVX2, several× slower — measure it.)
@@ -140,21 +140,13 @@ Unknowns to **measure, not assume** — build instrumentation into Phase 1 and r
 
 ## Phased build sequence
 
-### PHASE 1 — THE VERTICAL SLICE — remaining: environment-gated residuals [LOW]
+### PHASE 1 — THE VERTICAL SLICE: COMPLETE
 
-**Scope note:** the slice exists to prove the authority-swap, and that gate PASSED (ADR-0014; the full
-trail is ADR-0011…ADR-0016 in `DECISIONS.md`, live status in `PROJECT_STATE.md`). Everything left in this
-phase needs an environment this dev setup lacks: a rendering Bevy client, a desktop browser (WSL2 headless
-never completes the matchbox handshake — ADR-0012), or real-network peers.
-
-**Browser-side instrumentation** [LOW — needs the Bevy client / real network]
-- Measure the remaining in-browser rows: **cold-load TTI with the rendering Bevy client** (the harness is
-  in `web/index.html` — `[uniblox-metrics] cold-load`; the stub's ~0.9–1.2 s is NOT the budget number)
-  and the **STUN-only connection success rate** (real-network peers). *Acceptance:* the `/slice-check`
-  table's remaining pending rows fill with measured values. (In-browser ed25519 is measured:
-  sign ~20–24 µs / verify ~45 µs, in the table.)
-- Once the Bevy client renders, run `scripts/build-wasm.sh` to produce **meaningful** two-build WASM artifacts (WebGPU: `--features webgpu` + `RUSTFLAGS=--cfg=web_sys_unstable_apis`; WebGL2: default) and confirm `crates/client/web/index.html` loads the correct bundle per `navigator.gpu`. *Acceptance:* both artifacts produced from the real client; the page loads the right one; the build prints raw→bindgen→wasm-opt→brotli sizes. (Do NOT claim the stub's byte-identical KB output as this.)
-- Feature-prune Bevy via its **`2d`/`3d`/`ui` cargo feature collections** (verify exact collection names against Bevy 0.19 docs) rather than hand-listing features, and record the **`wasm-opt -Oz --converge`** (fixed-point) size deltas. *Acceptance:* the build prints size deltas from feature-pruning and from `--converge`. (Blocked: Bevy is added only when the client renders.)
+The slice proved the authority-swap (gate PASSED, ADR-0014; full trail ADR-0011…ADR-0017 in
+`DECISIONS.md`, live status in `PROJECT_STATE.md`) and the Bevy client renders in-browser with every
+slice measurement taken (ADR-0017: real two-build sizes, cold-load, size-budget gate PASS). The one
+measurement the slice could never take — the STUN-only connection success rate — needs real-network
+peers and lives in Phase 2's telemetry bullet.
 
 ### PHASE 2 — Transport hardening [MIXED]
 **Goal:** production-grade transport across browser and native/server.
@@ -309,13 +301,12 @@ Compact list; see **docs/CONTEXT.md** for the full rationale.
 ## Go/no-go gates & staged next steps
 
 **Gates:**
-- **Size-budget gate (when the Bevy client lands):** if the WebGPU+WebGL2 two-build size after `wasm-opt`+brotli is prohibitive for your cold-load target (the "upwards of 30MB → ~15MB" range unacceptable), pause and run a size-budget spike (feature-prune Bevy, lazy-load assets) before proceeding.
-- Define the currently-undefined cold-load target the size-budget gate tests against: **≤ ~8 MB brotli per WASM build**, aiming for a **playable first frame in ~2–5 s on ~5–10 Mbps** links (treat >~1 s first-contentful-paint on a high-end desktop as a signal to prune harder). These are post-`wasm-opt`+brotli *targets to validate*, not the refuted sub-3 MB uncompressed claim. *Acceptance:* the gate passes/fails against these numbers.
+- **Size-budget gate (standing; re-check per release as assets/features land):** ≤ **~8 MB brotli per WASM build**, aiming for a **playable first frame in ~2–5 s on ~5–10 Mbps** links (treat >~1 s first-contentful-paint on a high-end desktop as a signal to prune harder). **Current (2026-07-11, ADR-0017): PASS — 3.38/3.40 MB brotli; first frame ~3.1 s @10 Mbps (in target), ~5.8 s @5 Mbps (marginal — prune further when real game assets land).** If a release breaches the gate, pause and run a size spike (feature-prune, lazy-load assets) before proceeding.
 - **Benchmark thresholds that change the plan:** STUN-only failure materially above ~20–25% → prioritize TURN earlier / reconsider free-tier P2P expectations; per-frame sign/verify cost too high in-browser → default to reliable-channel-only signing; cold-load unacceptably slow → invest in binary-splitting/lazy assets before feature work.
 
 **Staged next steps:**
 1. **Finish Phase 2 (transport hardening)** — reconnect/ICE-restart, plus the environment-gated verifications (desktop-browser pairings, real-network failure-rate telemetry) as environments become available.
-2. **The Bevy client work** closes the client-gated Phase-1 residuals: meaningful two-build WASM sizes against the size-budget gate above, cold-load, in-browser metrics, and unblocks the Phase-14 Web Audio worklet. (The desktop-browser and real-network residuals have their own environment gates.)
+2. **Grow the client from the minimal render (ADR-0017) toward the playable mini-game view** — render the replicated entities, wire input, add the `ui` feature collection when needed; re-check the size-budget gate as it grows. The Phase-14 Web Audio worklet is now unblocked (needs audio added to the client first).
 3. **Fan out Phases 4–8** (Mode 1, services, identity/billing, persistence, publish) — LOW/MIXED, safe to delegate broadly with acceptance criteria as the contract; run them in parallel git worktrees if using multiple sessions.
 4. **Sequence the two HIGH-RISK deep passes (Phase 3 replication depth, Phase 12 sandbox) with a human owner each.** Never let these merge on auto-review alone; each goes to a fresh auditor subagent.
 5. **Keep instrumenting the measurement gaps and re-report every phase:** WASM binary size per build (before/after `wasm-opt -Oz` + brotli, within the wasm32 4 GB ceiling); cold-load time in-browser; replication bandwidth per peer post-delta/AOI (and whether 30–60 Hz is affordable); per-message sign/verify cost in-browser (ed25519); STUN-only connection failure rate (plan 15–25%; TURN provided only in Mode 3).

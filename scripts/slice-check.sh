@@ -18,11 +18,11 @@ size_row () {  # $1=label  $2=path
   fi
 }
 
-echo "-- WASM size (per build) -- (STUB CLIENT — not the size-budget measurement until Bevy renders)"
-size_row "webgl2 wasm-opt"  "dist/webgl2/client_bg.opt.wasm"
-size_row "webgl2 brotli"    "dist/webgl2/client_bg.opt.wasm.br"
-size_row "webgpu wasm-opt"  "dist/webgpu/client_bg.opt.wasm"
-size_row "webgpu brotli"    "dist/webgpu/client_bg.opt.wasm.br"
+echo "-- WASM size (per build; served artifact = wasm-opt output; gate: <= ~8 MB brotli) --"
+size_row "webgl2 wasm-opt"  "dist/webgl2/client_bg.wasm"
+size_row "webgl2 brotli"    "dist/webgl2/client_bg.wasm.br"
+size_row "webgpu wasm-opt"  "dist/webgpu/client_bg.wasm"
+size_row "webgpu brotli"    "dist/webgpu/client_bg.wasm.br"
 echo
 
 echo "-- Measured (native slice, loopback) --"
@@ -49,13 +49,14 @@ else
 fi
 echo
 
-echo "-- Measured (in-browser, desktop Chromium on the Windows host; re-measure per release) --"
-printf '  %-36s %s\n' "ed25519 sign (wasm, browser)"   "19.6-23.6 us/op  (2026-07-11, release + opt-level=3 crypto override)"
-printf '  %-36s %s\n' "ed25519 verify (wasm, browser)" "44.5-45.6 us/op  (~1.7x native 25.7 us; 8-peer mesh @30Hz ~= 1% of a core)"
-printf '  %-36s %s\n' "crypto wasm size cost"          "+106 KB wasm-opt / +55 KB brotli (dalek+override delta on the stub)"
+echo "-- Measured (in-browser; re-measure per release) --"
+printf '  %-36s %s\n' "ed25519 sign (wasm, browser)"   "19.6-25.0 us/op  (2026-07-11, release + opt-level=3 crypto override)"
+printf '  %-36s %s\n' "ed25519 verify (wasm, browser)" "44.0-45.6 us/op  (~1.7x native 25.7 us; 8-peer mesh @30Hz ~= 1% of a core)"
+printf '  %-36s %s\n' "crypto wasm size cost"          "+106 KB wasm-opt / +55 KB brotli (dalek+override delta, pre-Bevy stub)"
+printf '  %-36s %s\n' "cold-load: wasm instantiate"    "351 ms local (headless webgl2, optimized artifact, 2026-07-11)"
+printf '  %-36s %s\n' "cold-load: first Bevy frame"    "381 ms local; + download: ~2.7 s @10 Mbps / ~5.4 s @5 Mbps (3.4 MB brotli)"
+printf '  %-36s %s\n' "size-budget gate"               "PASS: 3.38/3.40 MB brotli <= ~8 MB; first frame ~3.1 s @10 Mbps (in target), ~5.8 s @5 Mbps (marginal)"
 echo
 
 echo "-- Pending (environment-gated) --"
-printf '  %-36s %s\n' "cold-load time (TTI)"          "needs the rendering Bevy client (harness in index.html prints [uniblox-metrics] cold-load; stub ~0.9-1.2 s is NOT the budget number)"
-printf '  %-36s %s\n' "STUN-only connection success"  "needs real-network peers (loopback is meaningless)"
-printf '  %-36s %s\n' "real WASM size / feature-prune" "needs the Bevy client (later in Phase 1)"
+printf '  %-36s %s\n' "STUN-only connection success"  "needs real-network peers (loopback is meaningless) — Phase-2 telemetry"

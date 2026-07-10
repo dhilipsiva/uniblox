@@ -1,11 +1,13 @@
-//! `client` — WASM/native client (winit + wgpu, later in Phase 1).
+//! `client` — WASM/native client.
 //!
 //! Two WASM builds (WebGPU + WebGL2), single-threaded (no COOP/COEP). See
 //! crates/client/CLAUDE.md and scripts/build-wasm.sh.
 //!
-//! Until the Bevy client lands, the wasm build runs a transport DEMO: it joins
-//! the local signaling room and exchanges greetings on both channels, logging
-//! to the browser console — this is the "two browser tabs connect P2P" proof.
+//! The wasm build runs the minimal Bevy render (ADR-0017: Camera2d + one
+//! asset-free sprite, canvas `#uniblox-canvas`) alongside the transport DEMO
+//! (joins the local signaling room, exchanges greetings on both channels) and
+//! the `[uniblox-metrics]` harness. Native main is still a stub — Bevy is a
+//! wasm32-only dependency here; native parity is Phase 14.
 
 /// The interim two-tab transport demo (wasm only).
 #[cfg(target_arch = "wasm32")]
@@ -125,9 +127,80 @@ mod demo {
     }
 }
 
+/// The minimal Bevy render (wasm only): one camera, one moving sprite, and a
+/// first-frame metric — the smallest thing that makes cold-load/TTI and the
+/// two-build sizes REAL measurements (TODO §size-budget gate).
+#[cfg(target_arch = "wasm32")]
+mod render {
+    // Bevy's derive macros detect the `bevy` facade by scanning [dependencies];
+    // ours is target-scoped, so they emit `bevy_ecs::` paths — alias them back.
+    use bevy::ecs as bevy_ecs;
+    use bevy::prelude::*;
+
+    /// Marker for the one demo sprite.
+    #[derive(Component)]
+    pub struct Bouncer;
+
+    fn setup(mut commands: Commands) {
+        commands.spawn(Camera2d);
+        commands.spawn((
+            Sprite::from_color(Color::srgb(0.9, 0.4, 0.1), Vec2::new(96.0, 96.0)),
+            Transform::default(),
+            Bouncer,
+        ));
+    }
+
+    /// Frames demonstrably tick: slide the sprite on a sine.
+    fn bounce(time: Res<Time>, mut sprites: Query<&mut Transform, With<Bouncer>>) {
+        let x = (time.elapsed_secs() * 1.5).sin() * 160.0;
+        for mut transform in &mut sprites {
+            transform.translation.x = x;
+        }
+    }
+
+    /// Logs the first rendered-frame time once ([uniblox-metrics] first-frame)
+    /// — the TTI end-marker; navigation start is performance.now()'s origin.
+    fn first_frame(mut done: Local<bool>) {
+        if !*done {
+            *done = true;
+            let ms = web_sys::window()
+                .and_then(|w| w.performance())
+                .map(|p| p.now())
+                .unwrap_or(0.0);
+            web_sys::console::log_1(
+                &format!("[uniblox-metrics] first-frame: {ms:.0} ms since navigation start").into(),
+            );
+        }
+    }
+
+    pub fn run() {
+        App::new()
+            .add_plugins(DefaultPlugins.set(WindowPlugin {
+                primary_window: Some(Window {
+                    title: "uniblox".into(),
+                    canvas: Some("#uniblox-canvas".into()),
+                    fit_canvas_to_parent: true,
+                    // Keep browser shortcuts (F5, devtools) working.
+                    prevent_default_event_handling: false,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .add_systems(Startup, setup)
+            .add_systems(Update, (bounce, first_frame))
+            .run();
+    }
+}
+
 fn main() {
     #[cfg(target_arch = "wasm32")]
-    demo::start();
+    {
+        // Transport demo + metrics first (spawn_local futures run alongside
+        // winit's requestAnimationFrame loop), then the render app — run()
+        // does not return on wasm.
+        demo::start();
+        render::run();
+    }
     #[cfg(not(target_arch = "wasm32"))]
     println!("uniblox client (stub)");
 }
