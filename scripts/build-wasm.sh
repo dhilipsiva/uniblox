@@ -50,7 +50,8 @@ emit () {
     "$(stat -c%s "${out}/client_bg.opt.wasm.br")"
   if command -v twiggy >/dev/null 2>&1; then
     echo "  -- twiggy top (${variant}) --"
-    twiggy top -n 15 "${out}/client_bg.opt.wasm" || true
+    twiggy top -n 15 "${out}/client_bg.opt.wasm" 2>/dev/null \
+      || echo "  (twiggy could not parse this wasm — newer feature set; per-function sizes skipped)"
   else
     echo "  (twiggy absent — per-function byte attribution skipped)"
   fi
@@ -59,4 +60,6 @@ emit () {
 echo "uniblox two-build WASM pipeline"
 emit webgl2 ""                 ""                              # default build
 emit webgpu "--features webgpu" "--cfg=web_sys_unstable_apis"  # WebGPU build
-echo "Done. Artifacts: dist/webgl2/ and dist/webgpu/. Serve with scripts/serve.sh (no COOP/COEP)."
+# Stage the capability-detection page at the served root.
+cp crates/client/web/index.html dist/index.html
+echo "Done. Artifacts: dist/webgl2/ and dist/webgpu/ (+ index.html). Serve with scripts/serve.sh (no COOP/COEP)."

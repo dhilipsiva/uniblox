@@ -149,10 +149,19 @@ Unknowns to **measure, not assume** — build instrumentation into Phase 1 and r
 
 > **Project + build + AI-workflow scaffolding is DONE** (see `PROJECT_STATE.md`): the `crates/*` workspace + size-optimized release profile + single-threaded stance; the full `.claude/` AI workflow (four subagents, five slash commands, four hooks + the `pre-commit` gate); the build-pipeline scripts + capability page + `.mcp.json`; and a **Nix flake devShell** (`flake.nix`/`.envrc`, ADR-0010) that pins Rust + the WASM toolchain (`wasm-bindgen`/`wasm-opt`/`brotli`/`twiggy`/`node`) with direnv auto-activation. `scripts/build-wasm.sh` runs end-to-end. Its remaining follow-ups are distributed to their homes below: **Instrumentation** (meaningful two-build artifacts + Bevy feature-prune, once the client renders), the **AI-workflow → MCP servers** note (bring the servers up), and **Phase 14** (the Web Audio worklet).
 
-**Transport: matchbox two-channel** [MIXED]
-- Wire `matchbox_socket`/`bevy_matchbox` with TWO channels — unreliable/unordered (positions/inputs) + reliable/ordered (events/handoffs/resync), e.g. `WebRtcSocketBuilder::new(url).add_channel(ChannelConfig::unreliable()).add_channel(ChannelConfig::reliable())`. Stand up a `matchbox_server` signaling server (room-based signaling with crude `?next=N` matchmaking, later extended for mode/version scoping — see Phase 5). *Acceptance:* two browser tabs connect P2P; data flows on both channels.
-
-> **Reusable prior art:** `github.com/dhilipsiva/nibli` is an existing browser-native WebRTC P2P gossip transport (NAT traversal, no central relay) — **directly reusable for the transport/signaling layer**. Evaluate it before hand-rolling transport plumbing here and in Phases 2/5.
+**Transport: matchbox two-channel — residual: browser-tab verification** [LOW]
+The core is DONE (ADR-0012): `crates/transport` wraps matchbox 0.14 with the two settled channels
+(state=0 unreliable, events=1 reliable); `crates/services` is the room-based full-mesh signaling binary
+(`?next=N` lands with Phase 5's custom topology); a hermetic native↔native two-peer test proves data flows
+on both channels through real WebRTC + real signaling; the wasm client demo + `scripts/e2e-two-tab.mjs`
+exist. What remains is only the literal browser-tab run, blocked in THIS dev environment: matchbox 0.14's
+wasm handshake waits for ICE-gathering-complete before sending its offer, and WSL2 headless Chrome never
+fires 'complete' with any iceServers set (see ADR-0012; Playwright-MCP lacked a browser and the Chrome
+extension was disconnected).
+- Verify in a real desktop browser (or non-WSL CI): `cargo run -p services`, `./scripts/build-wasm.sh`,
+  `./scripts/serve.sh`, open `http://localhost:8080/` in two tabs (or run `node scripts/e2e-two-tab.mjs`
+  where headless gathering completes). *Acceptance:* both tabs' consoles log `[uniblox-demo][STATE]` and
+  `[uniblox-demo][EVENT]` receipts from the other peer — two browser tabs connected P2P, data on both channels.
 
 **The replication protocol (custom)** [HIGH]
 - Wire format: bincode/postcard with **quantized floats** (fixed-point positions, quantized quaternions) + **per-component delta vs last-acked baseline**. TDD: write serialization round-trip and quantization-bound tests FIRST. *Acceptance:* round-trip within quantization tolerance; delta-vs-baseline verified.
@@ -174,7 +183,7 @@ Unknowns to **measure, not assume** — build instrumentation into Phase 1 and r
 - Feature-prune Bevy via its **`2d`/`3d`/`ui` cargo feature collections** (verify exact collection names against Bevy 0.19 docs) rather than hand-listing features, and record the **`wasm-opt -Oz --converge`** (fixed-point) size deltas. *Acceptance:* the build prints size deltas from feature-pruning and from `--converge`. (Blocked: Bevy is added only when the client renders.)
 
 ### PHASE 2 — Transport hardening [MIXED]
-**Goal:** production-grade transport across browser and native/server. (Reuse `nibli` where it fits — see the Phase 1 transport item.)
+**Goal:** production-grade transport across browser and native/server.
 - str0m (sans-IO) integration for native/server WebRTC; browser (web-sys) ↔ native (str0m) DataChannel interop. **[MIXED — the sans-IO poll/timeout event loop is fiddly; human-review the driving loop.]** *Acceptance:* a native str0m peer exchanges data with a browser matchbox peer on both channels.
 - Record the raw DataChannel/SCTP parameters behind the `unreliable()`/`reliable()` helpers, needed to configure the **str0m** side directly (it lacks matchbox's helpers): unreliable state = `{ ordered: false, maxRetransmits: 0 }`; reliable events = `{ ordered: true }` with neither retransmit field set. Spec constraint: **set at most one of `maxRetransmits` / `maxPacketLifeTime`** (both is an error). *Acceptance:* a native str0m peer negotiates matching channel semantics with a browser matchbox peer on both channels.
 - Two-channel config parameterized (reliability/ordering/retransmit). [LOW] *Acceptance:* config test.
@@ -198,7 +207,7 @@ Unknowns to **measure, not assume** — build instrumentation into Phase 1 and r
 - Opt-in content-addressed save. *Acceptance:* save/reload by content ID.
 
 ### PHASE 5 — Central services (signaling / session / matchmaking) [LOW]
-**Goal:** the WebSocket service required even for free tiers. Delegate heavily. (Start from `matchbox_server`'s room-based signaling + `?next=N`; extend it for mode/version scoping. Evaluate `nibli` for reusable signaling/NAT-traversal code.)
+**Goal:** the WebSocket service required even for free tiers. Delegate heavily. (Extend `crates/services`' full-mesh signaling with a custom `SignalingTopology` for `?next=N` matchmaking + mode/version scoping — see ADR-0012.)
 - SDP/ICE signaling + session registry, extending `matchbox_server`'s room-based `?next=N` matchmaking with mode/version scoping. *Acceptance:* peers exchange offers/answers; sessions listed; scoping enforced.
 - Matchmaking groups only same-mode, same-version players. *Acceptance:* mismatched version/mode never matched.
 - Version-triple enforcement/gating (`{engine, content, schema}`); gate join, no force-update. Version-gating on session join is the desync defense (engine/binary is a versioned release, not hot-reloadable in prod; content is hot-reloadable at runtime). *Acceptance:* incompatible client rejected at join with a clear reason.
@@ -286,7 +295,7 @@ Unknowns to **measure, not assume** — build instrumentation into Phase 1 and r
 | Bevy pre-1.0 breaking changes every ~3mo | High | Medium | Pin versions; budget migration each cycle |
 | WASM size > budget → slow cold load | Medium | Medium | Measure in slice; wasm-opt/brotli/lazy assets |
 | 15–25% Mode-2 peers fail STUN-only | High | Medium | Documented as accepted; offer Mode 3 |
-| matchbox/str0m are small-team OSS | Medium | Medium | Vendor/fork readiness; abstraction layer; reuse `nibli` |
+| matchbox/str0m are small-team OSS | Medium | Medium | Vendor/fork readiness; abstraction layer (`crates/transport`) |
 | WASM crypto too slow for per-frame signing | Medium | Low | Sign reliable channel only; configurable |
 | Mode 3 infra cost > subscription | Medium | High | Per-session cost model (vCPU + egress + TURN); managed fleet |
 | UGC moderation gaps (P2P unmoderatable live) | Medium | High | Publish-time scan (hash/static/name filters) + report queue |

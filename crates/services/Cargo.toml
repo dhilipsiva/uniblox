@@ -4,3 +4,6 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+matchbox_signaling.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true

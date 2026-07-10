@@ -4,7 +4,11 @@
 **Risk tier:** standard.
 
 ## Status
-Stub (Phase 1 scaffolding). Prints a placeholder; no Bevy yet.
+No Bevy yet. The wasm build runs the interim **transport two-tab demo**: connects
+to `ws://127.0.0.1:3536/uniblox-demo`, exchanges greetings on both channels, logs
+to the console (`[uniblox-demo][STATE]/[EVENT]` markers — asserted by
+`scripts/e2e-two-tab.mjs`). Panics and matchbox internals surface in the console
+(`console_error_panic_hook` + `console_log`). Native main is still the stub.
 
 ## Crate-local invariants
 - **Two WASM builds, not one.** WebGL2 = default build; WebGPU = `--features webgpu`

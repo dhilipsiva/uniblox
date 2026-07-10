@@ -4,7 +4,7 @@ Living snapshot of where uniblox is. Update it when a phase's status changes.
 The **why** behind decisions lives in `DECISIONS.md`; the **what/how** lives in
 `docs/final-buildspec.md`; the backlog lives in `TODO.md`.
 
-**Current phase: Phase 1 (the vertical slice) — scaffolding, the Rhai↔Bevy bridge, and the mode-agnostic mini-game done; next is matchbox two-channel transport.**
+**Current phase: Phase 1 (the vertical slice) — scaffolding, the Rhai↔Bevy bridge, the mode-agnostic mini-game, and the matchbox two-channel transport core done; next is the custom replication protocol [HIGH].**
 
 ## Done
 - **Cargo workspace** — virtual manifest, 9 crates under `crates/*` (glob members),
@@ -30,6 +30,11 @@ The **why** behind decisions lives in `DECISIONS.md`; the **what/how** lives in
   branching `simulate` system (Local computes; Remote is the documented apply-path placeholder — never
   re-simulates). 8 TDD tests green incl. the **Mode-2 two-perspective and Mode-3 shape proofs** — the
   authority-swap demonstrated at the unit level before transport exists. netcode-audited; wasm32-clean.
+- **matchbox two-channel transport core** (ADR-0012) — `crates/transport` (matchbox 0.14; state=0
+  unreliable, events=1 reliable), `crates/services` full-mesh signaling binary, hermetic native↔native
+  two-peer datachannel test green, wasm client demo + `scripts/e2e-two-tab.mjs`. The nibli prior-art note
+  was resolved obsolete (repo repurposed). Residual: the browser-tab run — blocked in WSL2 headless (ICE
+  gathering never completes; matchbox wasm waits on it), verifiable on a desktop browser (see TODO).
 
 ## Blocked / deferred (prerequisites do not exist yet)
 - **Real two-build WASM artifacts + size table** — WASM toolchain is now provided by the flake;
@@ -42,11 +47,11 @@ The **why** behind decisions lives in `DECISIONS.md`; the **what/how** lives in
 - **Web Audio worklet** investigation — needs a running WASM client with audio.
 
 ## Next
-- **Matchbox two-channel transport** (unreliable state + reliable events; two browser tabs connect P2P;
-  evaluate `nibli` before hand-rolling plumbing).
-- Then the custom replication protocol and the authority-swap to Mode 3 + one A→B handoff. **The
-  replication → authority-swap → handoff items are the architecture go/no-go gate** — do not build services
-  until the authority-swap and a clean handoff are proven.
+- **The custom replication protocol** [HIGH — plan-mode-first, TDD with human-specified cases,
+  netcode-auditor]: wire format with quantized floats + delta/baseline over the transport's two channels.
+- Then the authority-swap to Mode 3 + one A→B handoff. **The replication → authority-swap → handoff items
+  are the architecture go/no-go gate** — do not build services until the authority-swap and a clean handoff
+  are proven.
 
 ## Toolchain notes
 WSL2 Ubuntu. **The toolchain comes from the Nix flake devShell** (ADR-0010): pinned Rust 1.96.1

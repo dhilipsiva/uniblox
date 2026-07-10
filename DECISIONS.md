@@ -125,3 +125,32 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   schedule — acceptable while scripts stay thin; flipping to `sync` + `#[derive(Resource)]` later is a
   localized change (only the insert call + trait bounds move).
 - **Status:** Accepted (2026-07-09).
+
+## ADR-0012 — matchbox 0.14 two-channel transport; embedded full-mesh signaling; nibli note resolved
+- **Context:** the transport item prescribes matchbox with two DataChannels (unreliable state + reliable
+  events) and a room-based signaling server. Verified live: matchbox_socket/matchbox_signaling **0.14.0**
+  (TODO's 0.13 was stale). The TODO's prior-art note pointing at `github.com/dhilipsiva/nibli` as a reusable
+  "browser-native WebRTC P2P gossip transport" is **obsolete** — that repo has been repurposed into a Lojban
+  theorem prover; there is no transport code to reuse.
+- **Decision:** `crates/transport` wraps `matchbox_socket` with the settled channel layout baked in
+  (`CHANNEL_STATE`=0 unreliable/unordered `{ordered:false, max_retransmits:Some(0)}`; `CHANNEL_EVENTS`=1
+  reliable/ordered `{ordered:true, max_retransmits:None}`; channel index = builder insertion order).
+  `crates/services` embeds `matchbox_signaling`'s full-mesh topology as the signaling binary (rooms = URL
+  path). **`?next=N` matchmaking is NOT in the library's FullMesh topology** (it lives in the separate
+  `matchbox_server` binary's custom topology) — it lands with Phase 5's custom `SignalingTopology` extension.
+  matchbox's transport `PeerId` (UUID, signaling-assigned) is distinct from `protocol::PeerId(u64)`; the
+  mapping is a session-layer concern deferred to replication/session join.
+- **Consequences / findings:**
+  - The native↔native two-peer datachannel test (novel — matchbox itself only tests signaling) proves both
+    channels flow through real WebRTC + real signaling, hermetically (empty ICE config → loopback host
+    candidates; **native-only**: browsers reject an ICE-server entry with no URLs, so `connect_hermetic` is
+    cfg-gated off wasm).
+  - **matchbox 0.14 wasm handshake waits for ICE-gathering-complete before sending its offer** (non-trickle;
+    upstream TODO). Under WSL2 headless Chrome, gathering never reaches 'complete' when any iceServers entry
+    is set (reproduced: shell + full chromium, all flag combos) ⇒ the browser two-tab acceptance cannot run
+    headlessly in THIS environment; it passes wherever gathering completes (desktop browser / non-WSL CI).
+    `scripts/e2e-two-tab.mjs` encodes the automated check + the findings.
+  - tokio enters the tree (signaling + native webrtc); the client wasm demo gained `console_error_panic_hook`
+    + `console_log` (Rust panics and matchbox internals visible in the browser console — essential for wasm
+    debugging).
+- **Status:** Accepted (2026-07-10).
