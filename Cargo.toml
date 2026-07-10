@@ -52,6 +52,9 @@ tempfile = { version = "3" }
 filetime = { version = "0.2" }
 ed25519-dalek = { version = "3" }   # slice instrumentation (sign/verify cost); op-signing itself is Phase 6
 serde_json = { version = "1" }
+# TURN-relay tests (ADR-0016): raw webrtc-rs peers under Relay-only ICE policy
+# prove the coturn relay path. Same version matchbox_socket pins (no dup build).
+webrtc = { version = "0.17" }
 
 # Size-optimized ship profile (docs/final-todo.md §1.1). `panic = "abort"` is
 # scoped to release ONLY — `cargo test` builds under the dev/test profile

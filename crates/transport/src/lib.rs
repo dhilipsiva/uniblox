@@ -14,9 +14,7 @@
 //! Kept deliberately THIN: the custom replication protocol builds on this seam,
 //! and the native/server str0m abstraction (Phase 2) slots in behind the same API.
 
-#[cfg(not(target_arch = "wasm32"))]
-use matchbox_socket::RtcIceServerConfig;
-use matchbox_socket::{ChannelConfig, WebRtcSocket, WebRtcSocketBuilder}; // RtcIceServerConfig: only connect_hermetic (native-only) uses it
+use matchbox_socket::{ChannelConfig, RtcIceServerConfig, WebRtcSocket, WebRtcSocketBuilder};
 
 pub use matchbox_socket::{Error as TransportError, Packet, PeerId, PeerState};
 
@@ -71,6 +69,55 @@ pub const CHANNEL_SPECS: [ChannelSpec; 2] = [
     },
 ];
 
+/// ICE server policy for a session (ADR-0016). The tier decides it:
+/// - **Free modes (1/2 P2P): STUN-only** — NAT discovery via public STUN,
+///   no relay. Sessions that STUN cannot connect fail (the measured
+///   failure rate is a fleet metric — see TODO).
+/// - **Mode 3 (paid): STUN + TURN relay** — coturn, with **paid-only,
+///   per-session credentials** provisioned by the platform at session join
+///   (credential issuance is Phase-7 platform work; this type just carries
+///   them).
+///
+/// Wasm-safe plain data; maps onto matchbox's `RtcIceServerConfig`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IceConfig {
+    /// `stun:`/`turn:` URLs, all handed to the WebRTC stack as one server
+    /// entry (matchbox exposes exactly one).
+    pub urls: Vec<String>,
+    /// TURN username (`None` for STUN-only).
+    pub username: Option<String>,
+    /// TURN credential (`None` for STUN-only).
+    pub credential: Option<String>,
+}
+
+impl IceConfig {
+    /// The free-tier default: public STUN, no relay. Identical servers to
+    /// matchbox's own default (what plain [`Transport::connect`] uses).
+    pub fn stun_only() -> Self {
+        let defaults = RtcIceServerConfig::default();
+        IceConfig {
+            urls: defaults.urls,
+            username: None,
+            credential: None,
+        }
+    }
+
+    /// Mode-3 paid tier: the given `turn:` URLs (+ credentials) alongside the
+    /// STUN defaults. Credentials come from the platform per session — never
+    /// bake long-lived TURN secrets into a client.
+    pub fn with_turn(
+        turn_urls: impl IntoIterator<Item = String>,
+        username: impl Into<String>,
+        credential: impl Into<String>,
+    ) -> Self {
+        let mut config = IceConfig::stun_only();
+        config.urls.extend(turn_urls);
+        config.username = Some(username.into());
+        config.credential = Some(credential.into());
+        config
+    }
+}
+
 /// Error sending on a channel: the channel is closed/taken or the index is
 /// invalid (the two-channel layout is fixed, so the latter is a programmer error
 /// surfaced as a `Result`, never a panic).
@@ -111,6 +158,21 @@ impl Transport {
     /// path for real sessions.
     pub fn connect(room_url: impl Into<String>) -> (Self, MessageLoopFuture) {
         Self::build(WebRtcSocketBuilder::new(room_url))
+    }
+
+    /// Connect with an explicit ICE policy ([`IceConfig`]): STUN-only for the
+    /// free tiers, STUN+TURN with per-session credentials for Mode 3.
+    pub fn connect_with_ice(
+        room_url: impl Into<String>,
+        ice: IceConfig,
+    ) -> (Self, MessageLoopFuture) {
+        Self::build(
+            WebRtcSocketBuilder::new(room_url).ice_server(RtcIceServerConfig {
+                urls: ice.urls,
+                username: ice.username,
+                credential: ice.credential,
+            }),
+        )
     }
 
     /// Connect with an EMPTY ICE server list: loopback/LAN host candidates
@@ -237,6 +299,29 @@ mod tests {
             events.max_retransmits, None,
             "events channel is reliable (unlimited retransmits)"
         );
+    }
+
+    /// Free tier = STUN-only: matchbox's default servers, no credentials.
+    /// Mode 3 = the same plus TURN urls and per-session credentials.
+    #[test]
+    fn ice_config_tiers() {
+        let free = IceConfig::stun_only();
+        assert_eq!(free.urls, RtcIceServerConfig::default().urls);
+        assert_eq!(free.username, None);
+        assert_eq!(free.credential, None);
+
+        let paid = IceConfig::with_turn(
+            vec!["turn:relay.example:3478?transport=udp".to_string()],
+            "session-user",
+            "session-pass",
+        );
+        assert_eq!(&paid.urls[..free.urls.len()], &free.urls[..], "STUN kept");
+        assert_eq!(
+            paid.urls.last().map(String::as_str),
+            Some("turn:relay.example:3478?transport=udp")
+        );
+        assert_eq!(paid.username.as_deref(), Some("session-user"));
+        assert_eq!(paid.credential.as_deref(), Some("session-pass"));
     }
 
     /// The matchbox derivation must equal what matchbox's own

@@ -14,9 +14,14 @@ entries) for offline tests; proven by a hermetic native↔native two-peer test.
 peer speaking matchbox's signaling protocol (via `matchbox_protocol` +
 blocking tungstenite) with one connection thread per remote peer; interop
 proven hermetically str0m↔native-matchbox (both role directions) and
-str0m↔str0m, both channels, both ways (`tests/str0m_interop.rs`). Residuals:
-browser pairing (desktop-browser, ADR-0012), TLS signaling, non-loopback bind,
-reconnect/ICE-restart (later Phase-2 items).
+str0m↔str0m, both channels, both ways (`tests/str0m_interop.rs`).
+**`IceConfig` (ADR-0016)**: `stun_only()` free tier / `with_turn(urls, user,
+credential)` Mode-3 paid tier + `Transport::connect_with_ice`; the TURN relay
+path is proven hermetically against a flake-provided coturn
+(`tests/turn_relay.rs` — relay-only webrtc-rs peers, credential negative,
+matchbox pass-through). Residuals: browser pairing (desktop-browser,
+ADR-0012), TLS signaling, non-loopback bind, reconnect/ICE-restart (later
+Phase-2 items); per-session TURN credential issuance is Phase 6.
 
 ## Crate-local invariants
 - **WebRTC DataChannels only — no media, no SFU, anywhere.**
@@ -39,6 +44,10 @@ reconnect/ICE-restart (later Phase-2 items).
 - **Trickle candidates AFTER the offer/answer** — native matchbox drops
   out-of-phase candidates (its handshake loops ignore them); a pre-offer
   trickle "works" in tests only via peer-reflexive discovery.
+- **ICE policy is tier data** (`IceConfig`, ADR-0016): free = STUN-only,
+  Mode 3 = STUN+TURN with per-session credentials carried (never minted) by
+  the transport. The hermetic coturn tests need `--allow-loopback-peers` —
+  test-only, NEVER on a production coturn.
 - Transport `PeerId` is matchbox's UUID (signaling-assigned) — distinct from
   `protocol::PeerId`; the mapping is a session-layer concern (replication/join).
 - matchbox 0.14 wasm sends its offer only after ICE-gathering-COMPLETE (non-trickle,

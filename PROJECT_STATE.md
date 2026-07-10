@@ -67,6 +67,14 @@ native/server peer is landed and matchbox-interoperable (ADR-0015).
   semantics (reliability/ordering/retransmit) are parameterized in one `CHANNEL_SPECS` source of truth that
   BOTH stacks derive from, locked by config tests (cross-stack parity by construction). Residuals:
   browser pairing (desktop-browser, ADR-0012), TLS signaling, non-loopback bind, reconnect (later items).
+- **STUN/TURN policy + relay proof** (ADR-0016) — `IceConfig` tiers (free = STUN-only default; Mode 3 =
+  STUN+TURN with per-session paid credentials, carried never minted) + `Transport::connect_with_ice`.
+  Hermetic coturn 4.13 (flake-provided) tests: relay-only webrtc-rs peers exchange a payload through the
+  allocation (THE relay proof — host/srflx excluded by policy); wrong credentials gather zero relay
+  candidates and never open; matchbox pass-through with only the TURN url + creds connects on both
+  channels. Gotchas recorded: coturn blocks loopback peers by default (test-only `--allow-loopback-peers`);
+  UDP readiness ≠ TCP readiness (STUN-binding probe in the harness). Residuals: STUN-only failure RATE is
+  a real-network fleet metric; production coturn + credential issuance ride Phase 6.
 - **Instrumentation (native core)** — `slice_metrics` example + `/slice-check` table. **Measured (native
   loopback, 2026-07-10):** state channel 742 B/s per peer @ 2 entities (19.4 msg/s at the 20 Hz net tick,
   ~38 B/msg — comfortably inside the ~1150 B datagram budget); events steady 0 B/s; RTT 4.3 ms ± 0.6 ms
@@ -94,7 +102,7 @@ Phase 12 (sandbox hardening) each need a human-owned HIGH pass.
 
 ## Toolchain notes
 WSL2 Ubuntu. **The toolchain comes from the Nix flake devShell** (ADR-0010): pinned Rust 1.96.1
-(edition 2024, wasm32 target) + `wasm-bindgen`/`wasm-opt`/`brotli`/`twiggy`/`node`. Run `direnv allow`
+(edition 2024, wasm32 target) + `wasm-bindgen`/`wasm-opt`/`brotli`/`twiggy`/`node`/`coturn`. Run `direnv allow`
 once per clone. Interactive `cd` auto-activates; for the WSL wrapper, prefix cargo/WASM-tool/npx
 commands with `direnv exec .`:
 `wsl -d Ubuntu -e bash -lc "cd ~/projects/dhilipsiva/uniblox && direnv exec . <CMD>"` (compound chains:

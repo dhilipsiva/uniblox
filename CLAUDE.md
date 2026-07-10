@@ -46,7 +46,7 @@ Cargo workspace, multi-crate. HIGH-RISK crates get plan-mode-first, TDD, and a d
 
 ## Commands
 
-**Dev environment:** the toolchain comes from the **Nix flake devShell** (`flake.nix`, `DECISIONS.md` ADR-0010) — pinned Rust (cargo/rustc/clippy/rustfmt, wasm32 target) + `wasm-bindgen`/`wasm-opt`/`brotli`/`twiggy`/`node`, all pinned by `flake.lock`. Run `direnv allow` once per clone. Interactive `cd` auto-activates the env (direnv + nix-direnv). For the WSL wrapper, **prefix cargo/WASM-tool/npx commands with `direnv exec .`** so they use the flake toolchain; pure git/file commands use the plain wrapper. Ambient rustup is a benign fallback for un-routed commands. The cargo/tool-bearing scripts (`build-wasm.sh`, the `gate-clippy`/`fmt-on-write` hooks, `pre-commit`) self-activate the flake.
+**Dev environment:** the toolchain comes from the **Nix flake devShell** (`flake.nix`, `DECISIONS.md` ADR-0010) — pinned Rust (cargo/rustc/clippy/rustfmt, wasm32 target) + `wasm-bindgen`/`wasm-opt`/`brotli`/`twiggy`/`node`/`coturn` (turnserver for the hermetic TURN tests, ADR-0016), all pinned by `flake.lock`. Run `direnv allow` once per clone. Interactive `cd` auto-activates the env (direnv + nix-direnv). For the WSL wrapper, **prefix cargo/WASM-tool/npx commands with `direnv exec .`** so they use the flake toolchain; pure git/file commands use the plain wrapper. Ambient rustup is a benign fallback for un-routed commands. The cargo/tool-bearing scripts (`build-wasm.sh`, the `gate-clippy`/`fmt-on-write` hooks, `pre-commit`) self-activate the flake.
 
 Standard cargo across the workspace (run from repo root, inside the flake env):
 

@@ -179,7 +179,7 @@ with labeled pendings. What remains is environment-gated:
 ### PHASE 2 — Transport hardening [MIXED]
 **Goal:** production-grade transport across browser and native/server.
 - str0m ↔ BROWSER matchbox verification (the native core is DONE, ADR-0015: `Str0mPeer` speaks matchbox signaling + negotiated no-DCEP channels; str0m↔native-matchbox(webrtc-rs) and str0m↔str0m proven hermetically on both channels, both role directions; the raw channel parameters are recorded in `crates/transport/CLAUDE.md` and derived from `CHANNEL_SPECS`). The browser pairing is environment-gated exactly like the ADR-0012 browser-tab residual — WSL2 headless cannot complete the matchbox handshake; run on a desktop browser: wasm demo tab + `Str0mPeer` in the same room. *Acceptance:* a native str0m peer exchanges data with a browser matchbox peer on both channels, with matching channel semantics (unreliable/unordered state, reliable/ordered events) confirmed on both.
-- STUN/TURN: STUN-only for free modes; coturn TURN with **paid-only credentials** for Mode 3. [MIXED] *Acceptance:* TURN relay works with credentials; measure STUN-only failure rate.
+- STUN/TURN residuals (the policy + relay proof are DONE, ADR-0016: `IceConfig` tiers, `connect_with_ice`, hermetic coturn relay/negative/pass-through tests): **measure the STUN-only failure rate** — a real-network fleet metric (the §"measurement gaps" entry), needs peers behind real NATs; **production coturn deployment + per-session TURN credential issuance** land with the Phase-6 entitlement boundary. [MIXED] *Acceptance:* failure-rate telemetry exists once real sessions run; Mode-3 join hands the client short-lived TURN credentials.
 - Reconnect / ICE-restart handling. [MIXED]
 
 ### PHASE 3 — Replication depth [HIGH]

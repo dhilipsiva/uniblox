@@ -268,3 +268,37 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   later Phase-2 items); no reconnect/ICE-restart (separate item); the BROWSER matchbox pairing is
   environment-gated (WSL2 headless, ADR-0012) — desktop-browser residual recorded in TODO.
 - **Status:** Accepted (2026-07-10).
+
+## ADR-0016 — ICE policy: STUN-only free tier, coturn TURN as the Mode-3 paid feature
+- **Context:** the buildspec's connectivity economics — STUN-only P2P fails for an estimated ~15–25% of
+  peers (symmetric NAT / restrictive firewalls); relaying costs real bandwidth money. The settled stance:
+  free modes accept silent STUN-only failure; Mode 3 (paid) provides TURN.
+- **Decision:** `transport::IceConfig` encodes the tier as data:
+  - `IceConfig::stun_only()` — the free default (matchbox's default public-STUN servers; what plain
+    `Transport::connect` already used); no credentials, no relay.
+  - `IceConfig::with_turn(urls, username, credential)` — Mode 3: TURN alongside STUN, with **paid-only,
+    PER-SESSION credentials** provisioned at session join by the platform's entitlement boundary
+    (Phase 6). The transport only CARRIES credentials — long-lived TURN secrets never ship in a client.
+  - `Transport::connect_with_ice(room, ice)` maps it onto matchbox's `RtcIceServerConfig` (wasm + native).
+    The Mode-3 str0m SERVER needs no TURN client — it runs on publicly reachable addresses (that is part
+    of what the paid tier buys); TURN serves clients behind hostile NATs.
+- **Evidence** (`crates/transport/tests/turn_relay.rs`, hermetic against a flake-provided coturn 4.13):
+  - **The relay proof**: two RAW webrtc-rs peers under `ice_transport_policy = Relay` (host/srflx
+    excluded ⇒ data can ONLY flow through the TURN allocation) connect a DataChannel and exchange a
+    payload with valid credentials — "TURN relay works with credentials" end to end. (matchbox does not
+    expose relay-only, so the proof runs at the webrtc-rs layer matchbox native is built on.)
+  - **Negative**: wrong credentials ⇒ BOTH sides gather ZERO relay candidates and the channel never
+    opens (bounded window).
+  - **Pass-through**: two `Transport::connect_with_ice` peers configured with ONLY the coturn url +
+    credentials (a TURN server answers STUN binding requests too) connect and exchange on both channels —
+    the IceConfig plumbing through matchbox is live.
+- **Hermetic-coturn gotchas (recorded for reuse):** coturn **rejects loopback PEER addresses** by default
+  (CVE-2020-26262 hardening) — the tests pass `--allow-loopback-peers`, which must NEVER be set in
+  production; TCP-connect readiness is NOT UDP readiness — a lost first Allocate makes relay-only
+  gathering complete with zero candidates, so the harness probes with a real STUN Binding request over
+  UDP until answered.
+- **Residuals:** the **STUN-only failure RATE** is a real-network fleet metric (already a recorded
+  measurement gap) — it cannot be measured hermetically; production coturn deployment + per-session
+  credential issuance land with Phase 6 entitlements; str0m-side srflx/TURN gathering (if native
+  CLIENTS ever sit behind NATs) rides the non-loopback-bind residual.
+- **Status:** Accepted (2026-07-10).

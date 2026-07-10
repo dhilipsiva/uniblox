@@ -3937,6 +3937,7 @@ dependencies = [
  "str0m",
  "tokio",
  "tungstenite 0.29.0",
+ "webrtc",
 ]
 
 [[package]]
