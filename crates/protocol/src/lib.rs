@@ -11,7 +11,9 @@
 use serde::{Deserialize, Serialize};
 
 /// Wire-format version, checked on decode. Bump on ANY message-shape change.
-pub const WIRE_VERSION: u8 = 1;
+/// v2 (ADR-0020 / Phase 3): added `NetEvent::Ack` for delta-vs-last-acked
+/// baseline tracking. Pre-release hard cutover — v1 peers cleanly reject v2.
+pub const WIRE_VERSION: u8 = 2;
 
 /// Fixed-point quantization scale: world units × 1024.
 ///
@@ -101,8 +103,9 @@ pub struct StateMsg {
     pub entries: Vec<StateEntry>,
 }
 
-/// Per-entity state: a component is present iff it changed since the sender's
-/// last collect (or a keyframe forced a full refresh). Values are ABSOLUTE.
+/// Per-entity state: a component is present iff it differs from the sender's
+/// per-peer baseline OR that baseline is not yet acked by every peer (ADR-0020
+/// delta; the fixed keyframe is gone). Values are ABSOLUTE.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StateEntry {
     pub id: NetEntityId,
@@ -143,6 +146,12 @@ pub enum NetEvent {
     /// Transfer authority. Only the CURRENT owner may send this; identity
     /// (`id`) never changes — only the proxy's `Owner` component does.
     OwnershipTransfer { id: NetEntityId, new_owner: PeerId },
+    /// Delta-baseline acknowledgement (ADR-0020, Phase 3): "I have applied up
+    /// to state `seq` of YOUR stream." Sent DIRECTED (receiver → the acked
+    /// sender), on the reliable channel, so the sender can advance its
+    /// per-peer confirmed baseline and stop re-sending confirmed values.
+    /// Ephemeral bookkeeping — never signed (`sig` stays `None`).
+    Ack { seq: u64 },
 }
 
 /// Wire encode/decode errors. Decode failures are expected runtime events
@@ -212,5 +221,43 @@ mod tests {
         // Host-migration election relies on "lowest peer ID wins".
         assert!(PeerId(1) < PeerId(2));
         assert_eq!(PeerId(7), PeerId(7));
+    }
+
+    #[test]
+    fn ack_event_round_trips() {
+        let msg = EventMsg {
+            version: WIRE_VERSION,
+            sig: None,
+            event: NetEvent::Ack { seq: 42 },
+        };
+        let bytes = encode_event(&msg).expect("encode");
+        let back = decode_event(&bytes).expect("decode");
+        assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn wrong_version_is_clean_err() {
+        // A foreign-version event is rejected before variant dispatch.
+        let mut msg = EventMsg {
+            version: WIRE_VERSION.wrapping_sub(1),
+            sig: None,
+            event: NetEvent::Ack { seq: 1 },
+        };
+        let bytes = postcard::to_stdvec(&msg).expect("encode");
+        assert!(matches!(
+            decode_event(&bytes),
+            Err(WireError::VersionMismatch { .. })
+        ));
+        // And the existing lifecycle variants still round-trip at v2.
+        msg.version = WIRE_VERSION;
+        msg.event = NetEvent::Despawn {
+            id: NetEntityId {
+                spawner: PeerId(1),
+                index: 3,
+                generation: 0,
+            },
+        };
+        let bytes = encode_event(&msg).expect("encode");
+        assert_eq!(decode_event(&bytes).expect("decode"), msg);
     }
 }

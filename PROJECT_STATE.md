@@ -5,13 +5,14 @@ The **why** behind decisions lives in `DECISIONS.md`; the **what/how** lives in
 `docs/final-buildspec.md`; the backlog lives in `TODO.md`.
 
 **Current phase: PHASE 1 COMPLETE; PHASE 2 (transport hardening) COMPLETE bar the deploy-gated telemetry
-numbers.** The slice proved the authority-swap (gate PASSED, ADR-0014) and **the Bevy client renders
-in-browser (ADR-0017)** with every slice measurement taken (real two-build sizes 3.38/3.40 MB brotli,
-cold-load, in-browser ed25519; size-budget gate PASSES). **Phase 2 is done:** str0m native/server peer
-(ADR-0015), ICE policy tiers + hermetic TURN relay proof (ADR-0016), connection telemetry + fleet
-aggregation (ADR-0018), and reconnect / ICE-restart resilience (ADR-0019). The only open Phase-2 thread is
-the real-network telemetry NUMBERS (deploy-gated). Next: Phase 3 (replication depth, HIGH) or the Bevy
-client gameplay build.
+numbers; PHASE 3 (replication depth, HIGH) HAS BEGUN.** The slice proved the authority-swap (gate PASSED,
+ADR-0014) and **the Bevy client renders in-browser (ADR-0017)** with every slice measurement taken (real
+two-build sizes 3.38/3.40 MB brotli, cold-load, in-browser ed25519; size-budget gate PASSES). **Phase 2 is
+done:** str0m native/server peer (ADR-0015), ICE policy tiers + hermetic TURN relay proof (ADR-0016),
+connection telemetry + fleet aggregation (ADR-0018), and reconnect / ICE-restart resilience (ADR-0019); the
+only open Phase-2 thread is the real-network telemetry NUMBERS (deploy-gated). **Phase 3 started** with the
+delta-vs-last-acked baseline + per-peer ack tracking (ADR-0020) — the fixed keyframe is gone. Next Phase-3
+threads: interpolation buffers, anti-entropy resync, interest management / message splitting.
 
 ## Done
 - **Cargo workspace** — virtual manifest, 9 crates under `crates/*` (glob members),
@@ -47,10 +48,21 @@ client gameplay build.
   applies to headless CI — `scripts/e2e-two-tab.mjs` needs a non-WSL host.
 - **The custom replication protocol** (ADR-0013, HIGH) — `protocol` wire format (postcard, spawner-stable
   `NetEntityId`, quantized `QVec2`, reserved signature field) + `replication` (authority-gated cached-
-  `SystemState` sender, newest-seq LWW receiver, current-Owner validity, keyframes, `transfer_ownership`,
-  late-join replay). **27-test battery green incl. e2e over real WebRTC** — tests committed before impl;
-  netcode-audited (owned-ghost fix + documented cross-sender handoff gaps for Phase 3 resync). Snap-apply
-  per decision — interpolation buffers are Phase 3.
+  `SystemState` sender, newest-seq LWW receiver, current-Owner validity, `transfer_ownership`, late-join
+  replay). **e2e over real WebRTC** — tests committed before impl; netcode-audited (owned-ghost fix +
+  documented cross-sender handoff gaps for Phase 3 resync). Snap-apply per decision — interpolation buffers
+  are Phase 3.
+- **Delta vs last-acked baseline + per-peer ack tracking** (ADR-0020, Phase 3, HIGH) — the fixed keyframe is
+  replaced by a **contiguous-run cumulative-ack** delta: a component is sent while its quantized value
+  differs from the per-entity baseline OR is not yet acked by every tracked peer, then goes quiet.
+  `NetEvent::Ack{seq}` (reliable, directed) + `WIRE_VERSION`→2; sender `CompSend{value,run_start,last_sent}`
+  with decide/commit split (empty tick consumes no seq); receiver `applied_seq`(fully-applied) SEPARATE from
+  `last_seq`(seen) so it never acks a value it dropped (the F1 fix — state racing its Spawn, or a handoff
+  owner-mismatch, must not falsely confirm). **28-test two-World battery green** (T29–T37 the delta cases,
+  incl. the F1 regression `state_before_spawn_defers_ack` + the gap-reset soundness `gap_reset_keeps_run_
+  contiguous`); T35 proves the bandwidth win (0 steady-state bytes for a confirmed stationary scene).
+  **netcode-audited twice** (F1 blocker → fixed → MERGE). Fast-follow: a client-acks-server integration test
+  (the server ack-routing path is unit-covered but Mode-3-dead until Mode 2 lets a client own an entity).
 - **THE AUTHORITY-SWAP GATE: PASSED** (ADR-0014, HIGH) — `crates/server` is the Mode-3 headless runtime
   (standalone bevy_app+bevy_time, 64 Hz FixedUpdate, exclusive net pump at ~20 Hz virtual-clock cadence,
   Messages<AppExit>). The M1–M4 battery is the documented side-by-side run: same simulation, same

@@ -76,16 +76,24 @@ pub fn net_pump(world: &mut World) {
     match net.transport.poll_peers() {
         Ok(peers) => {
             for (peer, state) in peers {
-                if matches!(state, PeerState::Connected) {
-                    let proto = PeerId::from_uuid_bytes(*peer.0.as_bytes());
-                    log::info!("[server] peer connected: {proto:?}");
-                    let replay = net.repl.on_peer_connected(world, proto);
-                    for ev in replay {
-                        if net.transport.send_event(peer, ev).is_err() {
-                            // A lost replay Spawn is unhealable until Phase 3
-                            // resync — make it observable.
-                            log::warn!("[server] late-join replay send to {proto:?} failed");
+                let proto = PeerId::from_uuid_bytes(*peer.0.as_bytes());
+                match state {
+                    PeerState::Connected => {
+                        log::info!("[server] peer connected: {proto:?}");
+                        // on_peer_connected tracks the peer for delta baselining
+                        // (ADR-0020) and returns the late-join Spawn replay.
+                        let replay = net.repl.on_peer_connected(world, proto);
+                        for ev in replay {
+                            if net.transport.send_event(peer, ev).is_err() {
+                                // A lost replay Spawn is unhealable until the
+                                // anti-entropy resync item — make it observable.
+                                log::warn!("[server] late-join replay send to {proto:?} failed");
+                            }
                         }
+                    }
+                    PeerState::Disconnected => {
+                        log::info!("[server] peer disconnected: {proto:?}");
+                        net.repl.untrack_peer(proto);
                     }
                 }
             }
@@ -108,6 +116,21 @@ pub fn net_pump(world: &mut World) {
     for (from, bytes) in net.transport.recv_state() {
         let from = PeerId::from_uuid_bytes(*from.0.as_bytes());
         net.repl.apply_state(world, from, &bytes);
+    }
+
+    // Emit acks for state we received (ADR-0020) so senders advance their delta
+    // baselines. Directed back to each sender (map protocol id → transport peer).
+    let acks = net.repl.drain_acks();
+    if !acks.is_empty() {
+        let connected: Vec<_> = net.transport.connected_peers().collect();
+        for (target, ack) in acks {
+            if let Some(peer) = connected
+                .iter()
+                .find(|p| PeerId::from_uuid_bytes(*p.0.as_bytes()) == target)
+            {
+                let _ = net.transport.send_event(*peer, ack);
+            }
+        }
     }
 
     // Send on the network tick only.

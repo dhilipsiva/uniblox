@@ -463,3 +463,74 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   with peer identity), so a re-offer that must traverse signaling AFTER an id-changing reconnect is
   best-effort — the common case (connectivity blip, signaling UP) is fully handled.
 - **Status:** Accepted (2026-07-11).
+
+## ADR-0020 — Delta compression vs last-acked baseline; per-peer ack tracking
+- **Context:** first Phase-3 replication-depth item. The slice sent changed-components + a full KEYFRAME
+  (every owned entity's pos+vel) every 30 collects; the keyframe existed ONLY because the lossy state
+  channel can lose a final value, so a stationary-then-quiet entity would freeze on a receiver that missed
+  its last update. Replace the fixed keyframe with an ACKED-BASELINE delta: re-send a component only until
+  every tracked peer has confirmed (acked) its current value, then go quiet. Approved model (via
+  AskUserQuestion): **cumulative-ack + contiguous-run**; **drop the fixed keyframe**. HIGH-risk (netcode
+  "compiles but subtly wrong"): plan-mode-first, TDD, fresh `netcode-auditor` (twice — see below).
+- **Decision — the algorithm (contiguous-run cumulative-ack):**
+  1. **Ack wire (receiver → sender, reliable channel).** New `NetEvent::Ack { seq }` = "I have applied up to
+     state `seq` of YOUR stream." Reuses the `EventMsg` codec + apply routing (no new channel). Ephemeral
+     bookkeeping — `sig` always `None`. **`WIRE_VERSION` → 2** (pre-release hard cutover; v1 peers cleanly
+     reject v2).
+  2. **Sender confirmation state (`Replication`).** `acked_seq[peer]` (highest seq of OUR stream a peer
+     acked), a `peers` broadcast set, and per owned-entity per-component `CompSend { value, run_start,
+     last_sent }` (the value we are confirming, the seq its current contiguous send-run began, and the last
+     seq it was included in).
+  3. **`decide_component` (pure).** At the provisional `seq = next_seq`: never-sent or value-changed ⇒
+     include, fresh run at `seq`. Unchanged ⇒ `confirmed = peers.is_empty() || peers.all(acked[p] >=
+     run_start)`; confirmed ⇒ skip; else re-send, resetting `run_start = seq` when `last_sent + 1 != seq`
+     (a gap since the last inclusion). `seq` = SENT-message seq (only bumped when a message actually goes
+     out), so contiguity in seq == contiguity across sent messages.
+  4. **decide/commit split (the seq-consumption invariant).** `collect` decides all entities at the
+     provisional seq WITHOUT mutating; only if ≥1 component is included is the message sent — THEN the
+     `CompSend` updates commit and `next_seq += 1`. An empty tick consumes no seq and mutates no baseline.
+  5. **The send trigger is a QUANTIZED-VALUE diff** against the committed baseline, NOT `Ref::is_changed()`
+     — retiring the long-lived-server `check_change_ticks` hazard.
+- **Soundness (the crux):** while a component is unconfirmed it is in EVERY sent message of its contiguous
+  run `[run_start, last_sent]`, so a peer that acks any `seq >= run_start` demonstrably received a message
+  carrying the current value ⇒ holds it. A value change resets `run_start` to the new value's first seq, so
+  an ack of an OLD value can't confirm a NEW one. The gap-reset keeps the run contiguous when a component
+  resumes after being all-confirmed (e.g. a new peer joins) — without it the run would span seqs the
+  component was absent from, and an intermediate ack would falsely confirm.
+- **The keyframe's job is now continuous:** a lost final value is re-sent every tick until acked; a new peer
+  (acked nothing) has everything unconfirmed ⇒ gets a full targeted re-send. `on_peer_connected` tracks the
+  peer (so `collect` MUST run with a populated peer set — empty peers degrades to plain changed-only, a
+  documented `collect` precondition); `untrack_peer` prunes all per-peer state; `send_state` is pruned on
+  despawn and transfer-away.
+- **Ack basis = APPLIED, not SEEN (the auditor F1 fix, load-bearing).** The receiver keeps TWO per-sender
+  high-waters: `last_seq` (LWW "seen" — drops reordered older messages, advances unconditionally) and
+  `applied_seq` (advances only when a message's entries ALL applied — no dropped entry). `drain_acks` acks
+  `applied_seq`. Without this split, a state message that RACED AHEAD of its reliable `Spawn` (entry dropped,
+  no proxy yet) — or a handoff owner-mismatch — would still advance `last_seq`, get acked, and falsely
+  confirm a value the receiver never held; with the keyframe gone that divergence is PERMANENT. Withholding
+  the ack until a fully-applied message keeps the sender re-sending (bounded, for state-before-spawn, by the
+  reliable Spawn's arrival). The ack is whole-message per-sender (a single unresolvable entry withholds the
+  whole stream's ack → bandwidth-only over-send; per-entry acks are a future optimization, not a correctness
+  need).
+- **Audit (mandatory, HIGH-risk):** the FIRST `netcode-auditor` pass returned **FIX-FIRST** with F1 as a
+  BLOCKER (the seen-vs-applied ack conflation above) plus should-fixes (untested gap-reset, no
+  state-before-spawn ack test, empty-peers footgun, bandwidth-test honesty, an ADR mislabel). All addressed:
+  the `applied_seq`/`last_seq` split; two new deterministic tests — `state_before_spawn_defers_ack` (T37,
+  asserts a dropped-entry message is NOT acked; fails against the pre-fix code) and
+  `gap_reset_keeps_run_contiguous` (T36, forces the `else { seq }` reset via a quiet entity while a second
+  moving entity advances the stream, and distinguishes `run_start=reset` from `=1` with an injected stale
+  ack); an honest T35 (measures the full-first-send keyframe-equivalent cost, asserts ZERO steady-state
+  bytes); a `collect` empty-peers precondition doc. The SECOND (re-audit) pass returned **MERGE** — F1
+  verifiably closed (confirmation invariant + liveness both hold), the new tests genuine guards, no
+  regressions.
+- **Evidence:** `two_world.rs` 28 deterministic tests green (T29–T37 the delta battery); full workspace
+  suite green; clippy `-D warnings` native `--all-targets` + wasm32 (protocol/replication); fmt clean. T35
+  proves the bandwidth win deterministically (a confirmed stationary scene sends 0 steady-state bytes vs the
+  keyframe's full re-send every 30 ticks).
+- **Residuals / fast-follows (auditor, non-blocking):** the server's ack-ROUTING wiring
+  (`server::net_pump` `drain_acks` → protocol-id→transport-peer → `send_event`) is exercised only by the
+  `two_world` `flush_acks` helper — dead in Mode 3 (the server receives no client state) and untested in
+  integration; it becomes load-bearing the moment Mode 2 lets a CLIENT own an entity, so a client-acks-server
+  integration test is a pre-Mode-2 SHOULD-FIX. Deeper desync (a peer that never sees a Spawn / a frozen
+  wrong-owner proxy) remains owned by the separate anti-entropy-resync item.
+- **Status:** Accepted (2026-07-11).
