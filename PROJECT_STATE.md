@@ -4,12 +4,14 @@ Living snapshot of where uniblox is. Update it when a phase's status changes.
 The **why** behind decisions lives in `DECISIONS.md`; the **what/how** lives in
 `docs/final-buildspec.md`; the backlog lives in `TODO.md`.
 
-**Current phase: PHASE 1 COMPLETE; PHASE 2 (transport hardening) IN PROGRESS.** The slice proved the
-authority-swap (gate PASSED, ADR-0014) and **the Bevy client renders in-browser (ADR-0017)** with every
-slice measurement taken — real two-build sizes (3.38/3.40 MB brotli), cold-load, in-browser ed25519 —
-and the size-budget gate PASSES. The only measurement the slice could not take (STUN-only success rate)
-is real-network-gated and lives in Phase 2's telemetry bullet. Phase 2 so far: the str0m native/server
-peer (ADR-0015) + ICE policy tiers with the TURN relay proof (ADR-0016).
+**Current phase: PHASE 1 COMPLETE; PHASE 2 (transport hardening) COMPLETE bar the deploy-gated telemetry
+numbers.** The slice proved the authority-swap (gate PASSED, ADR-0014) and **the Bevy client renders
+in-browser (ADR-0017)** with every slice measurement taken (real two-build sizes 3.38/3.40 MB brotli,
+cold-load, in-browser ed25519; size-budget gate PASSES). **Phase 2 is done:** str0m native/server peer
+(ADR-0015), ICE policy tiers + hermetic TURN relay proof (ADR-0016), connection telemetry + fleet
+aggregation (ADR-0018), and reconnect / ICE-restart resilience (ADR-0019). The only open Phase-2 thread is
+the real-network telemetry NUMBERS (deploy-gated). Next: Phase 3 (replication depth, HIGH) or the Bevy
+client gameplay build.
 
 ## Done
 - **Cargo workspace** — virtual manifest, 9 crates under `crates/*` (glob members),
@@ -85,6 +87,17 @@ peer (ADR-0015) + ICE policy tiers with the TURN relay proof (ADR-0016).
   channels. Gotchas recorded: coturn blocks loopback peers by default (test-only `--allow-loopback-peers`);
   UDP readiness ≠ TCP readiness (STUN-binding probe in the harness). Residuals: STUN-only failure RATE is
   a real-network fleet metric; production coturn + credential issuance ride Phase 6.
+- **Reconnect / ICE-restart** (ADR-0019) — `Str0mPeer` is now network-resilient: transient ICE
+  `Disconnected` is tolerated (self-heal window, not fatal); the offerer does an in-place
+  `sdp_api().ice_restart(true)` if it persists (DTLS/SCTP + channels survive, no data gap); the signaling
+  WS reconnects with backoff WITHOUT killing live connections (a blip ≠ teardown); a hard failure triggers
+  a bounded full reconnect (offerer-only, present-gated, ≤5 attempts). `request_ice_restart(peer)` is the
+  ops/test trigger; `reconnects`/`ice_restarts` telemetry. Hermetic tests: `ice_restart_keeps_channels_and_counts`
+  (channels survive an explicit restart, both channels still exchange), `connection_survives_signaling_drop`
+  (kill the signaling server → data still flows) + decision unit tests; soaked. Fresh reviewer: MERGE (drain
+  invariant + glare rule + reconnect bounds + finalize completeness all hold; SHOULD-FIX folded in). Real
+  packet-loss recovery is mechanism-tested (can't simulate loss hermetically). **Phase 2 transport hardening
+  is now COMPLETE** bar the deploy-gated telemetry NUMBERS.
 - **Connection telemetry instrument + aggregation** (ADR-0018) — `Str0mPeer::telemetry()` records per-peer
   ICE outcome (Connecting/Connected/Failed), winning local-candidate kind (Host today), selected addrs, and
   RTT mean/jitter from str0m's ICE keepalive stats (the candidate-pair `current_round_trip_time`, NOT the

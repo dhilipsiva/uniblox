@@ -414,3 +414,52 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   small `PeerTelemetry` per distinct remote, so bounded retention / snapshot-and-drain is a
   pre-Mode-3-production follow-up (reviewer NIT).
 - **Status:** Accepted (2026-07-11).
+
+## ADR-0019 — Reconnect / ICE-restart handling (Str0mPeer resilience)
+- **Context:** `Str0mPeer` treated any loss as fatal — the first transient ICE `Disconnected` killed the
+  connection, and any signaling WS drop `close_all`'d every live connection and never reconnected. Both are
+  wrong: WebRTC `Disconnected` is documented transient/self-recovering, and WebRTC data paths are
+  independent of signaling. Approved scope: the full mechanism.
+- **Decision — five pieces (all native `str0m_peer.rs`):**
+  1. **Transient tolerance + auto ICE restart.** `run_connection` tracks a `disconnected_since` episode
+     instead of returning `Err`; returning to `Connected`/`Completed` clears it and counts a recovery. As
+     the OFFERER, after a self-heal grace (`ICE_RESTART_GRACE` 2s) it initiates an in-place
+     `sdp_api().ice_restart(true)` + `apply()` + re-offer — DTLS/SCTP and the channels SURVIVE (no data
+     gap). A hard deadline (`DISCONNECT_HARD_DEADLINE` 10s) gives up → the full-reconnect fallback.
+  2. **Re-offer channel guard.** The answerer's `apply_signal(Offer)` creates channels only on the FIRST
+     offer (`chan_ids[0].is_none()`); a re-offer (ICE restart) reuses them (`accept_offer` handles the
+     creds change) — recreating would break them.
+  3. **Explicit `Str0mPeer::request_ice_restart(peer)`** → `Cmd::IceRestart` (ops recovery hook + the
+     mechanism's hermetic test trigger); guarded to a connected peer so it can't clobber the initial offer.
+  4. **Signaling reconnect + no-kill-on-blip.** `run_signaling` is an outer reconnect loop around
+     `connect_and_serve` (→ `SignalingExit::{Closed,Dropped}`); a WS drop NO LONGER `close_all`s (live
+     connections survive) — it backs off (500ms→x2→5s) and reconnects. The outbound queue lives across
+     reconnects so per-peer threads' re-offers flush on the new WS.
+  5. **Full-reconnect fallback.** On a hard `Err`, ONLY the offerer re-establishes (glare avoidance — the
+     answerer recovers via the offerer's re-offer through the unknown-sender-Offer path), only while the
+     peer is still in `Shared.present`, bounded by `MAX_RECONNECT_ATTEMPTS` (5) with exponential backoff.
+  Telemetry (ADR-0018 extension): `PeerTelemetry` gains `reconnects` + `ice_restarts`; `FleetMetrics`
+  sums them.
+- **Glare rule:** only the offerer auto-restarts and re-establishes; role is fixed at spawn, so a pair can
+  never both offer. The answerer tolerates `Disconnected` and heals via the re-offer.
+- **str0m <-> BROWSER falls back to full reconnect** — matchbox-wasm is offer-once and won't accept a
+  mid-session re-offer for an in-place ICE restart; str0m <-> str0m (server/native) gets the in-place restart.
+- **Testability (honest):** real packet-loss recovery can't be simulated hermetically (`run_connection`
+  owns a real `UdpSocket`). The restart MECHANISM is proven by `request_ice_restart` +
+  `ice_restart_keeps_channels_and_counts` (both channels still exchange after; `ice_restarts` counted); the
+  no-kill-on-blip fix by `connection_survives_signaling_drop` (kill the signaling server → data still flows,
+  `poll_peers` stays open); the decision logic (`should_initiate_restart`, `reconnect_backoff`) by unit
+  tests. The AUTOMATIC trigger (sustained-Disconnected → restart) shares the same code path behind a timer,
+  validated by the decision unit test, not under simulated loss.
+- **Fresh-reviewer verdict MERGE:** drain invariant preserved at both new mutation sites (`continue` after
+  every `ice_restart`/`apply`), no busy-loop (`restart_sent` gates one restart/episode; socket wait floored),
+  reconnect bounded (≤5, present-gated, no `pow` overflow), finalize completeness (only the reconnect path
+  defers Failed-finalize; terminal attempts always finalize), no `unwrap`/`expect`/`unsafe`. Reviewer
+  SHOULD-FIX folded in: reset `restart_sent` at each new episode so an ops restart can't suppress the next
+  auto-restart.
+- **Residuals (reviewer NITs, documented):** per-peer `reconnects`/`ice_restarts` counters reset on a FULL
+  reconnect (a fresh `run_connection`), so `FleetMetrics` totals undercount full-reconnect recoveries
+  (metrics fidelity only); a signaling reconnect changes our matchbox id (matchbox couples signaling id
+  with peer identity), so a re-offer that must traverse signaling AFTER an id-changing reconnect is
+  best-effort — the common case (connectivity blip, signaling UP) is fully handled.
+- **Status:** Accepted (2026-07-11).

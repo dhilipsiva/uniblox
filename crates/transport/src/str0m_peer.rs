@@ -27,11 +27,14 @@
 //! mutation (`handle_input`, command application, SDP change) the loop drains
 //! `poll_output()` to `Output::Timeout` before the next mutation.
 //!
+//! Resilience (ADR-0019): transient ICE `Disconnected` is tolerated (not fatal);
+//! the offerer initiates an in-place `ice_restart` if it persists (channels
+//! survive); the signaling WS reconnects with backoff without tearing down live
+//! connections; a hard failure triggers a bounded full reconnect.
 //! Limitations (slice scope): `ws://` signaling only (no TLS); loopback/local
-//! UDP binding; peer threads exit on disconnect and are not restarted
-//! (reconnect/ICE-restart is a later Phase-2 item).
+//! UDP binding.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
@@ -75,11 +78,18 @@ struct IceCandidateJson {
 }
 
 enum Cmd {
-    Send { channel: usize, data: Box<[u8]> },
+    Send {
+        channel: usize,
+        data: Box<[u8]>,
+    },
     Signal(PeerSignal),
+    /// Force an ICE restart on this connection (ADR-0019) — ops hook + the
+    /// hermetic test trigger for the restart mechanism.
+    IceRestart,
     Close,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Role {
     /// We received `NewPeer` for this remote — we make the offer.
     Offerer,
@@ -95,6 +105,23 @@ const STATS_INTERVAL: Duration = Duration::from_millis(500);
 /// the attempt as [`IceOutcome::Failed`]. On a STUN-only config this is the
 /// signal that STUN could not traverse the NAT (the failure the metric counts).
 const CONNECT_DEADLINE: Duration = Duration::from_secs(30);
+
+/// After ICE goes `Disconnected` (a transient, self-recovering state), wait
+/// this long for it to self-heal before the offerer initiates an ICE restart
+/// (ADR-0019).
+const ICE_RESTART_GRACE: Duration = Duration::from_secs(2);
+
+/// If a `Disconnected` episode has not recovered by this point (even after an
+/// ICE restart), give up the connection → the full-reconnect fallback.
+const DISCONNECT_HARD_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Signaling WS reconnect backoff (ADR-0019): starts here, doubles, capped.
+const SIGNALING_BACKOFF_INITIAL: Duration = Duration::from_millis(500);
+const SIGNALING_BACKOFF_MAX: Duration = Duration::from_secs(5);
+
+/// Full-reconnect attempts before giving a peer up (ADR-0019). Bounds the
+/// re-establish loop so a permanently-gone peer cannot spin forever.
+const MAX_RECONNECT_ATTEMPTS: u32 = 5;
 
 /// Kind of the local winning ICE candidate — the "did we need TURN" signal
 /// (ADR-0018). Mapped from [`str0m::CandidateKind`]. `Host` today: `Str0mPeer`
@@ -145,6 +172,11 @@ pub struct PeerTelemetry {
     pub rtt_mean: Option<Duration>,
     /// RTT jitter (standard deviation of the samples).
     pub rtt_jitter: Option<Duration>,
+    /// Times this connection recovered from a transient `Disconnected` back to
+    /// `Connected`/`Completed` (ADR-0019) — the network-resilience signal.
+    pub reconnects: u32,
+    /// Times this connection initiated an ICE restart (ADR-0019).
+    pub ice_restarts: u32,
 }
 
 impl PeerTelemetry {
@@ -158,6 +190,8 @@ impl PeerTelemetry {
             rtt_samples: 0,
             rtt_mean: None,
             rtt_jitter: None,
+            reconnects: 0,
+            ice_restarts: 0,
         }
     }
 }
@@ -209,6 +243,10 @@ pub struct FleetMetrics {
     pub rtt_max: Option<Duration>,
     /// Mean of per-peer RTT jitter over peers that reported jitter.
     pub jitter_mean: Option<Duration>,
+    /// Total transient-disconnect recoveries across all peers (ADR-0019).
+    pub total_reconnects: u32,
+    /// Total ICE restarts initiated across all peers (ADR-0019).
+    pub total_ice_restarts: u32,
 }
 
 impl FleetMetrics {
@@ -224,6 +262,8 @@ impl FleetMetrics {
         let mut jitter_count: u64 = 0;
 
         for p in peers {
+            m.total_reconnects += p.reconnects;
+            m.total_ice_restarts += p.ice_restarts;
             match p.outcome {
                 IceOutcome::Connected => {
                     m.connected += 1;
@@ -286,6 +326,10 @@ struct Shared {
     /// Per-peer connection telemetry (ADR-0018); updated by the connection
     /// threads, read via [`Str0mPeer::telemetry`].
     telemetry: Mutex<HashMap<MbPeerId, PeerTelemetry>>,
+    /// Peers currently in the room (ADR-0019): added on `NewPeer` / first
+    /// inbound Offer, removed on `PeerLeft`. The full-reconnect fallback only
+    /// re-establishes to a peer that is still present.
+    present: Mutex<HashSet<MbPeerId>>,
     closed: AtomicBool,
 }
 
@@ -334,6 +378,7 @@ impl Str0mPeer {
             id: Mutex::new(None),
             conns: Mutex::new(HashMap::new()),
             telemetry: Mutex::new(HashMap::new()),
+            present: Mutex::new(HashSet::new()),
             closed: AtomicBool::new(false),
         });
         let (updates_tx, updates_rx) = std::sync::mpsc::channel();
@@ -404,6 +449,16 @@ impl Str0mPeer {
             .map_err(|_| ChannelSendError)
     }
 
+    /// Force an in-place ICE restart on the connection to `peer` (ADR-0019):
+    /// re-gather + re-nominate a candidate pair WITHOUT tearing down DTLS/SCTP,
+    /// so the channels (and buffered data) survive. Errors if the peer is
+    /// unknown/closed. Ops recovery hook; also drives the mechanism's test.
+    pub fn request_ice_restart(&mut self, peer: MbPeerId) -> Result<(), ChannelSendError> {
+        let conns = self.shared.conns.lock().map_err(|_| ChannelSendError)?;
+        let tx = conns.get(&peer).ok_or(ChannelSendError)?;
+        tx.send(Cmd::IceRestart).map_err(|_| ChannelSendError)
+    }
+
     /// Snapshot of per-peer connection telemetry (ADR-0018): ICE outcome,
     /// time-to-connect, winning local-candidate kind, and RTT mean/jitter from
     /// str0m's ICE keepalive stats. A fleet aggregates these into the STUN-only
@@ -452,6 +507,15 @@ fn install_crypto_provider() {
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const WS_POLL: Duration = Duration::from_millis(20);
 
+/// Why a signaling session ended (ADR-0019).
+enum SignalingExit {
+    /// The `Str0mPeer` was explicitly closed — stop.
+    Closed,
+    /// The WS dropped (blip / server restart) — reconnect with backoff. Live
+    /// WebRTC connections are NOT torn down.
+    Dropped,
+}
+
 fn run_signaling(
     url: &str,
     shared: &Arc<Shared>,
@@ -459,28 +523,74 @@ fn run_signaling(
     state_tx: Sender<(MbPeerId, Packet)>,
     events_tx: Sender<(MbPeerId, Packet)>,
 ) {
+    // The outbound queue lives ACROSS reconnects (ADR-0019): per-peer connection
+    // threads hold `out_tx` clones and keep sending re-offers/candidates; a
+    // signaling reconnect flushes them on the new WS.
+    let (out_tx, out_rx) = std::sync::mpsc::channel::<PeerRequest<PeerSignal>>();
+    let mut backoff = SIGNALING_BACKOFF_INITIAL;
+
+    loop {
+        if shared.closed.load(Ordering::SeqCst) {
+            return;
+        }
+        match connect_and_serve(
+            url,
+            shared,
+            &out_tx,
+            &out_rx,
+            &updates_tx,
+            &state_tx,
+            &events_tx,
+            &mut backoff,
+        ) {
+            SignalingExit::Closed => return,
+            SignalingExit::Dropped => {
+                // A signaling blip must NOT kill live connections — no
+                // `close_all` here. Back off and reconnect.
+                if shared.closed.load(Ordering::SeqCst) {
+                    return;
+                }
+                log::warn!("[str0m] signaling dropped — reconnecting in {backoff:?}");
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(SIGNALING_BACKOFF_MAX);
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn connect_and_serve(
+    url: &str,
+    shared: &Arc<Shared>,
+    out_tx: &Sender<PeerRequest<PeerSignal>>,
+    out_rx: &Receiver<PeerRequest<PeerSignal>>,
+    updates_tx: &Sender<(MbPeerId, PeerState)>,
+    state_tx: &Sender<(MbPeerId, Packet)>,
+    events_tx: &Sender<(MbPeerId, Packet)>,
+    backoff: &mut Duration,
+) -> SignalingExit {
     let (mut ws, _resp) = match tungstenite::connect(url) {
         Ok(ok) => ok,
         Err(err) => {
             log::error!("[str0m] signaling connect failed: {err}");
-            return;
+            return SignalingExit::Dropped;
         }
     };
+    // Connected — reset the backoff so a healthy session doesn't inherit growth.
+    *backoff = SIGNALING_BACKOFF_INITIAL;
     // Read with a timeout so the loop can also drain outbound signals.
     if let tungstenite::stream::MaybeTlsStream::Plain(stream) = ws.get_ref()
         && stream.set_read_timeout(Some(WS_POLL)).is_err()
     {
         log::error!("[str0m] cannot set WS read timeout");
-        return;
+        return SignalingExit::Dropped;
     }
 
-    // Connection threads push outbound requests here; we own the WS writer.
-    let (out_tx, out_rx) = std::sync::mpsc::channel::<PeerRequest<PeerSignal>>();
     let mut last_keepalive = Instant::now();
 
     loop {
         if shared.closed.load(Ordering::SeqCst) {
-            return;
+            return SignalingExit::Closed;
         }
 
         // Outbound: signals from connection threads + keepalive.
@@ -488,8 +598,8 @@ fn run_signaling(
             match serde_json::to_string(&request) {
                 Ok(text) => {
                     if let Err(err) = ws.send(tungstenite::Message::text(text)) {
-                        log::error!("[str0m] signaling send failed: {err}");
-                        return;
+                        log::warn!("[str0m] signaling send failed: {err}");
+                        return SignalingExit::Dropped;
                     }
                 }
                 Err(err) => log::error!("[str0m] signaling encode failed: {err}"),
@@ -501,8 +611,8 @@ fn run_signaling(
             match serde_json::to_string(&keepalive) {
                 Ok(text) => {
                     if let Err(err) = ws.send(tungstenite::Message::text(text)) {
-                        log::error!("[str0m] keepalive failed: {err}");
-                        return;
+                        log::warn!("[str0m] keepalive failed: {err}");
+                        return SignalingExit::Dropped;
                     }
                 }
                 Err(err) => log::error!("[str0m] keepalive encode failed: {err}"),
@@ -521,17 +631,16 @@ fn run_signaling(
                 continue;
             }
             Err(err) => {
-                log::error!("[str0m] signaling read failed: {err}");
-                close_all(shared);
-                return;
+                log::warn!("[str0m] signaling read failed: {err}");
+                return SignalingExit::Dropped;
             }
         };
         let text = match message {
             tungstenite::Message::Text(text) => text,
             tungstenite::Message::Close(_) => {
-                log::info!("[str0m] signaling closed by server");
-                close_all(shared);
-                return;
+                // Server closed (blip / restart) — reconnect, don't tear down.
+                log::info!("[str0m] signaling closed by server — will reconnect");
+                return SignalingExit::Dropped;
             }
             _ => continue, // ping/pong/binary — tungstenite handles ping replies
         };
@@ -550,18 +659,21 @@ fn run_signaling(
                 }
             }
             PeerEvent::NewPeer(remote) => {
+                mark_present(shared, remote, true);
                 // We are the existing peer — we offer.
                 spawn_connection(
                     Role::Offerer,
                     remote,
+                    0,
                     shared,
-                    &out_tx,
-                    &updates_tx,
-                    &state_tx,
-                    &events_tx,
+                    out_tx,
+                    updates_tx,
+                    state_tx,
+                    events_tx,
                 );
             }
             PeerEvent::PeerLeft(remote) => {
+                mark_present(shared, remote, false);
                 if let Ok(mut conns) = shared.conns.lock()
                     && let Some(tx) = conns.remove(&remote)
                 {
@@ -576,7 +688,7 @@ fn run_signaling(
                         Err(_) => {
                             log::error!("[str0m] conns lock poisoned — closing signaling");
                             close_all(shared);
-                            return;
+                            return SignalingExit::Closed;
                         }
                     };
                     conns.get(&sender).cloned()
@@ -585,7 +697,8 @@ fn run_signaling(
                     Some(tx) => tx,
                     None => {
                         // Unsolicited OFFER from an unknown peer: we are the
-                        // newcomer and they initiate. Anything else from an
+                        // newcomer (or the peer is re-offering after a reconnect,
+                        // ADR-0019) and they initiate. Anything else from an
                         // unknown sender is a stray (e.g. a signal racing
                         // PeerLeft) — spawning an answerer for it would create
                         // a ghost connection that waits on an offer that never
@@ -594,14 +707,16 @@ fn run_signaling(
                             log::debug!("[str0m] stray non-offer signal from unknown {sender}");
                             continue;
                         }
+                        mark_present(shared, sender, true);
                         spawn_connection(
                             Role::Answerer,
                             sender,
+                            0,
                             shared,
-                            &out_tx,
-                            &updates_tx,
-                            &state_tx,
-                            &events_tx,
+                            out_tx,
+                            updates_tx,
+                            state_tx,
+                            events_tx,
                         )
                     }
                 };
@@ -609,6 +724,23 @@ fn run_signaling(
             }
         }
     }
+}
+
+/// Add/remove a peer from the room-presence set (ADR-0019).
+fn mark_present(shared: &Shared, remote: MbPeerId, present: bool) {
+    if let Ok(mut set) = shared.present.lock() {
+        if present {
+            set.insert(remote);
+        } else {
+            set.remove(&remote);
+        }
+    }
+}
+
+/// Backoff before the Nth full-reconnect attempt (ADR-0019): exponential,
+/// capped.
+fn reconnect_backoff(attempt: u32) -> Duration {
+    (SIGNALING_BACKOFF_INITIAL * 2u32.pow(attempt.min(4))).min(SIGNALING_BACKOFF_MAX)
 }
 
 fn close_all(shared: &Arc<Shared>) {
@@ -623,6 +755,7 @@ fn close_all(shared: &Arc<Shared>) {
 fn spawn_connection(
     role: Role,
     remote: MbPeerId,
+    attempt: u32,
     shared: &Arc<Shared>,
     out_tx: &Sender<PeerRequest<PeerSignal>>,
     updates_tx: &Sender<(MbPeerId, PeerState)>,
@@ -639,7 +772,7 @@ fn spawn_connection(
     let events_tx = events_tx.clone();
     let shared = Arc::clone(shared);
     std::thread::spawn(move || {
-        if let Err(err) = run_connection(
+        let result = run_connection(
             role,
             remote,
             cmd_rx,
@@ -648,18 +781,54 @@ fn spawn_connection(
             &updates_tx,
             &state_tx,
             &events_tx,
-        ) {
+        );
+        let failed = result.is_err();
+        if let Err(err) = result {
             log::warn!("[str0m] connection to {remote} ended: {err}");
         }
-        // An attempt that never reached `Connected` is a `Failed` connection —
-        // the STUN-only failure the metric counts.
-        if let Ok(mut map) = shared.telemetry.lock() {
-            finalize_failed_telemetry(&mut map, remote);
-        }
+        // The connection dropped: remove the routing entry and tell the consumer
+        // (so it pauses sending). A reconnect, if any, will re-report Connected.
         if let Ok(mut conns) = shared.conns.lock() {
             conns.remove(&remote);
         }
         let _ = updates_tx.send((remote, PeerState::Disconnected));
+
+        // Full-reconnect fallback (ADR-0019): only the OFFERER re-establishes
+        // (glare avoidance — the answerer recovers via the offerer's re-offer,
+        // through the unknown-sender-Offer path), only on a hard failure, only
+        // while the peer is still in the room, bounded by MAX_RECONNECT_ATTEMPTS.
+        if failed
+            && role == Role::Offerer
+            && attempt < MAX_RECONNECT_ATTEMPTS
+            && !shared.closed.load(Ordering::SeqCst)
+        {
+            std::thread::sleep(reconnect_backoff(attempt));
+            let still_present = shared
+                .present
+                .lock()
+                .map(|p| p.contains(&remote))
+                .unwrap_or(false);
+            if still_present && !shared.closed.load(Ordering::SeqCst) {
+                log::info!("[str0m] reconnecting to {remote} (attempt {})", attempt + 1);
+                spawn_connection(
+                    Role::Offerer,
+                    remote,
+                    attempt + 1,
+                    &shared,
+                    &out_tx,
+                    &updates_tx,
+                    &state_tx,
+                    &events_tx,
+                );
+                return; // retrying — do NOT finalize as Failed
+            }
+        }
+
+        // Gave up (or a clean close): an attempt that never reached `Connected`
+        // is a `Failed` connection (the STUN-only failure the metric counts).
+        if let Ok(mut map) = shared.telemetry.lock() {
+            finalize_failed_telemetry(&mut map, remote);
+        }
     });
     cmd_tx
 }
@@ -758,6 +927,14 @@ fn run_connection(
     let mut connected_reported = false;
     let mut buf = vec![0u8; 2000];
 
+    // Reconnect state (ADR-0019): `Disconnected` is a TRANSIENT, self-recovering
+    // ICE state — we tolerate it (don't tear down) and, as the offerer, ICE-restart
+    // in place if it persists. `disconnected_since` is the current episode start;
+    // `restart_sent` gates one restart per episode.
+    let is_offerer = matches!(role, Role::Offerer);
+    let mut disconnected_since: Option<Instant> = None;
+    let mut restart_sent = false;
+
     loop {
         // Drain the Rtc to Timeout (the sans-IO invariant: a full drain after
         // every mutation; `handle_input` at the bottom of the loop and each
@@ -804,9 +981,35 @@ fn run_connection(
                     Event::ChannelClose(_) => {
                         return Err("channel closed".to_string());
                     }
-                    Event::IceConnectionStateChange(IceConnectionState::Disconnected) => {
-                        return Err("ice disconnected".to_string());
-                    }
+                    // ICE state (ADR-0019): `Disconnected` is TRANSIENT — start a
+                    // recovery episode instead of tearing down; returning to
+                    // `Connected`/`Completed` clears it and counts a recovery.
+                    Event::IceConnectionStateChange(state) => match state {
+                        IceConnectionState::Disconnected => {
+                            if disconnected_since.is_none() {
+                                disconnected_since = Some(Instant::now());
+                                // New episode: allow a fresh auto-restart even if
+                                // an explicit `request_ice_restart` already set
+                                // `restart_sent` (that restart need not have
+                                // produced a `Disconnected`, so the recovery
+                                // reset may never have fired).
+                                restart_sent = false;
+                                log::info!(
+                                    "[str0m] ice disconnected from {remote} — awaiting recovery"
+                                );
+                            }
+                        }
+                        IceConnectionState::Connected | IceConnectionState::Completed => {
+                            let was_disconnected = disconnected_since.take().is_some();
+                            if was_disconnected {
+                                restart_sent = false;
+                                telem.reconnects += 1;
+                                commit_telemetry(shared, remote, &telem);
+                                log::info!("[str0m] ice recovered to {remote}");
+                            }
+                        }
+                        _ => {}
+                    },
                     // Telemetry (ADR-0018): fold the ICE RTT + selected pair.
                     // Read-only — NOT an Rtc mutation, so the drain invariant is
                     // untouched (this is just another Event in the drain).
@@ -855,6 +1058,31 @@ fn run_connection(
             return Err("connect deadline exceeded".to_string());
         }
 
+        // Reconnect handling (ADR-0019): during a `Disconnected` episode, the
+        // offerer ICE-restarts once after the self-heal grace; a hard deadline
+        // gives up → the full-reconnect fallback in spawn_connection.
+        if let Some(since) = disconnected_since {
+            let down = since.elapsed();
+            if should_initiate_restart(is_offerer, Some(down), restart_sent) {
+                restart_sent = true;
+                if initiate_ice_restart(
+                    &mut rtc,
+                    &mut pending_offer,
+                    &candidate_json,
+                    out_tx,
+                    remote,
+                ) {
+                    telem.ice_restarts += 1;
+                    commit_telemetry(shared, remote, &telem);
+                    log::info!("[str0m] initiated ICE restart to {remote}");
+                }
+                continue; // SDP change is a mutation → re-enter the drain
+            }
+            if down > DISCONNECT_HARD_DEADLINE {
+                return Err("ice restart did not recover".to_string());
+            }
+        }
+
         // Service commands; each application mutates the Rtc, and the `continue`
         // re-enters the drain above before any further mutation.
         match cmd_rx.try_recv() {
@@ -890,6 +1118,26 @@ fn run_connection(
                     out_tx,
                     remote,
                 )?;
+                continue; // drain after mutation
+            }
+            Ok(Cmd::IceRestart) => {
+                // Explicit ICE restart (ADR-0019): ops hook + the mechanism's
+                // test trigger. Same in-place restart as the automatic path.
+                // Only once connected — restarting mid-handshake would clobber
+                // the initial `pending_offer` and break the first negotiation.
+                if connected_reported
+                    && initiate_ice_restart(
+                        &mut rtc,
+                        &mut pending_offer,
+                        &candidate_json,
+                        out_tx,
+                        remote,
+                    )
+                {
+                    telem.ice_restarts += 1;
+                    restart_sent = true;
+                    commit_telemetry(shared, remote, &telem);
+                }
                 continue; // drain after mutation
             }
             Err(TryRecvError::Empty) => {}
@@ -938,6 +1186,45 @@ fn run_connection(
     }
 }
 
+/// Whether the offerer should initiate an ICE restart now (ADR-0019): only the
+/// offerer initiates (glare avoidance — the answerer recovers via the re-offer),
+/// only once per disconnect episode, and only after the self-heal grace.
+fn should_initiate_restart(
+    is_offerer: bool,
+    disconnected_for: Option<Duration>,
+    restart_sent: bool,
+) -> bool {
+    is_offerer && !restart_sent && disconnected_for.is_some_and(|d| d > ICE_RESTART_GRACE)
+}
+
+/// Initiate an in-place ICE restart (ADR-0019): schedule the restart (keep
+/// local candidates), produce a new offer, send it + re-trickle the candidate.
+/// The DTLS/SCTP association and its channels are NOT torn down. `apply()` is
+/// an `Rtc` mutation — the caller must re-enter the drain (`continue`) after.
+/// Returns whether an offer was produced.
+fn initiate_ice_restart(
+    rtc: &mut Rtc,
+    pending_offer: &mut Option<str0m::change::SdpPendingOffer>,
+    candidate_json: &str,
+    out_tx: &Sender<PeerRequest<PeerSignal>>,
+    remote: MbPeerId,
+) -> bool {
+    let mut sdp = rtc.sdp_api();
+    sdp.ice_restart(true);
+    if let Some((offer, pending)) = sdp.apply() {
+        *pending_offer = Some(pending);
+        send_signal(out_tx, remote, PeerSignal::Offer(offer.to_sdp_string()));
+        send_signal(
+            out_tx,
+            remote,
+            PeerSignal::IceCandidate(candidate_json.to_string()),
+        );
+        true
+    } else {
+        false
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_signal(
     rtc: &mut Rtc,
@@ -956,12 +1243,16 @@ fn apply_signal(
                 .sdp_api()
                 .accept_offer(offer)
                 .map_err(|e| format!("accept_offer: {e}"))?;
-            // Pre-negotiated channels (no DCEP): declare ours now, matching
-            // matchbox's fixed stream ids.
-            let [cfg0, cfg1] = channel_configs();
-            let mut direct = rtc.direct_api();
-            chan_ids[0] = Some(direct.create_data_channel(cfg0));
-            chan_ids[1] = Some(direct.create_data_channel(cfg1));
+            // Pre-negotiated channels (no DCEP): declare ours on the FIRST offer
+            // only. A re-offer (ICE restart, ADR-0019) reuses the existing
+            // channels — `accept_offer` handles the ICE-restart creds change;
+            // recreating the channels would break them.
+            if chan_ids[0].is_none() {
+                let [cfg0, cfg1] = channel_configs();
+                let mut direct = rtc.direct_api();
+                chan_ids[0] = Some(direct.create_data_channel(cfg0));
+                chan_ids[1] = Some(direct.create_data_channel(cfg1));
+            }
             send_signal(out_tx, remote, PeerSignal::Answer(answer.to_sdp_string()));
             // Trickle our host candidate AFTER the answer — native matchbox
             // drops candidates that arrive before the answer it is waiting on.
@@ -1212,6 +1503,34 @@ mod tests {
         let m = FleetMetrics::aggregate(&peers);
         assert_eq!(m.success_fraction, Some(0.0));
         assert_eq!(m.rtt_mean, None);
+    }
+
+    /// The offerer initiates an ICE restart only after the grace, only once
+    /// per episode, and the answerer never initiates (glare avoidance).
+    #[test]
+    fn restart_decision() {
+        let past_grace = Some(ICE_RESTART_GRACE + Duration::from_millis(1));
+        let within_grace = Some(Duration::from_millis(1));
+        // Offerer, past grace, not yet sent → restart.
+        assert!(should_initiate_restart(true, past_grace, false));
+        // Still within the self-heal grace → wait.
+        assert!(!should_initiate_restart(true, within_grace, false));
+        // Already restarted this episode → don't repeat.
+        assert!(!should_initiate_restart(true, past_grace, true));
+        // Answerer never initiates.
+        assert!(!should_initiate_restart(false, past_grace, false));
+        // Not disconnected → nothing to do.
+        assert!(!should_initiate_restart(true, None, false));
+    }
+
+    /// Reconnect backoff is exponential and capped at SIGNALING_BACKOFF_MAX.
+    #[test]
+    fn reconnect_backoff_is_bounded() {
+        assert_eq!(reconnect_backoff(0), SIGNALING_BACKOFF_INITIAL);
+        assert_eq!(reconnect_backoff(1), SIGNALING_BACKOFF_INITIAL * 2);
+        assert!(reconnect_backoff(3) >= reconnect_backoff(1));
+        // Far-out attempts saturate at the cap, never grow unbounded.
+        assert_eq!(reconnect_backoff(100), SIGNALING_BACKOFF_MAX);
     }
 
     /// Nearest-rank percentile edge cases: single element, and p100 → max.

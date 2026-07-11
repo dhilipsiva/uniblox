@@ -151,7 +151,6 @@ peers and lives in Phase 2's telemetry bullet.
 ### PHASE 2 — Transport hardening [MIXED]
 **Goal:** production-grade transport across browser and native/server.
 - STUN-only failure rate + real-network RTT/jitter — the telemetry INSTRUMENT + AGGREGATION are DONE (ADR-0018: `Str0mPeer::telemetry()` records per-peer ICE outcome, winning-candidate kind, and RTT/jitter from str0m's ICE keepalive stats; `FleetMetrics::aggregate` turns many records into the STUN-only success fraction + candidate-kind breakdown + RTT/jitter distribution; hermetic + unit tested; live-demoed). Remaining is purely deploy-gated: the real-network NUMBERS need a fleet behind diverse NATs, and the collect→aggregate→export wiring lands with Phase-14 observability; browser-side candidate-pair classification via `getStats()` is a follow-up (matchbox-wasm doesn't surface it). [LOW] *Acceptance:* a fleet aggregates the telemetry into the STUN-only success fraction + RTT/jitter distributions once real sessions run.
-- Reconnect / ICE-restart handling. [MIXED]
 
 ### PHASE 3 — Replication depth [HIGH]
 **Goal:** turn the slice's replication into a robust layer. Every task: plan-mode + netcode-auditor + TDD + deterministic replay tests.

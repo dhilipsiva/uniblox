@@ -27,7 +27,13 @@ matchbox pass-through).
 ICE outcome (Connecting/Connected/Failed), winning local-candidate kind, and
 RTT mean/jitter; the aggregation turns many records into the STUN-only success
 fraction + candidate-kind breakdown + RTT/jitter distribution (pure, unit
-tested). Residuals: TLS signaling, non-loopback bind, reconnect/ICE-restart
+tested).
+**Reconnect / ICE-restart (ADR-0019)**: transient ICE `Disconnected` is
+tolerated (self-heal window), the offerer does an in-place `ice_restart` if it
+persists (channels survive), the signaling WS reconnects with backoff without
+killing live connections, and a hard failure triggers a bounded full reconnect;
+`request_ice_restart(peer)` is the ops/test trigger; `reconnects`/`ice_restarts`
+telemetry. Residuals: TLS signaling, non-loopback bind
 (later Phase-2 items); per-session TURN credential issuance is Phase 6;
 real-network telemetry NUMBERS need a deployed fleet; browser `getStats()`
 candidate classification is a follow-up.
@@ -67,6 +73,12 @@ candidate classification is a follow-up.
   `selected_candidate_pair.current_round_trip_time`. Stats are OFF by default —
   build the `Rtc` via `RtcConfig::new().set_stats_interval(Some(..)).build()`.
   Handling `Event::PeerStats` is read-only, so the drain invariant is untouched.
+- **ICE `Disconnected` is TRANSIENT, not fatal** (ADR-0019): it self-recovers;
+  don't tear down. The offerer ICE-restarts in place if it persists past the
+  grace; the answerer heals via the re-offer. A **signaling WS drop must NOT
+  kill live connections** (WebRTC is independent of signaling) — reconnect the
+  WS, don't `close_all`. Only the OFFERER auto-restarts / re-establishes (glare
+  avoidance). A **re-offer must reuse existing channels**, not recreate them.
 - **ICE policy is tier data** (`IceConfig`, ADR-0016): free = STUN-only,
   Mode 3 = STUN+TURN with per-session credentials carried (never minted) by
   the transport. The hermetic coturn tests need `--allow-loopback-peers` —

@@ -294,6 +294,97 @@ async fn telemetry_records_outcome_rtt_and_candidate() {
     assert!(other.rtt_mean.is_some());
 }
 
+/// Reconnect (ADR-0019): an in-place ICE restart re-nominates a candidate pair
+/// WITHOUT tearing down DTLS/SCTP — the channels (and data) survive. Trigger it
+/// explicitly on a connected str0m↔str0m pair, then prove data still flows on
+/// BOTH channels afterward and the initiator counted the restart.
+#[tokio::test(flavor = "multi_thread")]
+async fn ice_restart_keeps_channels_and_counts() {
+    let room = start_signaling();
+
+    let mut first = Str0mPeer::connect(&room);
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    while first.id().is_none() {
+        assert!(tokio::time::Instant::now() < deadline, "no first str0m id");
+        tokio::time::sleep(POLL).await;
+    }
+    let mut second = Str0mPeer::connect(&room);
+
+    let second_seen_by_first = wait_connected(&mut first).await;
+    let first_seen_by_second = wait_connected(&mut second).await;
+
+    // Force an in-place ICE restart from `first` toward `second`.
+    first
+        .request_ice_restart(second_seen_by_first)
+        .expect("ice restart request");
+
+    // Channels survived the restart: a full both-channel exchange still works.
+    exchange_both_channels(
+        &mut first,
+        second_seen_by_first,
+        &mut second,
+        first_seen_by_second,
+    )
+    .await;
+
+    // The initiator recorded the ICE restart in its telemetry.
+    let restarts = first
+        .telemetry()
+        .into_iter()
+        .find(|(id, _)| *id == second_seen_by_first)
+        .map(|(_, t)| t.ice_restarts)
+        .unwrap_or(0);
+    assert!(restarts >= 1, "initiator recorded an ICE restart");
+}
+
+/// Reconnect (ADR-0019): a signaling WS drop must NOT tear down live WebRTC
+/// connections (they are independent of signaling). Connect two str0m peers,
+/// KILL the signaling server, and prove data still flows str0m↔str0m and
+/// neither peer reports the transport closed.
+#[tokio::test(flavor = "multi_thread")]
+async fn connection_survives_signaling_drop() {
+    let mut server = SignalingServer::full_mesh_builder((Ipv4Addr::LOCALHOST, 0)).build();
+    let addr = server.bind().expect("signaling server must bind");
+    let handle = tokio::spawn(server.serve());
+    let room = format!("ws://{addr}/signaling_drop");
+
+    let mut first = Str0mPeer::connect(&room);
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    while first.id().is_none() {
+        assert!(tokio::time::Instant::now() < deadline, "no first str0m id");
+        tokio::time::sleep(POLL).await;
+    }
+    let mut second = Str0mPeer::connect(&room);
+    let second_seen_by_first = wait_connected(&mut first).await;
+    let first_seen_by_second = wait_connected(&mut second).await;
+
+    // Kill signaling. Give the WS drop a moment to register in both peers.
+    handle.abort();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Data still flows without signaling — the connection survived the blip.
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    let mut got = false;
+    while !got {
+        first
+            .send_state(second_seen_by_first, (*b"post-drop").into())
+            .expect("send after signaling drop (connection must survive)");
+        assert!(first.poll_peers().is_ok(), "first transport still open");
+        assert!(second.poll_peers().is_ok(), "second transport still open");
+        for (from, payload) in second.recv_state() {
+            if &payload[..] == b"post-drop" {
+                assert_eq!(from, first_seen_by_second);
+                got = true;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "data did not flow after the signaling server was killed"
+        );
+        tokio::time::sleep(POLL).await;
+    }
+}
+
 /// Poll `p`'s telemetry for `peer` until it has an RTT sample, or panic at the
 /// deadline.
 async fn wait_for_rtt(p: &Str0mPeer, peer: PeerId) -> PeerTelemetry {
