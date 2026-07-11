@@ -23,10 +23,11 @@ credential)` Mode-3 paid tier + `Transport::connect_with_ice`; the TURN relay
 path is proven hermetically against a flake-provided coturn
 (`tests/turn_relay.rs` — relay-only webrtc-rs peers, credential negative,
 matchbox pass-through).
-**`Str0mPeer::telemetry()` (ADR-0018)**: per-peer ICE outcome
-(Connecting/Connected/Failed), winning local-candidate kind, and RTT
-mean/jitter — the STUN-only-failure-rate + RTT/jitter instrument a fleet
-aggregates. Residuals: TLS signaling, non-loopback bind, reconnect/ICE-restart
+**`Str0mPeer::telemetry()` + `FleetMetrics::aggregate` (ADR-0018)**: per-peer
+ICE outcome (Connecting/Connected/Failed), winning local-candidate kind, and
+RTT mean/jitter; the aggregation turns many records into the STUN-only success
+fraction + candidate-kind breakdown + RTT/jitter distribution (pure, unit
+tested). Residuals: TLS signaling, non-loopback bind, reconnect/ICE-restart
 (later Phase-2 items); per-session TURN credential issuance is Phase 6;
 real-network telemetry NUMBERS need a deployed fleet; browser `getStats()`
 candidate classification is a follow-up.

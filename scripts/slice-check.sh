@@ -59,5 +59,5 @@ printf '  %-36s %s\n' "size-budget gate"               "PASS: 3.38/3.40 MB brotl
 echo
 
 echo "-- Pending (environment-gated) --"
-printf '  %-36s %s\n' "STUN-only connection success"  "INSTRUMENT ready (ADR-0018): Str0mPeer::telemetry() records ICE outcome + candidate kind + RTT/jitter per peer; real NUMBERS need a real-network fleet (loopback = 100% host, ~0.6ms)"
+printf '  %-36s %s\n' "STUN-only connection success"  "INSTRUMENT+AGGREGATION ready (ADR-0018): Str0mPeer::telemetry() per peer + FleetMetrics::aggregate → success fraction / kind breakdown / RTT distribution; real NUMBERS need a real-network fleet (loopback = 100% host, ~0.6ms)"
 printf '  %-36s %s\n' "  └ browser-side classification" "getStats() candidate-pair type not yet surfaced by matchbox-wasm (follow-up)"

@@ -22,7 +22,7 @@ pub use matchbox_socket::{Error as TransportError, Packet, PeerId, PeerState};
 #[cfg(not(target_arch = "wasm32"))]
 mod str0m_peer;
 #[cfg(not(target_arch = "wasm32"))]
-pub use str0m_peer::{IceOutcome, LocalCandidateKind, PeerTelemetry, Str0mPeer};
+pub use str0m_peer::{FleetMetrics, IceOutcome, LocalCandidateKind, PeerTelemetry, Str0mPeer};
 
 /// The message-loop future returned by [`Transport::connect`]. It drives
 /// signaling + WebRTC and MUST be polled (natively: spawn it on the executor;

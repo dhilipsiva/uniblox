@@ -377,8 +377,12 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
 - **Decision:** `Str0mPeer` records per-peer `PeerTelemetry { outcome (Connecting/Connected/Failed),
   time_to_connect, local_candidate (Host/ServerReflexive/PeerReflexive/Relayed/Unknown),
   selected_local/remote_addr, rtt_samples, rtt_mean, rtt_jitter }`, exposed via
-  `Str0mPeer::telemetry() -> Vec<(PeerId, PeerTelemetry)>`. A fleet aggregates: **STUN-only success
-  fraction = Connected / attempted**; **RTT/jitter distributions** from the per-peer values.
+  `Str0mPeer::telemetry() -> Vec<(PeerId, PeerTelemetry)>`. **`FleetMetrics::aggregate(&[PeerTelemetry])`**
+  turns many records into the numbers: **STUN-only success fraction = Connected / (Connected + Failed)**
+  (Connecting excluded), the winning-candidate-kind breakdown (host/srflx/prflx/relay/unknown, the
+  TURN-needed signal), and the **RTT/jitter distribution** (min / mean / p50 / p95 / max over per-peer
+  mean RTTs, nearest-rank percentiles; mean per-peer jitter). Pure function — no network to compute or
+  test; only the DATA needs real peers.
 - **How it's sourced from str0m (verified in `str0m-0.21.0/src/stats.rs`):**
   - Stats are OFF by default → build the `Rtc` via
     `RtcConfig::new().set_stats_interval(Some(500ms)).build(start)` so str0m emits `Event::PeerStats`.
@@ -398,9 +402,11 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   drain-to-Timeout discipline.
 - **Evidence:** hermetic str0m↔str0m test (`tests/str0m_interop.rs`) — both peers record `Connected`,
   time-to-connect, `Host` candidate, selected addrs, and an RTT sample with mean+jitter (soaked 4/4);
-  three unit tests on the `Failed`/`Connected`-stays-`Connected` finalize transitions. Live str0m↔str0m:
+  three unit tests on the `Failed`/`Connected`-stays-`Connected` finalize transitions; **six unit tests on
+  `FleetMetrics::aggregate`** (empty, success-fraction-excludes-Connecting, kind breakdown, RTT
+  distribution over 1..=10 ms, all-failed → 0.0, percentile edges). Live str0m↔str0m:
   `[TELEMETRY] outcome=Connected local=Host rtt=0.6ms jitter=0.2ms samples=19` (the ICE RTT is tighter
-  than the app-ping's ~4 ms, which is poll-bounded). Fresh reviewer on the diff.
+  than the app-ping's ~4 ms, which is poll-bounded). Fresh reviewer on the per-peer diff (MERGE).
 - **Residuals:** real-network NUMBERS need a deployed fleet (unchanged gate); browser-side candidate-pair
   classification via `getStats()` is a follow-up (matchbox-wasm doesn't surface it); srflx/relay local
   classification lights up with the deferred str0m gathering work. The telemetry map is retained per-peer

@@ -171,6 +171,115 @@ fn map_candidate_kind(kind: CandidateKind) -> LocalCandidateKind {
     }
 }
 
+/// Fleet-aggregated connection metrics (ADR-0018) — what a session/fleet
+/// computes from many [`PeerTelemetry`] records to fill the measurement gap:
+/// the STUN-only success fraction, the winning-candidate-kind breakdown, and
+/// the RTT/jitter distribution. Pure over the telemetry — no network needed to
+/// compute or test; only the DATA needs real peers.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FleetMetrics {
+    /// Peers that reached `Connected`.
+    pub connected: usize,
+    /// Peers whose attempt `Failed`.
+    pub failed: usize,
+    /// Peers still `Connecting` (non-terminal; excluded from the success fraction).
+    pub connecting: usize,
+    /// `Connected / (Connected + Failed)` — the STUN-only success fraction.
+    /// `None` until there is at least one terminal outcome.
+    pub success_fraction: Option<f64>,
+    /// Connected peers that won on a `Host` candidate.
+    pub host: usize,
+    /// Connected peers that won on a server-reflexive (STUN) candidate.
+    pub server_reflexive: usize,
+    /// Connected peers that won on a peer-reflexive candidate.
+    pub peer_reflexive: usize,
+    /// Connected peers that won on a relayed (TURN) candidate — the "needed TURN" count.
+    pub relayed: usize,
+    /// Connected peers whose winning candidate could not be classified.
+    pub unknown_kind: usize,
+    /// Smallest per-peer mean RTT among connected peers with a sample.
+    pub rtt_min: Option<Duration>,
+    /// Mean of per-peer mean RTTs.
+    pub rtt_mean: Option<Duration>,
+    /// Median (p50) of per-peer mean RTTs.
+    pub rtt_p50: Option<Duration>,
+    /// p95 of per-peer mean RTTs.
+    pub rtt_p95: Option<Duration>,
+    /// Largest per-peer mean RTT.
+    pub rtt_max: Option<Duration>,
+    /// Mean of per-peer RTT jitter over peers that reported jitter.
+    pub jitter_mean: Option<Duration>,
+}
+
+impl FleetMetrics {
+    /// Aggregate per-peer telemetry into fleet metrics (ADR-0018). A
+    /// session/fleet collects [`Str0mPeer::telemetry`] across peers and feeds
+    /// them here to produce the STUN-only success fraction + RTT/jitter
+    /// distributions the measurement gap asks for.
+    pub fn aggregate(peers: &[PeerTelemetry]) -> FleetMetrics {
+        let mut m = FleetMetrics::default();
+        // Each CONNECTED peer contributes its own mean RTT to the distribution.
+        let mut rtt_means: Vec<Duration> = Vec::new();
+        let mut jitter_sum_us = 0.0;
+        let mut jitter_count: u64 = 0;
+
+        for p in peers {
+            match p.outcome {
+                IceOutcome::Connected => {
+                    m.connected += 1;
+                    match p.local_candidate {
+                        LocalCandidateKind::Host => m.host += 1,
+                        LocalCandidateKind::ServerReflexive => m.server_reflexive += 1,
+                        LocalCandidateKind::PeerReflexive => m.peer_reflexive += 1,
+                        LocalCandidateKind::Relayed => m.relayed += 1,
+                        LocalCandidateKind::Unknown => m.unknown_kind += 1,
+                    }
+                    if let Some(rtt) = p.rtt_mean {
+                        rtt_means.push(rtt);
+                    }
+                    if let Some(jitter) = p.rtt_jitter {
+                        jitter_sum_us += jitter.as_secs_f64() * 1e6;
+                        jitter_count += 1;
+                    }
+                }
+                IceOutcome::Failed => m.failed += 1,
+                IceOutcome::Connecting => m.connecting += 1,
+            }
+        }
+
+        let terminal = m.connected + m.failed;
+        if terminal > 0 {
+            m.success_fraction = Some(m.connected as f64 / terminal as f64);
+        }
+
+        if !rtt_means.is_empty() {
+            rtt_means.sort_unstable();
+            let n = rtt_means.len();
+            let sum_us: f64 = rtt_means.iter().map(|d| d.as_secs_f64() * 1e6).sum();
+            m.rtt_min = Some(rtt_means[0]);
+            m.rtt_max = Some(rtt_means[n - 1]);
+            m.rtt_mean = Some(Duration::from_secs_f64(sum_us / n as f64 / 1e6));
+            m.rtt_p50 = Some(percentile(&rtt_means, 50));
+            m.rtt_p95 = Some(percentile(&rtt_means, 95));
+        }
+        if jitter_count > 0 {
+            m.jitter_mean = Some(Duration::from_secs_f64(
+                jitter_sum_us / jitter_count as f64 / 1e6,
+            ));
+        }
+
+        m
+    }
+}
+
+/// Nearest-rank percentile of a NON-EMPTY sorted slice (`p` in `1..=100`).
+fn percentile(sorted: &[Duration], p: usize) -> Duration {
+    let n = sorted.len();
+    // rank = ceil(p/100 · n), 1-indexed, clamped to [1, n].
+    let rank = (p * n).div_ceil(100).clamp(1, n);
+    sorted[rank - 1]
+}
+
 struct Shared {
     id: Mutex<Option<MbPeerId>>,
     conns: Mutex<HashMap<MbPeerId, Sender<Cmd>>>,
@@ -1001,5 +1110,118 @@ mod tests {
             map.get(&remote).map(|t| t.outcome),
             Some(IceOutcome::Failed)
         );
+    }
+
+    /// Build a telemetry record with a given outcome, candidate kind, and RTT
+    /// (ms) — for the fleet-aggregation tests.
+    fn telem(outcome: IceOutcome, kind: LocalCandidateKind, rtt_ms: Option<f64>) -> PeerTelemetry {
+        let mut t = PeerTelemetry::connecting();
+        t.outcome = outcome;
+        t.local_candidate = kind;
+        t.rtt_mean = rtt_ms.map(|ms| Duration::from_secs_f64(ms / 1e3));
+        t.rtt_jitter = rtt_ms.map(|_| Duration::from_millis(1));
+        t
+    }
+
+    /// Empty input yields all-zero metrics with no fraction/distribution.
+    #[test]
+    fn aggregate_empty() {
+        let m = FleetMetrics::aggregate(&[]);
+        assert_eq!(m, FleetMetrics::default());
+        assert_eq!(m.success_fraction, None);
+        assert_eq!(m.rtt_mean, None);
+    }
+
+    /// The STUN-only success fraction is Connected / (Connected + Failed);
+    /// `Connecting` peers are excluded from the fraction.
+    #[test]
+    fn aggregate_success_fraction_excludes_connecting() {
+        let peers = [
+            telem(IceOutcome::Connected, LocalCandidateKind::Host, Some(10.0)),
+            telem(IceOutcome::Connected, LocalCandidateKind::Host, Some(20.0)),
+            telem(IceOutcome::Connected, LocalCandidateKind::Host, Some(30.0)),
+            telem(IceOutcome::Failed, LocalCandidateKind::Unknown, None),
+            telem(IceOutcome::Connecting, LocalCandidateKind::Unknown, None),
+        ];
+        let m = FleetMetrics::aggregate(&peers);
+        assert_eq!(m.connected, 3);
+        assert_eq!(m.failed, 1);
+        assert_eq!(m.connecting, 1);
+        // 3 / (3 + 1) = 0.75 — the connecting peer is not counted.
+        assert_eq!(m.success_fraction, Some(0.75));
+    }
+
+    /// The candidate-kind breakdown counts only CONNECTED peers, per kind.
+    #[test]
+    fn aggregate_candidate_kind_breakdown() {
+        let peers = [
+            telem(IceOutcome::Connected, LocalCandidateKind::Host, Some(5.0)),
+            telem(
+                IceOutcome::Connected,
+                LocalCandidateKind::ServerReflexive,
+                Some(5.0),
+            ),
+            telem(
+                IceOutcome::Connected,
+                LocalCandidateKind::Relayed,
+                Some(5.0),
+            ),
+            // A failed peer's kind is NOT counted in the breakdown.
+            telem(IceOutcome::Failed, LocalCandidateKind::Host, None),
+        ];
+        let m = FleetMetrics::aggregate(&peers);
+        assert_eq!(m.host, 1);
+        assert_eq!(m.server_reflexive, 1);
+        assert_eq!(m.relayed, 1);
+        assert_eq!(m.peer_reflexive, 0);
+        assert_eq!(m.unknown_kind, 0);
+    }
+
+    /// The RTT distribution (min/mean/p50/p95/max) is over the per-peer means
+    /// of connected peers; nearest-rank percentiles.
+    #[test]
+    fn aggregate_rtt_distribution() {
+        // Per-peer mean RTTs 1..=10 ms.
+        let peers: Vec<_> = (1..=10)
+            .map(|ms| {
+                telem(
+                    IceOutcome::Connected,
+                    LocalCandidateKind::Host,
+                    Some(ms as f64),
+                )
+            })
+            .collect();
+        let m = FleetMetrics::aggregate(&peers);
+        let ms = |d: Option<Duration>| d.map(|d| (d.as_secs_f64() * 1e3).round() as i64);
+        assert_eq!(ms(m.rtt_min), Some(1));
+        assert_eq!(ms(m.rtt_max), Some(10));
+        assert_eq!(ms(m.rtt_mean), Some(6)); // (1..=10).mean() = 5.5 → rounds to 6
+        // nearest-rank: p50 = ceil(0.5·10)=5th = 5 ms; p95 = ceil(0.95·10)=10th = 10 ms.
+        assert_eq!(ms(m.rtt_p50), Some(5));
+        assert_eq!(ms(m.rtt_p95), Some(10));
+        assert!(m.jitter_mean.is_some());
+    }
+
+    /// All-failed: success fraction is 0.0, no RTT distribution.
+    #[test]
+    fn aggregate_all_failed() {
+        let peers = [
+            telem(IceOutcome::Failed, LocalCandidateKind::Unknown, None),
+            telem(IceOutcome::Failed, LocalCandidateKind::Unknown, None),
+        ];
+        let m = FleetMetrics::aggregate(&peers);
+        assert_eq!(m.success_fraction, Some(0.0));
+        assert_eq!(m.rtt_mean, None);
+    }
+
+    /// Nearest-rank percentile edge cases: single element, and p100 → max.
+    #[test]
+    fn percentile_edges() {
+        let one = [Duration::from_millis(7)];
+        assert_eq!(percentile(&one, 50), Duration::from_millis(7));
+        assert_eq!(percentile(&one, 95), Duration::from_millis(7));
+        let ten: Vec<_> = (1..=10).map(Duration::from_millis).collect();
+        assert_eq!(percentile(&ten, 100), Duration::from_millis(10));
+        assert_eq!(percentile(&ten, 10), Duration::from_millis(1));
     }
 }
