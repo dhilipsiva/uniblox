@@ -5,8 +5,11 @@
 
 use bevy_ecs::prelude::*;
 use engine_core::{Owner, Position, Velocity, insert_sim, simulate, spawn_owned};
-use protocol::{NetEntityId, NetEvent, PeerId, StateEntry, decode_event, decode_state};
-use replication::{KEYFRAME_INTERVAL, Outbox, Replication};
+use protocol::{
+    EventMsg, NetEntityId, NetEvent, PeerId, StateEntry, WIRE_VERSION, decode_event, decode_state,
+    encode_event,
+};
+use replication::{Outbox, Replication};
 
 const DT: f32 = 0.5;
 /// Quantization tolerance: 1/2048.
@@ -100,6 +103,18 @@ impl TestPeer {
     }
 }
 
+/// Flush `receiver`'s acks back to `sender` (ADR-0020): the receiver acks the
+/// sender's stream; the sender records the confirmed baseline.
+fn flush_acks(receiver: &mut TestPeer, sender: &mut TestPeer) {
+    let acks = receiver.repl.drain_acks();
+    for (target, ack) in acks {
+        assert_eq!(target, sender.id, "an ack targets the acked sender");
+        sender
+            .repl
+            .apply_events(&mut sender.world, receiver.id, &ack);
+    }
+}
+
 fn state_entries(outbox: &Outbox) -> Vec<StateEntry> {
     outbox
         .state
@@ -120,6 +135,36 @@ fn spawn_ids(events: &[Box<[u8]>]) -> Vec<NetEntityId> {
 
 fn approx(a: f32, b: f32) -> bool {
     (a - b).abs() <= TOL
+}
+
+/// The `NetEntityId` a peer mints for a local entity (mirrors the sender's
+/// minting rule) — lets a test match a specific entity's state entries.
+fn net_id(spawner: PeerId, e: Entity) -> NetEntityId {
+    NetEntityId {
+        spawner,
+        index: e.index_u32(),
+        generation: e.generation().to_bits(),
+    }
+}
+
+/// The seq of a state message (panics if the outbox carried none).
+fn state_seq(o: &Outbox) -> u64 {
+    decode_state(o.state.as_ref().expect("outbox has state"))
+        .expect("decode")
+        .seq
+}
+
+/// Inject a hand-built `Ack{seq}` from `from` into `target`'s sender state —
+/// white-box control for verifying the confirmation logic (e.g. a stale ack of
+/// a seq the peer could not actually have applied for a given component).
+fn inject_ack(target: &mut TestPeer, from: PeerId, seq: u64) {
+    let bytes = encode_event(&EventMsg {
+        version: WIRE_VERSION,
+        sig: None,
+        event: NetEvent::Ack { seq },
+    })
+    .expect("encode ack");
+    target.repl.apply_events(&mut target.world, from, &bytes);
 }
 
 // ───────────────────────────── T9 ─────────────────────────────
@@ -567,36 +612,41 @@ fn early_new_owner_state_dropped_until_transfer() {
 
 // ───────────────────────────── T21 ─────────────────────────────
 
-/// T21 — the keyframe heals a lost final packet: after a dropped update and
-/// no further changes, exactly one keyframe within the interval re-sends full
-/// state and the receiver converges.
+/// T21 (rewritten, ADR-0020) — the acked baseline heals a lost final packet:
+/// after a dropped update with no further changes, the unconfirmed value is
+/// re-sent EVERY tick until acked (continuous, not a periodic keyframe).
 #[test]
-fn keyframe_heals_dropped_final_packet() {
+fn acked_baseline_heals_dropped_final_packet() {
     let mut a = TestPeer::new(1);
     let mut b = TestPeer::new(2);
+    a.repl.track_peer(b.id); // A broadcasts to B — required for delta re-send
     let e = a.spawn(1.0, 1.0, 0.0, 0.0);
-    let out = a.collect();
+    let out = a.collect(); // seq 1: pos(1,1)+vel
     b.deliver_all(a.id, &out);
+    flush_acks(&mut b, &mut a); // B acks seq 1
 
-    // The "final" update is LOST.
+    // The "final" update to x=9 is LOST (collected but not delivered).
     a.world.get_mut::<Position>(e).unwrap().x = 9.0;
-    let _lost = a.collect();
+    let _lost = a.collect(); // seq 2: pos(9,1) — DROPPED
 
-    // Nothing changes anymore; within KEYFRAME_INTERVAL collects exactly one
-    // keyframe must emit, and it heals the receiver.
-    let mut emissions = 0;
-    for _ in 0..=KEYFRAME_INTERVAL {
-        let out = a.collect();
-        if let Some(state) = &out.state {
-            emissions += 1;
-            b.deliver_state(a.id, state);
-        }
-    }
-    assert_eq!(emissions, 1, "exactly one keyframe in a quiet interval");
+    // Nothing changes, but pos is unconfirmed (B has 1.0) — so it re-sends.
+    let out = a.collect(); // seq 3: pos still (9,1)
+    assert!(
+        out.state.is_some(),
+        "an unconfirmed value is re-sent until acked"
+    );
+    b.deliver_all(a.id, &out);
     let proxy = b.entity_owned_by(a.id);
     assert!(
         approx(b.pos(proxy).x, 9.0),
-        "keyframe must heal the lost update"
+        "the re-send heals the lost final packet"
+    );
+
+    // Once B acks the healed value, A goes quiet.
+    flush_acks(&mut b, &mut a);
+    assert!(
+        a.collect().state.is_none(),
+        "a confirmed value is not re-sent (bandwidth win)"
     );
 }
 
@@ -778,7 +828,7 @@ fn transfer_then_despawn_same_tick_yields_no_ghost() {
         match decode_event(ev).unwrap().event {
             NetEvent::OwnershipTransfer { .. } => saw_transfer = true,
             NetEvent::Despawn { .. } => saw_despawn = true,
-            NetEvent::Spawn { .. } => {}
+            NetEvent::Spawn { .. } | NetEvent::Ack { .. } => {}
         }
     }
     assert!(!saw_transfer, "a transfer for a dead entity must be purged");
@@ -822,4 +872,341 @@ fn first_collect_announces_and_snapshots_everything() {
     for entry in &msg.entries {
         assert_eq!(entry.mask(), 0b11, "first snapshot is full-mask");
     }
+}
+
+// ────────────────────── T29–T35: delta baseline (ADR-0020) ──────────────────────
+
+/// T29 ★ confirm → quiet: a stationary entity, once acked by all peers, stops
+/// being re-sent (the bandwidth win). Contrast the pre-delta keyframe, which
+/// re-sent everything every 30 ticks.
+#[test]
+fn confirmed_value_goes_quiet() {
+    let mut a = TestPeer::new(1);
+    let mut b = TestPeer::new(2);
+    a.repl.track_peer(b.id);
+    a.spawn(4.0, 4.0, 0.0, 0.0);
+
+    let out = a.collect(); // seq 1: sends pos+vel (first send)
+    assert!(out.state.is_some(), "first send carries the value");
+    b.deliver_all(a.id, &out);
+    flush_acks(&mut b, &mut a); // B confirms seq 1
+
+    // Nothing changed AND confirmed by every peer ⇒ silence, tick after tick.
+    for _ in 0..5 {
+        assert!(
+            a.collect().state.is_none(),
+            "a confirmed, unchanged value is never re-sent"
+        );
+    }
+}
+
+/// T30 ★ a value change re-arms confirmation: an ack of the OLD value does not
+/// confirm the NEW one — the sender keeps re-sending until an ack ≥ the new
+/// run start.
+#[test]
+fn value_change_re_arms_confirmation() {
+    let mut a = TestPeer::new(1);
+    let mut b = TestPeer::new(2);
+    a.repl.track_peer(b.id);
+    let e = a.spawn(0.0, 0.0, 0.0, 0.0);
+    b.deliver_all(a.id, &a.collect()); // seq 1
+    flush_acks(&mut b, &mut a); // B acks seq 1 (value 0,0)
+
+    // New value; the message that carries it is LOST.
+    a.world.get_mut::<Position>(e).unwrap().x = 7.0;
+    let _lost = a.collect(); // seq 2 (7,0) dropped
+
+    // B's ack still reflects the OLD value — the new value stays unconfirmed.
+    let out = a.collect(); // seq 3: pos(7,0) re-sent
+    assert!(
+        state_entries(&out).iter().any(|e| e.pos.is_some()),
+        "the new value is not confirmed by an old ack — keep sending"
+    );
+    b.deliver_all(a.id, &out);
+    flush_acks(&mut b, &mut a); // now B acks the new value
+    assert!(
+        a.collect().state.is_none(),
+        "confirmed after the ack catches up to the new run"
+    );
+}
+
+/// T31 ★ new-peer bootstrap + gap-reset: after A+B confirm an entity (A goes
+/// quiet), tracking a THIRD peer re-arms every component (unconfirmed for C),
+/// starting a fresh contiguous run after the all-confirmed gap.
+#[test]
+fn new_peer_re_sends_everything() {
+    let mut a = TestPeer::new(1);
+    let mut b = TestPeer::new(2);
+    let mut c = TestPeer::new(3);
+    a.repl.track_peer(b.id);
+    a.spawn(2.0, 3.0, 0.0, 0.0);
+    b.deliver_all(a.id, &a.collect());
+    flush_acks(&mut b, &mut a);
+    assert!(a.collect().state.is_none(), "quiet once B confirms");
+
+    // C joins: on_peer_connected replays the Spawn (reliable) + tracks C, then
+    // A's delta re-arms every component (unconfirmed for C).
+    let replay = a.repl.on_peer_connected(&mut a.world, c.id);
+    c.deliver_events(a.id, &replay);
+    let out = a.collect();
+    let entries = state_entries(&out);
+    assert_eq!(entries.len(), 1, "the entity is re-sent for the new peer");
+    assert_eq!(
+        entries[0].mask(),
+        0b11,
+        "full value (pos+vel) for the newcomer"
+    );
+    c.deliver_all(a.id, &out);
+    let proxy = c.entity_owned_by(a.id);
+    assert!(approx(c.pos(proxy).x, 2.0) && approx(c.pos(proxy).y, 3.0));
+
+    // Once BOTH confirm, quiet again.
+    flush_acks(&mut b, &mut a);
+    flush_acks(&mut c, &mut a);
+    assert!(a.collect().state.is_none(), "quiet once all peers confirm");
+}
+
+/// T32 ★ split acks: a value is broadcast until EVERY tracked peer confirms —
+/// one peer's ack is not enough.
+#[test]
+fn broadcast_until_all_confirm() {
+    let mut a = TestPeer::new(1);
+    let mut b = TestPeer::new(2);
+    let mut c = TestPeer::new(3);
+    a.repl.track_peer(b.id);
+    a.repl.track_peer(c.id);
+    a.spawn(5.0, 5.0, 0.0, 0.0);
+
+    let out = a.collect(); // seq 1
+    b.deliver_all(a.id, &out);
+    c.deliver_all(a.id, &out);
+    flush_acks(&mut b, &mut a); // only B acks
+
+    // C hasn't confirmed ⇒ still sent.
+    assert!(
+        a.collect().state.is_some(),
+        "unconfirmed by C ⇒ still broadcast"
+    );
+    // C's ack for the FIRST message (seq 1 ≥ run_start 1) confirms it.
+    flush_acks(&mut c, &mut a);
+    assert!(a.collect().state.is_none(), "quiet once both confirm");
+}
+
+/// T33 ★ THE cumulative-ack soundness case under loss: a value sent across
+/// seqs 1/2/3 with the middle one dropped is still confirmed by an ack of the
+/// latest received seq (the peer got the value in a surviving message), but a
+/// LATER value is NOT confirmed by that older ack.
+#[test]
+fn cumulative_ack_sound_under_loss() {
+    let mut a = TestPeer::new(1);
+    let mut b = TestPeer::new(2);
+    a.repl.track_peer(b.id);
+    let e = a.spawn(1.0, 0.0, 0.0, 0.0);
+
+    let m1 = a.collect(); // seq 1: pos(1,0)
+    b.deliver_all(a.id, &m1); // B receives seq 1
+    // Unconfirmed still (no ack yet) ⇒ re-sent at seq 2; DROP seq 2.
+    let _m2 = a.collect();
+    // Re-sent again at seq 3; deliver seq 3.
+    let m3 = a.collect();
+    b.deliver_all(a.id, &m3); // B's newest applied seq is 3
+    flush_acks(&mut b, &mut a); // B acks 3 ≥ run_start 1 ⇒ confirmed
+    assert!(
+        a.collect().state.is_none(),
+        "value confirmed: B received it in a surviving message"
+    );
+    let proxy = b.entity_owned_by(a.id);
+    assert!(approx(b.pos(proxy).x, 1.0));
+
+    // Now a NEW value; B is momentarily behind ⇒ NOT confirmed by the old ack.
+    a.world.get_mut::<Position>(e).unwrap().x = 8.0;
+    assert!(
+        state_entries(&a.collect()).iter().any(|e| e.pos.is_some()),
+        "the new value's run is unconfirmed until B acks a message carrying it"
+    );
+}
+
+/// T34 — despawning an owned entity prunes its delta baseline (no leak, no
+/// re-send of a gone entity).
+#[test]
+fn despawn_prunes_baseline() {
+    let mut a = TestPeer::new(1);
+    let mut b = TestPeer::new(2);
+    a.repl.track_peer(b.id);
+    let e = a.spawn(1.0, 1.0, 0.0, 0.0);
+    b.deliver_all(a.id, &a.collect());
+    flush_acks(&mut b, &mut a);
+
+    a.world.despawn(e);
+    let out = a.collect(); // announces the Despawn; no state for the gone entity
+    assert!(
+        state_entries(&out).is_empty(),
+        "no state entry for a despawned entity"
+    );
+    // Re-spawn a fresh entity (new id) — it re-baselines from scratch, proving
+    // the old baseline didn't linger and mis-key.
+    a.spawn(2.0, 2.0, 0.0, 0.0);
+    let entries = state_entries(&a.collect());
+    assert_eq!(entries.len(), 1, "only the new entity is sent");
+    assert_eq!(entries[0].mask(), 0b11, "fresh baseline is a full send");
+}
+
+/// T35 ★ ACCEPTANCE — bandwidth drops measurably vs the full-snapshot scheme.
+/// A stationary scene: the FIRST send is a full snapshot of every entity —
+/// exactly what a keyframe costs, and what the pre-delta scheme re-paid every
+/// 30 ticks. Measure that keyframe-equivalent cost, then assert the acked
+/// baseline sends ZERO bytes in steady state (so over the 40-tick window it
+/// avoids ≥1 whole keyframe the old scheme would have emitted).
+#[test]
+fn bandwidth_drops_for_stationary_scene() {
+    let mut a = TestPeer::new(1);
+    let mut b = TestPeer::new(2);
+    a.repl.track_peer(b.id);
+    for i in 0..8 {
+        a.spawn(i as f32, i as f32, 0.0, 0.0); // all stationary
+    }
+
+    let mut first_send_bytes = 0usize;
+    let mut steady_state_bytes = 0usize;
+    for tick in 0..40 {
+        let out = a.collect();
+        if let Some(state) = &out.state {
+            if tick == 0 {
+                // The full initial snapshot == one keyframe's cost.
+                first_send_bytes = state.len();
+            } else if tick >= 4 {
+                // Well past send → ack → confirm settling: must be silent.
+                steady_state_bytes += state.len();
+            }
+            b.deliver_all(a.id, &out);
+        }
+        flush_acks(&mut b, &mut a);
+    }
+    assert!(
+        first_send_bytes > 0,
+        "the first send is a full snapshot (the keyframe-equivalent cost)"
+    );
+    assert_eq!(
+        steady_state_bytes, 0,
+        "a confirmed stationary scene sends ZERO steady-state bytes — the old \
+         keyframe scheme would have re-sent {first_send_bytes}B every 30 ticks"
+    );
+}
+
+/// T36 ★ gap-reset soundness (auditor F2): when a component goes quiet
+/// (confirmed) while OTHER entities keep the seq stream advancing, a newly
+/// tracked peer forces a re-send whose `run_start` JUMPS to the current seq.
+/// So an ack of an INTERMEDIATE seq — a message that never carried this
+/// component — cannot falsely confirm it. Without the reset the run would span
+/// seqs the component was absent from, and such an ack would silently confirm a
+/// value the peer never received.
+#[test]
+fn gap_reset_keeps_run_contiguous() {
+    let mut a = TestPeer::new(1);
+    let mut b = TestPeer::new(2);
+    let c_id = PeerId(3);
+    a.repl.track_peer(b.id);
+    let e = a.spawn(9.0, 9.0, 0.0, 0.0); // STATIONARY — goes quiet once acked
+    let e_id = net_id(a.id, e);
+    let _f = a.spawn(0.0, 0.0, 2.0, 0.0); // MOVING — advances the seq stream
+
+    let m1 = a.collect(); // seq 1: E + F
+    assert!(
+        state_entries(&m1).iter().any(|s| s.id == e_id),
+        "E is in its first send"
+    );
+    b.deliver_all(a.id, &m1);
+    flush_acks(&mut b, &mut a); // B confirms E at run_start 1
+
+    // seqs 2..4: F moves and is re-sent; E is quiet — ABSENT from these
+    // messages while the seq counter advances well past it.
+    for _ in 0..3 {
+        a.sim_tick();
+        let out = a.collect();
+        assert!(
+            !state_entries(&out).iter().any(|s| s.id == e_id),
+            "E is silent (confirmed) while F advances the stream"
+        );
+        b.deliver_all(a.id, &out);
+        flush_acks(&mut b, &mut a);
+    }
+
+    // C joins having acked nothing ⇒ the next collect re-arms E and (because E
+    // was absent from the intervening seqs) resets run_start to the CURRENT seq.
+    a.repl.track_peer(c_id);
+    let out = a.collect();
+    let reset_seq = state_seq(&out);
+    assert!(
+        state_entries(&out).iter().any(|s| s.id == e_id),
+        "E is re-sent for the newcomer"
+    );
+    b.deliver_all(a.id, &out);
+    flush_acks(&mut b, &mut a); // B stays confirmed at the reset run (isolates C)
+
+    // A stale intermediate ack (of a message that never carried E) must NOT
+    // confirm the reset run — else silent divergence for C. Under a broken
+    // reset, run_start would still be 1 and `reset_seq-1 ≥ 1` would silence E.
+    inject_ack(&mut a, c_id, reset_seq - 1);
+    assert!(
+        state_entries(&a.collect()).iter().any(|s| s.id == e_id),
+        "a stale ack (< reset run_start) must not confirm E — keep sending"
+    );
+
+    // A correct ack ≥ the reset run_start finally confirms it (both peers now
+    // hold the value at that run).
+    inject_ack(&mut a, c_id, reset_seq);
+    assert!(
+        !state_entries(&a.collect()).iter().any(|s| s.id == e_id),
+        "E quiet once C acks ≥ the reset run_start"
+    );
+}
+
+/// T37 ★ THE F1 regression — state racing its Spawn must NOT be acked. The
+/// unreliable state channel can outrun the reliable Spawn: the receiver drops
+/// the entry (no proxy yet), but MUST NOT ack that seq (it does not hold the
+/// value). Acking it would let the sender mark it confirmed and go silent, and
+/// with the keyframe gone the receiver would be stuck at the Spawn's value
+/// forever. Withholding the ack keeps the sender re-sending until the Spawn
+/// lands and the value actually applies.
+#[test]
+fn state_before_spawn_defers_ack() {
+    let mut a = TestPeer::new(1);
+    let mut b = TestPeer::new(2);
+    a.repl.track_peer(b.id);
+    a.spawn(5.0, 5.0, 0.0, 0.0); // STATIONARY — re-send is purely "unconfirmed"
+
+    let m1 = a.collect(); // seq 1: Spawn (reliable) + state (unreliable)
+    assert!(!m1.events.is_empty(), "first collect mints a Spawn");
+    assert!(m1.state.is_some(), "first collect sends state");
+
+    // State outruns its Spawn: deliver state ONLY. B has no proxy ⇒ the entry
+    // is dropped. It must NOT be acked (the F1 soundness guarantee).
+    b.deliver_state(a.id, m1.state.as_ref().unwrap());
+    assert!(
+        b.repl.drain_acks().is_empty(),
+        "F1: a state msg whose only entry was dropped (no proxy) must NOT be acked"
+    );
+
+    // A received no ack ⇒ the value is still unconfirmed ⇒ re-sent.
+    let m2 = a.collect(); // seq 2: E re-sent (unconfirmed)
+    assert!(
+        state_entries(&m2).iter().any(|s| s.pos.is_some()),
+        "unconfirmed ⇒ the value is still being re-sent"
+    );
+
+    // The reliable Spawn finally lands; the re-sent state now applies.
+    b.deliver_events(a.id, &m1.events); // build the proxy at (5,5)
+    b.deliver_state(a.id, m2.state.as_ref().unwrap());
+    let proxy = b.entity_owned_by(a.id);
+    assert!(
+        approx(b.pos(proxy).x, 5.0) && approx(b.pos(proxy).y, 5.0),
+        "B holds the real value once the Spawn arrives + state applies"
+    );
+
+    // Only NOW (a fully-applied message) does B ack ⇒ A confirms ⇒ silence.
+    flush_acks(&mut b, &mut a);
+    assert!(
+        a.collect().state.is_none(),
+        "confirmed only after a message that actually applied"
+    );
 }
