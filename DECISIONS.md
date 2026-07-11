@@ -367,3 +367,44 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   the render metrics run headless (playwright chromium in `~/.cache/ms-playwright`).
 - **Status:** Accepted (2026-07-11). PHASE 1 IS COMPLETE — the only untaken slice measurement
   (STUN-only success rate) is real-network-gated and lives in Phase 2's telemetry bullet.
+
+## ADR-0018 — str0m connection telemetry: the STUN-only-failure-rate + RTT/jitter instrument
+- **Context:** the "measure the STUN-only failure rate + real-network RTT/jitter" item. The NUMBERS are
+  hard-blocked by the environment (they need peers behind diverse real NATs; on a single host every
+  connection succeeds via host candidates → 0% failure, ~0.6 ms RTT). Approved scope: build the telemetry
+  INSTRUMENT the acceptance refers to ("telemetry reports … once real sessions run") so a deployed fleet
+  auto-produces the numbers. Native/str0m side; browser `getStats()` is a follow-up.
+- **Decision:** `Str0mPeer` records per-peer `PeerTelemetry { outcome (Connecting/Connected/Failed),
+  time_to_connect, local_candidate (Host/ServerReflexive/PeerReflexive/Relayed/Unknown),
+  selected_local/remote_addr, rtt_samples, rtt_mean, rtt_jitter }`, exposed via
+  `Str0mPeer::telemetry() -> Vec<(PeerId, PeerTelemetry)>`. A fleet aggregates: **STUN-only success
+  fraction = Connected / attempted**; **RTT/jitter distributions** from the per-peer values.
+- **How it's sourced from str0m (verified in `str0m-0.21.0/src/stats.rs`):**
+  - Stats are OFF by default → build the `Rtc` via
+    `RtcConfig::new().set_stats_interval(Some(500ms)).build(start)` so str0m emits `Event::PeerStats`.
+  - **RTT comes from `selected_candidate_pair.current_round_trip_time`, NOT `PeerStats.rtt`.** The latter
+    is RTP/media-derived and stays `None` for a DataChannels-only session (found live: the hermetic test
+    hung 120 s waiting on `stats.rtt`); the candidate-pair RTT is the ICE keepalive/consent RTT and is
+    "available even on receive-only endpoints." This is the load-bearing detail.
+  - `CandidateStats` exposes only the `addr`, not the kind — so the winning LOCAL candidate is classified
+    by matching `selected.local.addr` against the candidates we added (each has `Candidate::kind()`).
+    **`Host` today** — `Str0mPeer` gathers only a host candidate; srflx/relay await the non-loopback-bind
+    / STUN-gathering residual, at which point the classification lights up with no code change.
+  - `Failed` is finalized when the per-peer thread exits without ever reaching `Connected` (deadline / ICE
+    disconnect / dead remote); a peer that connected then dropped STAYS `Connected` (it did connect — a
+    disconnect is not a STUN failure).
+- **Drain invariant preserved:** handling `Event::PeerStats` is READ-ONLY (fold RTT, classify, update a
+  Mutex) — not an `Rtc` mutation, so it sits inside the existing drain with no change to the
+  drain-to-Timeout discipline.
+- **Evidence:** hermetic str0m↔str0m test (`tests/str0m_interop.rs`) — both peers record `Connected`,
+  time-to-connect, `Host` candidate, selected addrs, and an RTT sample with mean+jitter (soaked 4/4);
+  three unit tests on the `Failed`/`Connected`-stays-`Connected` finalize transitions. Live str0m↔str0m:
+  `[TELEMETRY] outcome=Connected local=Host rtt=0.6ms jitter=0.2ms samples=19` (the ICE RTT is tighter
+  than the app-ping's ~4 ms, which is poll-bounded). Fresh reviewer on the diff.
+- **Residuals:** real-network NUMBERS need a deployed fleet (unchanged gate); browser-side candidate-pair
+  classification via `getStats()` is a follow-up (matchbox-wasm doesn't surface it); srflx/relay local
+  classification lights up with the deferred str0m gathering work. The telemetry map is retained per-peer
+  (intentional — a fleet wants the historical outcome record); a long-lived Mode-3 hub accumulates one
+  small `PeerTelemetry` per distinct remote, so bounded retention / snapshot-and-drain is a
+  pre-Mode-3-production follow-up (reviewer NIT).
+- **Status:** Accepted (2026-07-11).

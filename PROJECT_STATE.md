@@ -85,6 +85,14 @@ peer (ADR-0015) + ICE policy tiers with the TURN relay proof (ADR-0016).
   channels. Gotchas recorded: coturn blocks loopback peers by default (test-only `--allow-loopback-peers`);
   UDP readiness ≠ TCP readiness (STUN-binding probe in the harness). Residuals: STUN-only failure RATE is
   a real-network fleet metric; production coturn + credential issuance ride Phase 6.
+- **Connection telemetry instrument** (ADR-0018) — `Str0mPeer::telemetry()` records per-peer ICE outcome
+  (Connecting/Connected/Failed), winning local-candidate kind (Host today), selected addrs, and RTT
+  mean/jitter from str0m's ICE keepalive stats (the candidate-pair `current_round_trip_time`, NOT the
+  media-only `PeerStats.rtt` — the load-bearing detail that hung the first test). A fleet aggregates these
+  into the STUN-only success fraction + RTT/jitter distributions. Hermetic str0m↔str0m test (Connected +
+  RTT + Host + addrs, soaked 4/4) + finalize unit tests; live demo prints `outcome=Connected local=Host
+  rtt=0.6ms jitter=0.2ms`. Real NUMBERS need a deployed fleet; browser `getStats()` classification is a
+  follow-up.
 - **Instrumentation (native core)** — `slice_metrics` example + `/slice-check` table. **Measured (native
   loopback, 2026-07-10):** state channel 742 B/s per peer @ 2 entities (19.4 msg/s at the 20 Hz net tick,
   ~38 B/msg — comfortably inside the ~1150 B datagram budget); events steady 0 B/s; RTT 4.3 ms ± 0.6 ms

@@ -35,6 +35,10 @@ fn main() {
     // Peers currently connected (we re-send the unreliable state each tick).
     let mut connected: HashSet<_> = HashSet::new();
 
+    // Print the connection telemetry (ADR-0018) every ~2 s.
+    const TELEMETRY_EVERY: u32 = 20;
+    let mut ticks: u32 = 0;
+
     loop {
         match peer.poll_peers() {
             Ok(updates) => {
@@ -80,6 +84,24 @@ fn main() {
                 "[str0m-demo][EVENT] from {id}: {}",
                 String::from_utf8_lossy(&pkt)
             );
+        }
+
+        ticks += 1;
+        if ticks.is_multiple_of(TELEMETRY_EVERY) {
+            for (id, t) in peer.telemetry() {
+                let rtt = t
+                    .rtt_mean
+                    .map(|d| format!("{:.1}ms", d.as_secs_f64() * 1e3))
+                    .unwrap_or_else(|| "-".to_string());
+                let jitter = t
+                    .rtt_jitter
+                    .map(|d| format!("{:.1}ms", d.as_secs_f64() * 1e3))
+                    .unwrap_or_else(|| "-".to_string());
+                println!(
+                    "[str0m-demo][TELEMETRY] {id}: outcome={:?} local={:?} rtt={rtt} jitter={jitter} samples={}",
+                    t.outcome, t.local_candidate, t.rtt_samples
+                );
+            }
         }
 
         std::thread::sleep(TICK);

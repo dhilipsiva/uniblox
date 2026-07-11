@@ -22,9 +22,14 @@ caught the `sdpMid` bug below.
 credential)` Mode-3 paid tier + `Transport::connect_with_ice`; the TURN relay
 path is proven hermetically against a flake-provided coturn
 (`tests/turn_relay.rs` — relay-only webrtc-rs peers, credential negative,
-matchbox pass-through). Residuals: TLS signaling, non-loopback bind,
-reconnect/ICE-restart (later Phase-2 items); per-session TURN credential
-issuance is Phase 6.
+matchbox pass-through).
+**`Str0mPeer::telemetry()` (ADR-0018)**: per-peer ICE outcome
+(Connecting/Connected/Failed), winning local-candidate kind, and RTT
+mean/jitter — the STUN-only-failure-rate + RTT/jitter instrument a fleet
+aggregates. Residuals: TLS signaling, non-loopback bind, reconnect/ICE-restart
+(later Phase-2 items); per-session TURN credential issuance is Phase 6;
+real-network telemetry NUMBERS need a deployed fleet; browser `getStats()`
+candidate classification is a follow-up.
 
 ## Crate-local invariants
 - **WebRTC DataChannels only — no media, no SFU, anywhere.**
@@ -55,6 +60,12 @@ issuance is Phase 6.
   `sdpMid:None, sdpMLineIndex:Some(0)` is correct for both roles and both
   stacks. **Lesson: browsers are stricter than webrtc-rs — verify real-browser
   interop, don't trust native-matchbox-only tests.**
+- **Telemetry RTT comes from the ICE candidate pair, not `PeerStats.rtt`**
+  (ADR-0018): `PeerStats.rtt` is RTP/media-derived and stays `None` for a
+  DataChannels-only session; the ICE keepalive RTT is
+  `selected_candidate_pair.current_round_trip_time`. Stats are OFF by default —
+  build the `Rtc` via `RtcConfig::new().set_stats_interval(Some(..)).build()`.
+  Handling `Event::PeerStats` is read-only, so the drain invariant is untouched.
 - **ICE policy is tier data** (`IceConfig`, ADR-0016): free = STUN-only,
   Mode 3 = STUN+TURN with per-session credentials carried (never minted) by
   the transport. The hermetic coturn tests need `--allow-loopback-peers` —

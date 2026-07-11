@@ -18,7 +18,10 @@ use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use matchbox_signaling::SignalingServer;
-use transport::{CHANNEL_EVENTS, CHANNEL_STATE, Packet, PeerId, PeerState, Str0mPeer, Transport};
+use transport::{
+    CHANNEL_EVENTS, CHANNEL_STATE, IceOutcome, LocalCandidateKind, Packet, PeerId, PeerState,
+    PeerTelemetry, Str0mPeer, Transport,
+};
 
 const DEADLINE: Duration = Duration::from_secs(120); // bounds hangs, not CPU contention
 const POLL: Duration = Duration::from_millis(20);
@@ -243,6 +246,74 @@ async fn str0m_to_str0m() {
         first_seen_by_second,
     )
     .await;
+}
+
+/// Telemetry (ADR-0018): two connected str0m peers each record `Connected`
+/// with a time-to-connect, a Host winning candidate (loopback), selected
+/// addrs, and — once str0m's ICE keepalive stats arrive — an RTT sample with
+/// mean+jitter. This is the native instrument a fleet aggregates into the
+/// STUN-only success fraction and RTT/jitter distributions.
+#[tokio::test(flavor = "multi_thread")]
+async fn telemetry_records_outcome_rtt_and_candidate() {
+    let room = start_signaling();
+
+    let mut first = Str0mPeer::connect(&room);
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    while first.id().is_none() {
+        assert!(tokio::time::Instant::now() < deadline, "no first str0m id");
+        tokio::time::sleep(POLL).await;
+    }
+    let mut second = Str0mPeer::connect(&room);
+
+    let second_seen_by_first = wait_connected(&mut first).await;
+    let first_seen_by_second = wait_connected(&mut second).await;
+
+    // Poll telemetry until an RTT sample lands (a couple stats intervals after
+    // connect) — bounded by DEADLINE.
+    let telem = wait_for_rtt(&first, second_seen_by_first).await;
+
+    assert_eq!(telem.outcome, IceOutcome::Connected);
+    assert!(
+        telem.time_to_connect.is_some(),
+        "time_to_connect recorded on connect"
+    );
+    assert_eq!(
+        telem.local_candidate,
+        LocalCandidateKind::Host,
+        "loopback bind ⇒ Host winning candidate"
+    );
+    assert!(telem.selected_local_addr.is_some(), "selected local addr");
+    assert!(telem.selected_remote_addr.is_some(), "selected remote addr");
+    assert!(telem.rtt_samples >= 1, "at least one RTT sample");
+    assert!(telem.rtt_mean.is_some(), "RTT mean");
+    assert!(telem.rtt_jitter.is_some(), "RTT jitter");
+
+    // The other side records its own peer symmetrically.
+    let other = wait_for_rtt(&second, first_seen_by_second).await;
+    assert_eq!(other.outcome, IceOutcome::Connected);
+    assert!(other.rtt_mean.is_some());
+}
+
+/// Poll `p`'s telemetry for `peer` until it has an RTT sample, or panic at the
+/// deadline.
+async fn wait_for_rtt(p: &Str0mPeer, peer: PeerId) -> PeerTelemetry {
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    loop {
+        if let Some(telem) = p
+            .telemetry()
+            .into_iter()
+            .find(|(id, _)| *id == peer)
+            .map(|(_, t)| t)
+            && telem.rtt_mean.is_some()
+        {
+            return telem;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "telemetry never produced an RTT sample for {peer}"
+        );
+        tokio::time::sleep(POLL).await;
+    }
 }
 
 /// str0m joins FIRST → str0m receives NewPeer(matchbox) → str0m OFFERS,

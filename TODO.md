@@ -150,7 +150,7 @@ peers and lives in Phase 2's telemetry bullet.
 
 ### PHASE 2 — Transport hardening [MIXED]
 **Goal:** production-grade transport across browser and native/server.
-- Measure the STUN-only failure rate and real-network RTT/jitter — fleet metrics (§"Measurement gaps"); need peers behind real NATs (the loopback RTT baseline is not a sizing input for Phase-3 interpolation buffers). [LOW] *Acceptance:* telemetry reports the STUN-only connection-success fraction and per-peer RTT/jitter distributions once real sessions run. (Production TURN deployment + per-session credential minting are Phase-9 bullets; the transport side — `IceConfig`/`connect_with_ice`, ADR-0016 — is ready for them.)
+- STUN-only failure rate + real-network RTT/jitter — the telemetry INSTRUMENT is DONE (ADR-0018: `Str0mPeer::telemetry()` records per-peer ICE outcome, winning-candidate kind, and RTT/jitter from str0m's ICE keepalive stats; hermetic-tested; live-demoed). Remaining: the real-network NUMBERS need a deployed fleet behind diverse NATs (deploy-gated); browser-side candidate-pair classification via `getStats()` is a follow-up (matchbox-wasm doesn't surface it). [LOW] *Acceptance:* a fleet aggregates the telemetry into the STUN-only success fraction + RTT/jitter distributions once real sessions run. (Production TURN deployment + per-session credential minting are Phase-9 bullets; the transport side — `IceConfig`/`connect_with_ice`, ADR-0016 — is ready.)
 - Reconnect / ICE-restart handling. [MIXED]
 
 ### PHASE 3 — Replication depth [HIGH]

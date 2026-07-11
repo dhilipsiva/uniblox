@@ -32,7 +32,7 @@
 //! (reconnect/ICE-restart is a later Phase-2 item).
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, Once};
@@ -42,7 +42,7 @@ use matchbox_protocol::{PeerEvent, PeerId as MbPeerId, PeerRequest};
 use serde::{Deserialize, Serialize};
 use str0m::channel::{ChannelConfig as Str0mChannelConfig, ChannelId, Reliability};
 use str0m::net::{Protocol, Receive};
-use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc};
+use str0m::{Candidate, CandidateKind, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
 
 use crate::{
     CHANNEL_EVENTS, CHANNEL_SPECS, CHANNEL_STATE, ChannelSendError, ChannelSpec, Packet, PeerState,
@@ -87,10 +87,123 @@ enum Role {
     Answerer,
 }
 
+/// How str0m's stats poll reports RTT/candidate info (ADR-0018): enabling it
+/// makes str0m emit [`Event::PeerStats`] on this cadence.
+const STATS_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Bound on how long we wait for a peer to reach `Connected` before recording
+/// the attempt as [`IceOutcome::Failed`]. On a STUN-only config this is the
+/// signal that STUN could not traverse the NAT (the failure the metric counts).
+const CONNECT_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Kind of the local winning ICE candidate — the "did we need TURN" signal
+/// (ADR-0018). Mapped from [`str0m::CandidateKind`]. `Host` today: `Str0mPeer`
+/// gathers only a host candidate (srflx/relay await the non-loopback-bind /
+/// STUN-gathering work), but the classification is future-proof for when they
+/// appear.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalCandidateKind {
+    Host,
+    ServerReflexive,
+    PeerReflexive,
+    Relayed,
+    /// The selected local address matched none of our gathered candidates.
+    Unknown,
+}
+
+/// Whether a peer connection succeeded — the STUN-only-failure-rate signal
+/// (ADR-0018). Fleet aggregate: success fraction = `Connected` / attempted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IceOutcome {
+    /// Negotiating; not yet connected.
+    Connecting,
+    /// Reached `Connected` at least once (the pair nominated).
+    Connected,
+    /// Never connected (deadline, ICE disconnect before connect, or dead remote).
+    Failed,
+}
+
+/// Per-peer connection telemetry (ADR-0018). A deployed fleet aggregates these
+/// into the STUN-only success fraction and the RTT/jitter distributions the
+/// measurement gap asks for. Loopback/host on a single machine; meaningful the
+/// moment peers are remote.
+#[derive(Clone, Debug)]
+pub struct PeerTelemetry {
+    /// Connection outcome.
+    pub outcome: IceOutcome,
+    /// Time from the connection attempt starting to the first `Connected`.
+    pub time_to_connect: Option<Duration>,
+    /// Kind of our winning local candidate (the TURN-needed signal).
+    pub local_candidate: LocalCandidateKind,
+    /// Address of our winning local candidate.
+    pub selected_local_addr: Option<SocketAddr>,
+    /// Address of the remote's winning candidate.
+    pub selected_remote_addr: Option<SocketAddr>,
+    /// Number of RTT samples folded in (from str0m's ICE keepalive stats).
+    pub rtt_samples: u64,
+    /// Mean RTT over the samples.
+    pub rtt_mean: Option<Duration>,
+    /// RTT jitter (standard deviation of the samples).
+    pub rtt_jitter: Option<Duration>,
+}
+
+impl PeerTelemetry {
+    fn connecting() -> Self {
+        PeerTelemetry {
+            outcome: IceOutcome::Connecting,
+            time_to_connect: None,
+            local_candidate: LocalCandidateKind::Unknown,
+            selected_local_addr: None,
+            selected_remote_addr: None,
+            rtt_samples: 0,
+            rtt_mean: None,
+            rtt_jitter: None,
+        }
+    }
+}
+
+fn map_candidate_kind(kind: CandidateKind) -> LocalCandidateKind {
+    match kind {
+        CandidateKind::Host => LocalCandidateKind::Host,
+        CandidateKind::ServerReflexive => LocalCandidateKind::ServerReflexive,
+        CandidateKind::PeerReflexive => LocalCandidateKind::PeerReflexive,
+        CandidateKind::Relayed => LocalCandidateKind::Relayed,
+    }
+}
+
 struct Shared {
     id: Mutex<Option<MbPeerId>>,
     conns: Mutex<HashMap<MbPeerId, Sender<Cmd>>>,
+    /// Per-peer connection telemetry (ADR-0018); updated by the connection
+    /// threads, read via [`Str0mPeer::telemetry`].
+    telemetry: Mutex<HashMap<MbPeerId, PeerTelemetry>>,
     closed: AtomicBool,
+}
+
+/// Write a peer's telemetry snapshot into the shared map (best-effort — a
+/// poisoned lock silently drops the update, never blocks the connection loop).
+fn commit_telemetry(shared: &Shared, remote: MbPeerId, telem: &PeerTelemetry) {
+    if let Ok(mut map) = shared.telemetry.lock() {
+        map.insert(remote, telem.clone());
+    }
+}
+
+/// Finalize a peer's telemetry when its connection thread exits: an attempt
+/// that never reached `Connected` (or recorded nothing) becomes `Failed`. A
+/// peer that connected then dropped STAYS `Connected` — it DID connect; that is
+/// a disconnect, not a STUN failure.
+fn finalize_failed_telemetry(map: &mut HashMap<MbPeerId, PeerTelemetry>, remote: MbPeerId) {
+    match map.get_mut(&remote) {
+        Some(telem) if telem.outcome == IceOutcome::Connecting => {
+            telem.outcome = IceOutcome::Failed;
+        }
+        Some(_) => {}
+        None => {
+            let mut failed = PeerTelemetry::connecting();
+            failed.outcome = IceOutcome::Failed;
+            map.insert(remote, failed);
+        }
+    }
 }
 
 /// The native str0m peer. Mirrors [`crate::Transport`]'s method surface so
@@ -111,6 +224,7 @@ impl Str0mPeer {
         let shared = Arc::new(Shared {
             id: Mutex::new(None),
             conns: Mutex::new(HashMap::new()),
+            telemetry: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
         });
         let (updates_tx, updates_rx) = std::sync::mpsc::channel();
@@ -179,6 +293,17 @@ impl Str0mPeer {
         let tx = conns.get(&peer).ok_or(ChannelSendError)?;
         tx.send(Cmd::Send { channel, data })
             .map_err(|_| ChannelSendError)
+    }
+
+    /// Snapshot of per-peer connection telemetry (ADR-0018): ICE outcome,
+    /// time-to-connect, winning local-candidate kind, and RTT mean/jitter from
+    /// str0m's ICE keepalive stats. A fleet aggregates these into the STUN-only
+    /// success fraction and RTT/jitter distributions.
+    pub fn telemetry(&self) -> Vec<(MbPeerId, PeerTelemetry)> {
+        match self.shared.telemetry.lock() {
+            Ok(map) => map.iter().map(|(id, t)| (*id, t.clone())).collect(),
+            Err(_) => Vec::new(),
+        }
     }
 
     pub fn recv_state(&mut self) -> Vec<(MbPeerId, Packet)> {
@@ -409,12 +534,18 @@ fn spawn_connection(
             role,
             remote,
             cmd_rx,
+            &shared,
             &out_tx,
             &updates_tx,
             &state_tx,
             &events_tx,
         ) {
             log::warn!("[str0m] connection to {remote} ended: {err}");
+        }
+        // An attempt that never reached `Connected` is a `Failed` connection —
+        // the STUN-only failure the metric counts.
+        if let Ok(mut map) = shared.telemetry.lock() {
+            finalize_failed_telemetry(&mut map, remote);
         }
         if let Ok(mut conns) = shared.conns.lock() {
             conns.remove(&remote);
@@ -450,10 +581,12 @@ fn str0m_config(spec: &ChannelSpec, index: u16) -> Str0mChannelConfig {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_connection(
     role: Role,
     remote: MbPeerId,
     cmd_rx: Receiver<Cmd>,
+    shared: &Shared,
     out_tx: &Sender<PeerRequest<PeerSignal>>,
     updates_tx: &Sender<(MbPeerId, PeerState)>,
     state_tx: &Sender<(MbPeerId, Packet)>,
@@ -464,11 +597,29 @@ fn run_connection(
         .local_addr()
         .map_err(|e| format!("local addr: {e}"))?;
 
-    let mut rtc = Rtc::new(Instant::now());
+    // Stats ON (default is off) so str0m emits Event::PeerStats with the ICE
+    // RTT + selected candidate pair — the telemetry source (ADR-0018).
+    let mut rtc = RtcConfig::new()
+        .set_stats_interval(Some(STATS_INTERVAL))
+        .build(Instant::now());
     let candidate =
         Candidate::host(local_addr, "udp").map_err(|e| format!("host candidate: {e}"))?;
+    // Remember our gathered candidates + their kinds so a PeerStats selected
+    // pair (which carries only the addr) can be classified back to a kind.
+    let local_candidates: Vec<(SocketAddr, LocalCandidateKind)> =
+        vec![(candidate.addr(), map_candidate_kind(candidate.kind()))];
     rtc.add_local_candidate(candidate.clone());
     let candidate_json = encode_candidate(&candidate)?;
+
+    // Telemetry state for this peer (ADR-0018). Written into `shared.telemetry`
+    // on the first Connected and on each PeerStats update.
+    let connect_start = Instant::now();
+    let mut telem = PeerTelemetry::connecting();
+    commit_telemetry(shared, remote, &telem);
+    // RTT accumulator (µs) → running mean + stddev (jitter).
+    let mut rtt_count: u64 = 0;
+    let mut rtt_sum_us: f64 = 0.0;
+    let mut rtt_sum_sq_us: f64 = 0.0;
 
     let mut chan_ids: [Option<ChannelId>; 2] = [None, None];
     let mut chan_open: [bool; 2] = [false, false];
@@ -523,6 +674,9 @@ fn run_connection(
                         }
                         if chan_open.iter().all(|open| *open) && !connected_reported {
                             connected_reported = true;
+                            telem.outcome = IceOutcome::Connected;
+                            telem.time_to_connect = Some(connect_start.elapsed());
+                            commit_telemetry(shared, remote, &telem);
                             let _ = updates_tx.send((remote, PeerState::Connected));
                         }
                     }
@@ -544,6 +698,38 @@ fn run_connection(
                     Event::IceConnectionStateChange(IceConnectionState::Disconnected) => {
                         return Err("ice disconnected".to_string());
                     }
+                    // Telemetry (ADR-0018): fold the ICE RTT + selected pair.
+                    // Read-only — NOT an Rtc mutation, so the drain invariant is
+                    // untouched (this is just another Event in the drain).
+                    Event::PeerStats(stats) => {
+                        if let Some(pair) = stats.selected_candidate_pair {
+                            telem.selected_local_addr = Some(pair.local.addr);
+                            telem.selected_remote_addr = Some(pair.remote.addr);
+                            telem.local_candidate = local_candidates
+                                .iter()
+                                .find(|(addr, _)| *addr == pair.local.addr)
+                                .map(|(_, kind)| *kind)
+                                .unwrap_or(LocalCandidateKind::Unknown);
+                            // The RTT comes from the ICE keepalive on the
+                            // nominated pair (`current_round_trip_time`) — NOT
+                            // `stats.rtt`, which is RTP/media-derived and stays
+                            // None for a DataChannels-only session.
+                            if let Some(rtt) = pair.current_round_trip_time {
+                                let us = rtt.as_secs_f64() * 1e6;
+                                rtt_count += 1;
+                                rtt_sum_us += us;
+                                rtt_sum_sq_us += us * us;
+                                let n = rtt_count as f64;
+                                let mean_us = rtt_sum_us / n;
+                                let var_us = (rtt_sum_sq_us / n - mean_us * mean_us).max(0.0);
+                                telem.rtt_samples = rtt_count;
+                                telem.rtt_mean = Some(Duration::from_secs_f64(mean_us / 1e6));
+                                telem.rtt_jitter =
+                                    Some(Duration::from_secs_f64(var_us.sqrt() / 1e6));
+                            }
+                        }
+                        commit_telemetry(shared, remote, &telem);
+                    }
                     _ => {}
                 },
             }
@@ -551,6 +737,13 @@ fn run_connection(
 
         if !rtc.is_alive() {
             return Err("rtc no longer alive".to_string());
+        }
+
+        // Record a never-connected attempt as Failed once the deadline passes
+        // (the STUN-only failure the metric counts). spawn_connection's exit
+        // finalizer also covers ICE-disconnect/dead-remote exits.
+        if !connected_reported && connect_start.elapsed() > CONNECT_DEADLINE {
+            return Err("connect deadline exceeded".to_string());
         }
 
         // Service commands; each application mutates the Rtc, and the `continue`
@@ -750,5 +943,63 @@ mod tests {
             }
             assert!(config.protocol.is_empty(), "matchbox sets no protocol");
         }
+    }
+
+    /// `PeerId` is a newtype over `Uuid`; serde deserializes it from a UUID
+    /// string, so we can mint distinct ids without a `uuid` dev-dependency.
+    fn peer_id(n: u128) -> MbPeerId {
+        let uuid = format!("{n:032x}");
+        let hyphenated = format!(
+            "{}-{}-{}-{}-{}",
+            &uuid[0..8],
+            &uuid[8..12],
+            &uuid[12..16],
+            &uuid[16..20],
+            &uuid[20..32]
+        );
+        serde_json::from_str(&format!("\"{hyphenated}\"")).expect("valid uuid")
+    }
+
+    /// A connection thread that exits without ever reaching `Connected` marks
+    /// the attempt `Failed` — the STUN-only failure the metric counts.
+    #[test]
+    fn finalize_marks_unconnected_as_failed() {
+        let remote = peer_id(1);
+        let mut map = HashMap::new();
+        map.insert(remote, PeerTelemetry::connecting());
+        finalize_failed_telemetry(&mut map, remote);
+        assert_eq!(
+            map.get(&remote).map(|t| t.outcome),
+            Some(IceOutcome::Failed)
+        );
+    }
+
+    /// A peer that connected then dropped STAYS `Connected` — it did connect;
+    /// that is a disconnect, not a STUN failure.
+    #[test]
+    fn finalize_leaves_connected_untouched() {
+        let remote = peer_id(2);
+        let mut map = HashMap::new();
+        let mut telem = PeerTelemetry::connecting();
+        telem.outcome = IceOutcome::Connected;
+        map.insert(remote, telem);
+        finalize_failed_telemetry(&mut map, remote);
+        assert_eq!(
+            map.get(&remote).map(|t| t.outcome),
+            Some(IceOutcome::Connected)
+        );
+    }
+
+    /// A thread that exits before recording anything still counts as a `Failed`
+    /// attempt (an entry is created).
+    #[test]
+    fn finalize_records_failed_when_absent() {
+        let remote = peer_id(3);
+        let mut map = HashMap::new();
+        finalize_failed_telemetry(&mut map, remote);
+        assert_eq!(
+            map.get(&remote).map(|t| t.outcome),
+            Some(IceOutcome::Failed)
+        );
     }
 }
