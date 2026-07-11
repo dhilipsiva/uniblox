@@ -708,7 +708,14 @@ fn send_signal(out_tx: &Sender<PeerRequest<PeerSignal>>, remote: MbPeerId, data:
 fn encode_candidate(candidate: &Candidate) -> Result<String, String> {
     let init = IceCandidateJson {
         candidate: candidate.to_sdp_string(),
-        sdp_mid: Some("0".to_string()),
+        // Identify the m-line by INDEX only, never a hardcoded `sdpMid`. Our
+        // offer/answer always has exactly one BUNDLE'd data m-line at index 0,
+        // but str0m generates a RANDOM mid (e.g. `a=mid:SrN`) — a hardcoded
+        // `sdpMid:"0"` mismatches it, and a strict `addIceCandidate` (Chrome)
+        // REJECTS the candidate (`OperationError`), crashing browser matchbox.
+        // webrtc-rs is lenient (ignores the wrong mid), which is why the
+        // hermetic native tests never caught it; browsers are strict.
+        sdp_mid: None,
         sdp_mline_index: Some(0),
         username_fragment: None,
     };

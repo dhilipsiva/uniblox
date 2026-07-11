@@ -270,9 +270,27 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   channels BOTH ways through an in-process signaling server; soaked 4/4. The reviewer (fresh session)
   traced the drain invariant per mutation site and verified the wasm dep tree gained nothing.
 - **Scope/residuals:** `ws://` signaling only (no TLS yet); loopback UDP bind (real binds + STUN/TURN are
-  later Phase-2 items); no reconnect/ICE-restart (separate item); the BROWSER matchbox pairing is
-  environment-gated (WSL2 headless, ADR-0012) — desktop-browser residual recorded in TODO.
-- **Status:** Accepted (2026-07-10).
+  later Phase-2 items); no reconnect/ICE-restart (separate item).
+- **Status:** Accepted (2026-07-10). **BROWSER pairing VERIFIED (2026-07-11) — and it caught a real bug.**
+  A runnable peer (`crates/transport/examples/str0m_browser_demo.rs`) joined the `uniblox-demo` room with
+  the wasm demo in a desktop-class Chromium on the Windows host (WSL2 `networkingMode=mirrored` — str0m's
+  `127.0.0.1` host candidate is reachable from the browser; str0m learns the browser via peer-reflexive
+  discovery, so it needs nothing from the browser's mDNS candidates). Proven BOTH role directions
+  (str0m offers / str0m answers), all four: browser `[STATE]`+`[EVENT]` from str0m, str0m `[STATE]`+`[EVENT]`
+  from the browser, no console errors.
+  - **The bug (invisible to the hermetic tests):** `encode_candidate` hardcoded `sdpMid:"0"`, but str0m
+    generates a RANDOM m-line mid (captured live: `a=mid:SrN`). Chrome validates the candidate's `sdpMid`
+    against the actual m-lines, rejects the mismatch (`OperationError`), and matchbox-wasm `.unwrap()`s that
+    into a PANIC that breaks the browser peer's message loop (it connected only intermittently, via the
+    SDP-embedded candidate). **webrtc-rs is LENIENT** (ignores the wrong mid, uses `sdpMLineIndex`), so the
+    str0m↔native-matchbox hermetic tests passed while the browser crashed — the exact "browsers are stricter
+    than the native impl you tested against" gap this verification exists to find.
+  - **The fix:** identify the m-line by INDEX only — `sdpMid: None, sdpMLineIndex: Some(0)`. The offer/answer
+    always has exactly ONE BUNDLE'd data m-line at index 0 (DataChannels-only; both channels share one SCTP
+    m-line), so index-0 is unambiguous for both roles, and both Chrome and webrtc-rs accept it. Hermetic
+    interop + TURN suites stay green; fresh reviewer verdict MERGE.
+  - WSL2-HEADLESS gathering limitation (ADR-0012) still holds for automated CI; this run used the desktop
+    Browser pane.
 
 ## ADR-0016 — ICE policy: STUN-only free tier, coturn TURN as the Mode-3 paid feature
 - **Context:** the buildspec's connectivity economics — STUN-only P2P fails for an estimated ~15–25% of

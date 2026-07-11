@@ -72,6 +72,11 @@ peer (ADR-0015) + ICE policy tiers with the TURN relay proof (ADR-0016).
   semantics (reliability/ordering/retransmit) are parameterized in one `CHANNEL_SPECS` source of truth that
   BOTH stacks derive from, locked by config tests (cross-stack parity by construction). Residuals:
   browser pairing (desktop-browser, ADR-0012), TLS signaling, non-loopback bind, reconnect (later items).
+  **BROWSER pairing VERIFIED 2026-07-11** (`examples/str0m_browser_demo.rs` + the wasm demo in a
+  desktop Chromium; both role directions, all four channel/direction combos) — and it caught a real bug the
+  hermetic tests couldn't: `encode_candidate` hardcoded `sdpMid:"0"` but str0m emits a random mid, which
+  Chrome rejects (`OperationError`) and matchbox-wasm panics on; webrtc-rs was lenient. Fixed by identifying
+  the m-line by index only (`sdpMid:None, sdpMLineIndex:0` — single BUNDLE'd data m-line). Reviewer: MERGE.
 - **STUN/TURN policy + relay proof** (ADR-0016) — `IceConfig` tiers (free = STUN-only default; Mode 3 =
   STUN+TURN with per-session paid credentials, carried never minted) + `Transport::connect_with_ice`.
   Hermetic coturn 4.13 (flake-provided) tests: relay-only webrtc-rs peers exchange a payload through the

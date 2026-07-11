@@ -150,7 +150,6 @@ peers and lives in Phase 2's telemetry bullet.
 
 ### PHASE 2 — Transport hardening [MIXED]
 **Goal:** production-grade transport across browser and native/server.
-- Verify str0m ↔ BROWSER matchbox on a desktop browser (environment-gated like the Phase-1 browser residuals — ADR-0012): the wasm demo tab + a `Str0mPeer` (ADR-0015) in the same room. [LOW] *Acceptance:* a native str0m peer exchanges data with a browser matchbox peer on both channels, with matching channel semantics (unreliable/unordered state, reliable/ordered events) confirmed on both.
 - Measure the STUN-only failure rate and real-network RTT/jitter — fleet metrics (§"Measurement gaps"); need peers behind real NATs (the loopback RTT baseline is not a sizing input for Phase-3 interpolation buffers). [LOW] *Acceptance:* telemetry reports the STUN-only connection-success fraction and per-peer RTT/jitter distributions once real sessions run. (Production TURN deployment + per-session credential minting are Phase-9 bullets; the transport side — `IceConfig`/`connect_with_ice`, ADR-0016 — is ready for them.)
 - Reconnect / ICE-restart handling. [MIXED]
 

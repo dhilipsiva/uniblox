@@ -14,14 +14,17 @@ entries) for offline tests; proven by a hermetic native↔native two-peer test.
 peer speaking matchbox's signaling protocol (via `matchbox_protocol` +
 blocking tungstenite) with one connection thread per remote peer; interop
 proven hermetically str0m↔native-matchbox (both role directions) and
-str0m↔str0m, both channels, both ways (`tests/str0m_interop.rs`).
+str0m↔str0m, both channels, both ways (`tests/str0m_interop.rs`), and
+**VERIFIED against a real desktop BROWSER** (2026-07-11,
+`examples/str0m_browser_demo.rs` + the wasm demo, both roles) — that run
+caught the `sdpMid` bug below.
 **`IceConfig` (ADR-0016)**: `stun_only()` free tier / `with_turn(urls, user,
 credential)` Mode-3 paid tier + `Transport::connect_with_ice`; the TURN relay
 path is proven hermetically against a flake-provided coturn
 (`tests/turn_relay.rs` — relay-only webrtc-rs peers, credential negative,
-matchbox pass-through). Residuals: browser pairing (desktop-browser,
-ADR-0012), TLS signaling, non-loopback bind, reconnect/ICE-restart (later
-Phase-2 items); per-session TURN credential issuance is Phase 6.
+matchbox pass-through). Residuals: TLS signaling, non-loopback bind,
+reconnect/ICE-restart (later Phase-2 items); per-session TURN credential
+issuance is Phase 6.
 
 ## Crate-local invariants
 - **WebRTC DataChannels only — no media, no SFU, anywhere.**
@@ -44,6 +47,14 @@ Phase-2 items); per-session TURN credential issuance is Phase 6.
 - **Trickle candidates AFTER the offer/answer** — native matchbox drops
   out-of-phase candidates (its handshake loops ignore them); a pre-offer
   trickle "works" in tests only via peer-reflexive discovery.
+- **Trickled ICE candidates identify the m-line by INDEX, not a hardcoded
+  `sdpMid`** (`encode_candidate`): str0m emits a RANDOM mid (`a=mid:SrN`), so a
+  hardcoded `sdpMid:"0"` mismatches it and strict browsers (Chrome) REJECT the
+  candidate → matchbox-wasm panics. webrtc-rs is lenient (hid it from the
+  hermetic tests). We always have one BUNDLE'd data m-line, so
+  `sdpMid:None, sdpMLineIndex:Some(0)` is correct for both roles and both
+  stacks. **Lesson: browsers are stricter than webrtc-rs — verify real-browser
+  interop, don't trust native-matchbox-only tests.**
 - **ICE policy is tier data** (`IceConfig`, ADR-0016): free = STUN-only,
   Mode 3 = STUN+TURN with per-session credentials carried (never minted) by
   the transport. The hermetic coturn tests need `--allow-loopback-peers` —
