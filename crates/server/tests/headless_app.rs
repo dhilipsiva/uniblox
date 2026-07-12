@@ -104,6 +104,25 @@ impl Client {
             }
         }
 
+        // Anti-entropy resync sends (ADR-0024), mirroring the server's net_pump.
+        // Only drain_resync_requests fires here (the client received the server's
+        // Digest and asks for the fix); collect_resync / drain_resync_responses are
+        // empty + inert (this client owns nothing) — sent for symmetry with a real
+        // client pump, which must adopt the same three sends. Receive needs nothing
+        // new: recv_events → apply_events already applies the incoming Digest +
+        // ResyncSpawn.
+        let mut resync: Vec<(PeerId, Box<[u8]>)> = self.repl.drain_resync_requests();
+        resync.extend(self.repl.drain_resync_responses(&mut self.world));
+        resync.extend(self.repl.collect_resync(&mut self.world));
+        for (target, bytes) in resync {
+            if let Some(peer) = connected
+                .iter()
+                .find(|p| PeerId::from_uuid_bytes(*p.0.as_bytes()) == target)
+            {
+                let _ = self.transport.send_event(*peer, bytes);
+            }
+        }
+
         // Send our OWNED entities' state (Mode-2-shaped) to each tracked peer.
         // A client that owns nothing yields empty outboxes — transparent to the
         // Mode-3 receive-only tests; drives the server's ack-routing in return.
@@ -137,6 +156,20 @@ impl Client {
             .collect();
         found.sort_by_key(|(idx, _)| *idx);
         found.into_iter().map(|(_, p)| p).collect()
+    }
+
+    /// The single server-owned proxy Entity (panics if not exactly one) — for
+    /// injecting a divergence directly into the proxy's `Position`.
+    fn server_proxy_entity(&mut self, server_id: PeerId) -> Entity {
+        let found: Vec<Entity> = self
+            .world
+            .query::<(Entity, &Owner)>()
+            .iter(&self.world)
+            .filter(|(_, o)| o.0 == server_id)
+            .map(|(e, _)| e)
+            .collect();
+        assert_eq!(found.len(), 1, "expected exactly one server-owned proxy");
+        found[0]
     }
 }
 
@@ -527,4 +560,102 @@ async fn two_focused_clients_see_disjoint_sets() {
         s1.is_disjoint(&s2),
         "per-client foci must be disjoint: {s1:?} vs {s2:?}"
     );
+}
+
+/// Anti-entropy resync heals an injected desync over the REAL pump (ADR-0024):
+/// a stationary server entity is confirmed+quiet (so the delta stream is silent
+/// and the server's Digest carries a state-hash), then the client's proxy value
+/// is CORRUPTED — only the digest → request → ResyncSpawn round can restore it.
+/// The over-transport lift of the two_world R6-5 hash-mismatch unit test.
+#[tokio::test(flavor = "multi_thread")]
+async fn resync_heals_injected_desync_over_pump() {
+    let room = start_signaling();
+    let (mut app, server_id) = boot_server(&room, 0).await;
+    engine_core::spawn_owned(
+        app.world_mut(),
+        server_id,
+        Position { x: 5.0, y: 5.0 },
+        Velocity { x: 0.0, y: 0.0 },
+    );
+    let mut client = Client::connect(&room).await;
+
+    // Phase 1: converge to the (single) stationary proxy.
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    loop {
+        app.update();
+        client.pump();
+        if client.server_proxies(server_id).len() == 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "client never converged"
+        );
+        tokio::time::sleep(POLL).await;
+    }
+
+    // Phase 2: SETTLE TO QUIET (load-bearing). The value must be confirmed (client
+    // acked) + unchanged so (a) the delta stream is silent — it can't mask the
+    // injected divergence — and (b) the server's Digest carries a state-hash (a
+    // pure value divergence is invisible without one). Settle FIRST (let the ack
+    // land + the server confirm), THEN measure quiescence over a fresh window —
+    // capturing the baseline POST-settle, not right after converge when the value
+    // may still be unconfirmed (auditor N1).
+    let settle_end = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < settle_end {
+        app.update();
+        client.pump();
+        tokio::time::sleep(POLL).await;
+    }
+    let recv_baseline = client.received_state_msgs;
+    let observe_end = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < observe_end {
+        app.update();
+        client.pump();
+        tokio::time::sleep(POLL).await;
+    }
+    assert!(
+        client.received_state_msgs - recv_baseline <= 2,
+        "the server must be confirmed-quiet before the injection (got {} state msgs)",
+        client.received_state_msgs - recv_baseline
+    );
+
+    // Phase 3: INJECT a silent divergence into the client's Remote proxy — the
+    // delta stream cannot heal it (server quiet; a client never sends state for a
+    // Remote proxy), so RESYNC is the ONLY possible heal path (non-vacuous).
+    let proxy = client.server_proxy_entity(server_id);
+    client.world.get_mut::<Position>(proxy).unwrap().x = 999.0;
+    assert!(
+        (client.server_proxies(server_id)[0].x - 999.0).abs() < 0.01,
+        "divergence injected"
+    );
+
+    // Phase 4: HEAL — pump until the digest → request → ResyncSpawn round restores
+    // the authoritative value.
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    loop {
+        app.update();
+        client.pump();
+        if (client.server_proxies(server_id)[0].x - 5.0).abs() < 0.1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "resync never healed the injected desync (proxy x = {})",
+            client.server_proxies(server_id)[0].x
+        );
+        tokio::time::sleep(POLL).await;
+    }
+
+    // Phase 5: STABILITY — the heal holds (idempotent; no re-divergence).
+    let stable_end = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < stable_end {
+        app.update();
+        client.pump();
+        assert!(
+            (client.server_proxies(server_id)[0].x - 5.0).abs() < 0.1,
+            "the healed value must hold"
+        );
+        tokio::time::sleep(POLL).await;
+    }
 }
