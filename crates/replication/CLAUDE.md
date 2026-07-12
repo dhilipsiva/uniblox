@@ -69,12 +69,18 @@ its own proxy + emits `OwnershipCommit` to `claimants ∪ {prior owner}` (prior 
 authority) + `ClaimRejected` to losers (AND to any un-arbitrable claim — never a silent black-hole). All owner
 changes (transfer, commit, coordinator self-apply) share ONE strict-`>` gate `apply_ranked_owner_change`; the
 commit arm has NO own-authority guard (a commit is meant to demote the current owner). `has_pending_claim` is a
-white-box accessor. Phase 3 still owns: message splitting, per-entry ack granularity, and the DEFERRED
-cross-owner hardening the arbitration left open (auditor carry-forwards): **push/pull mutual exclusion** (an
-entity must use `transfer_ownership` OR the coordinator pull, not both concurrently — they mint the rank
-independently and collide at equal seq) and **consistent-membership consensus** (the `net_pump` Disconnected
-wiring — exactly-one-coordinator + Stage B's exactly-once reassignment need an agreed `peers` view; the seq
-tiebreak converges a one-shot migration but not a persistent split).
+white-box accessor. **ADR-0028 — pump-wired + cross-owner carry-forwards CLOSED:** the handshake is now driven
+by `server::net_pump` (`drain_commits` every frame; `reassign_orphans` on the Disconnected arm). **(a)
+Sole-minter** — the push/pull double-mint collision is closed by routing the PUSH through the coordinator:
+`request_transfer(world, entity, to)` sends a `TransferRequest` (WIRE 6→7) to the coordinator (flips no Owner,
+mints no local rank); `drain_commits` is UNIFIED — candidates = `claimants ∪ {live transfer target}`, ONE
+coordinator-minted commit, so a concurrent push+pull can't collide at equal seq. `transfer_ownership` stays as
+the Mode-1/coordinator/mechanics primitive — the sole-minter is a DOCUMENTED discipline (non-coordinators use
+`request_transfer`), not a hard guard. **(b) Membership** — `poll_peers` is the AUTHORITATIVE membership signal;
+`apply_events` NEVER mutates `peers` (an earlier observe-traffic belt was removed — it could resurrect a
+departed peer as a ghost that `reassign_orphans` might elect as a dead owner); the deterministic `coordinator()`
++ seq gate + resync converge a transient split once views reconcile. Full partition consensus is out of scope
+(casual/co-op envelope). Phase 3 still owns: message splitting, per-entry ack granularity.
 
 ## Crate-local invariants
 - **Single-ownership per entity ⇒ last-write-wins, NO CRDT.** One authority per

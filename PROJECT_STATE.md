@@ -58,8 +58,16 @@ single-authority INTERACTION rule (R1 — each effect decided by the OWNER of th
 `resolve_interactions` system in engine-core wired into the server `FixedUpdate`; `interaction_decider=min`
 tiebreaks a shared outcome; reads the other's replicated `Position`, never re-simulates; Mode 3 owning all
 dissolves the gap frame-perfectly, no fork). engine-core 12 + two_world 107 green; netcode-audited → MERGE.
-Next Phase-3 threads: the ownership push/pull + membership hardening + the pump wiring; message splitting;
-per-entry ack granularity.
+**ADR-0028 — handshake WIRED into the pump + ADR-0025 carry-forwards CLOSED:** `net_pump` now drives
+`drain_commits` (coordinator arbitration) every frame + `reassign_orphans` on disconnect. (a) **Sole-minter** —
+a non-coordinator PUSH routes through the coordinator (`request_transfer`→`TransferRequest`, WIRE 6→7);
+`drain_commits` unifies claims+requests (candidates = claimants ∪ live transfer target) into ONE
+coordinator-minted commit, so a concurrent push+pull can't double-mint (`transfer_ownership` stays the
+Mode-1/coordinator/mechanics primitive — the discipline is documented, not hard-guarded). (b) **Membership** —
+`poll_peers` is the sole authority (`apply_events` never mutates `peers`; an audit caught + removed a
+ghost-peer belt); deterministic `coordinator()` + seq gate + resync converge a split (full partition consensus
+out of scope). two_world 110 + headless 8 green; netcode-audited → MAJOR ghost belt removed. Next Phase-3
+threads: message splitting; per-entry ack granularity; the Phase-5 Mode-2 coordinator peer SERVICE.
 
 ## Done
 - **Cargo workspace** — virtual manifest, 9 crates under `crates/*` (glob members),

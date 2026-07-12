@@ -11,10 +11,15 @@ at 1/64 s — NOT the `bevy` umbrella; `MinimalPlugins` lives in `bevy_internal`
 FixedUpdate = `sync_sim_dt` → `count_tick` → `advance_tick` → `apply_input` → `simulate`
 (chained; `SimDt` fed from the fixed clock at the app boundary), Update = exclusive
 `net_pump` (NonSend `Net`; receive every frame, emit acks (`drain_acks`) + resync
-requests/responses (`drain_resync_requests`/`drain_resync_responses`) every frame,
-collect+send at `NET_INTERVAL` 50 ms via a virtual-clock accumulator, and resync
-DIGESTS (`collect_resync`) on a SLOW separate `RESYNC_INTERVAL` 500 ms accumulator —
-ADR-0024; the `send_directed` helper routes every directed batch).
+requests/responses (`drain_resync_requests`/`drain_resync_responses`) + ownership
+COMMITS (`drain_commits`, ADR-0028 — the coordinator arbitrates queued claims /
+transfer-requests) every frame, collect+send at `NET_INTERVAL` 50 ms via a
+virtual-clock accumulator, and resync DIGESTS (`collect_resync`) on a SLOW separate
+`RESYNC_INTERVAL` 500 ms accumulator — ADR-0024; the `send_directed` helper routes
+every directed batch). Connect → `on_peer_connected`; **Disconnect → `untrack_peer`
++ `reassign_orphans` (ADR-0028) so a departed owner's entities re-tag to the
+surviving lowest peer** + avatar despawn/`PendingInputs` prune (ADR-0023 c).
+`poll_peers` is the AUTHORITATIVE membership signal (Connected/Disconnected).
 Mode 3 is expressed purely as data: the server spawns/owns everything. Exit via
 `Messages<AppExit>` (0.19 renamed Events→Messages). M3/M4 tests drive the real App;
 demo entities must keep nonzero vel.x (test predicates observe replay-ordered proxies).
