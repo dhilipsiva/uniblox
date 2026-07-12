@@ -1000,3 +1000,47 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   MERGE (both cardinal properties hold structurally; single-ownership/no-CRDT preserved; Mode-3 dissolution
   genuine).
 - **Status:** Accepted (2026-07-13).
+
+## ADR-0028 — Wire the ownership handshake into net_pump + close the ADR-0025 cross-owner carry-forwards
+- **Context:** ADR-0025 built the claim/commit/reject arbitration primitive, but the pump never CALLED it and
+  its auditor flagged two soundness gaps. Exploration found connect/disconnect ALREADY wired into
+  `server::net_pump` via `poll_peers` — unwired were `drain_commits` (never called) and `reassign_orphans`
+  (never on disconnect). User decisions (via AskUserQuestion): **(a) coordinator SOLE-MINTER**, **(b) pragmatic
+  membership reconcile + document**. Three stages.
+- **Stage 1 — pump wiring (Accepted 2026-07-13):** `net_pump` now calls `drain_commits` every frame (routed via
+  `send_directed`) and `reassign_orphans(world, departed)` in the Disconnected arm after `untrack_peer`. The
+  `Client` test harness pumps `drain_commits` + gained `claim`/`owner_of`/`close`. Real-transport headless proof:
+  `pump_drives_claim_end_to_end` (a claim converges to the sole claimant through the wired pump — robust to
+  random PeerIds), `pump_reassigns_departed_owners_entity` (a departing owner's entity is reassigned to the
+  survivor, not frozen).
+- **Stage 2 — (a) coordinator SOLE-MINTER (Accepted 2026-07-13):** the push/pull double-mint collision (a
+  non-coordinator's direct `transfer_ownership` mints `{r+1, giver}` racing the coordinator's commit
+  `{r+1, coordinator}` → the `(seq, coordinator)` tiebreak lets the higher-id push override a granted claim) is
+  closed by routing the PUSH through the coordinator. `NetEvent::TransferRequest{id,to}` (WIRE 6→7);
+  `request_transfer(world, entity, to)` (owner→coordinator; self-coordinator records locally; flips NO Owner,
+  mints NO local rank); `drain_commits` UNIFIED — per entity, candidates = `claimants ∪ {transfer target}`,
+  winner = `elect_owner`, ONE coordinator-minted commit — so a concurrent push+pull serializes into a single
+  monotonic rank (proven `concurrent_push_and_pull_converge_to_one_owner`: one owner, rank `{1, coord}`). The
+  transfer target must be a LIVE member to win (never commit to a ghost). `transfer_ownership` is UNCHANGED as
+  the Mode-1 / coordinator / mechanics primitive — the sole-minter is a DOCUMENTED discipline (a non-coordinator
+  must use `request_transfer`), NOT structurally guarded (a hard guard would break the replication-mechanics
+  tests that use `transfer_ownership` as a low-level primitive; callers carry the invariant).
+- **Stage 3 — (b) membership reconcile (Accepted 2026-07-13):** `poll_peers` (Connected/Disconnected) is the
+  AUTHORITATIVE membership signal and already reconciles on partition-heal, so the deterministic
+  `coordinator() = elect_owner(peers ∪ local)` + the seq gate + resync converge a transient split to one
+  coordinator once views agree (proven `membership_reconciles_to_the_lower_coordinator`). **Auditor-driven
+  reversal:** an initial "observe-traffic belt" (track `from` in `apply_events`) was REMOVED — it could
+  resurrect a departed peer (a straggler event after a one-shot `Disconnected`) as a permanent ghost in
+  `peers`, which `reassign_orphans` could then elect as a DEAD owner (re-opening the E4 orphan) or wedge
+  `coordinator()`. `apply_events` deliberately never mutates `peers`; membership changes only through the pump's
+  `poll_peers`. A full network-partition CONSENSUS protocol is OUT OF SCOPE for the casual/co-op envelope.
+- **Consequences / deferred (accepted, documented):** the sole-minter is a discipline, not a structural guard
+  (Mode-2 non-coordinator `transfer_ownership` misuse would reopen the collision); a `TransferRequest` misrouted
+  to a non-coordinator (a coordinator-change race) is dropped without a nack (the owner re-requests); a
+  `to == current owner` request is a harmless self-naming commit. Evidence: two_world 110 green (Groups SM + MC)
+  + headless 8 green (WIRE-claim + WIRE-reassign over real transport) + protocol WIRE 7; clippy `-D warnings`
+  native + wasm32; fmt clean; full workspace green. netcode-audited → the MAJOR ghost-peer belt found and
+  REMOVED, target-liveness validated, the sole-minter discipline documented.
+- **Status:** Accepted (2026-07-13). The ADR-0025 cross-owner carry-forwards are CLOSED (push/pull exclusion via
+  sole-minter; membership via `poll_peers` + deterministic coordinator). The Phase-5 Mode-2 coordinator peer
+  SERVICE (a hosted coordinator) builds on this wiring.

@@ -11,6 +11,9 @@
 use serde::{Deserialize, Serialize};
 
 /// Wire-format version, checked on decode. Bump on ANY message-shape change.
+/// v7 (ADR-0028 / Phase 3): coordinator sole-minter — `NetEvent` gains
+/// `TransferRequest` (a non-coordinator owner routes its PUSH handoff through the
+/// coordinator so the coordinator is the sole `OwnerSeq` minter in Mode 2).
 /// v6 (ADR-0025 A-handshake / Phase 3): the coordinator PULL handshake —
 /// `NetEvent` gains `ClaimOwnership`, `OwnershipCommit`, and `ClaimRejected`.
 /// v5 (ADR-0025 A-kernel / Phase 3): double-ownership arbitration by coordinator
@@ -23,7 +26,7 @@ use serde::{Deserialize, Serialize};
 /// (the owner's privileged create-or-correct that heals a frozen wrong-owner /
 /// orphaned proxy). v3 (ADR-0022): `StateMsg` gains `tick` + `last_input`. v2
 /// added `NetEvent::Ack`. Pre-release hard cutover.
-pub const WIRE_VERSION: u8 = 6;
+pub const WIRE_VERSION: u8 = 7;
 
 /// Fixed-point quantization scale: world units × 1024.
 ///
@@ -270,6 +273,13 @@ pub enum NetEvent {
     /// A-handshake). No state change (the claimant never pre-flipped); the pump
     /// may re-claim. Reliable, directed.
     ClaimRejected { id: NetEntityId },
+    /// A non-coordinator owner's PUSH handoff, ROUTED through the coordinator
+    /// (ADR-0028 sole-minter): "I own `id` and want to hand it to `to`." Directed
+    /// to the coordinator, which mints the resulting `OwnershipCommit` — so the
+    /// coordinator is the SOLE `OwnerSeq` minter in Mode 2 and a push can never
+    /// collide with a concurrent pull at equal seq. Flips no `Owner` at the sender
+    /// (it waits for the commit). Reliable, directed.
+    TransferRequest { id: NetEntityId, to: PeerId },
 }
 
 /// Wire encode/decode errors. Decode failures are expected runtime events
@@ -455,6 +465,7 @@ mod tests {
                 },
             },
             NetEvent::ClaimRejected { id },
+            NetEvent::TransferRequest { id, to: PeerId(3) },
         ] {
             let msg = EventMsg {
                 version: WIRE_VERSION,

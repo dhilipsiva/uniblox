@@ -301,6 +301,12 @@ pub struct Replication {
     /// while WE are the coordinator (lowest live peer); drained by
     /// [`drain_commits`] into `OwnershipCommit`/`ClaimRejected`.
     pending_claims: HashMap<NetEntityId, HashSet<PeerId>>,
+    /// COORDINATOR (ADR-0028 sole-minter): per entity id, a non-coordinator owner's
+    /// requested PUSH target (`TransferRequest`), awaiting arbitration alongside
+    /// claims. Drained by [`drain_commits`] — the transfer target joins the
+    /// candidate set so the coordinator mints the SINGLE commit (no push/pull
+    /// double-mint). Cleared in `untrack_peer`.
+    pending_transfer_requests: HashMap<NetEntityId, PeerId>,
     /// The tracked peer set (added on connect, dropped on departure).
     peers: HashSet<PeerId>,
 }
@@ -323,6 +329,7 @@ impl Replication {
             resync_requests: HashMap::new(),
             resync_wanted: HashMap::new(),
             pending_claims: HashMap::new(),
+            pending_transfer_requests: HashMap::new(),
             peers: HashSet::new(),
         }
     }
@@ -840,6 +847,16 @@ impl Replication {
             log::warn!("ignoring unexpected signature on event from {from:?}");
         }
 
+        // NOTE (ADR-0028 b): membership is reconciled by the pump's `poll_peers`
+        // Connected/Disconnected signal — the AUTHORITATIVE liveness source — NOT
+        // by observing received traffic. `apply_events` deliberately does NOT
+        // `track_peer(from)`: a straggler event delivered after a peer's
+        // `Disconnected` was processed would resurrect it as a permanent ghost in
+        // `peers` (untrack only fires on a one-shot Disconnected), which could make
+        // `reassign_orphans` elect a DEAD owner or wedge `coordinator()` (auditor).
+        // On a partition-heal `poll_peers` re-fires Connected → track_peer → the
+        // deterministic `coordinator()` + the seq gate + resync converge.
+
         match msg.event {
             NetEvent::Spawn { id, pos, vel } => {
                 // Only the minting peer may introduce ids in its namespace.
@@ -1101,6 +1118,18 @@ impl Replication {
                 // Our claim did not win (ADR-0025 A-handshake). Nothing to undo — a
                 // claimant never pre-flips its `Owner`. The pump may re-claim.
                 log::debug!("ownership claim for {id:?} rejected");
+            }
+            NetEvent::TransferRequest { id, to } => {
+                // COORDINATOR side (ADR-0028 sole-minter): a non-coordinator owner
+                // routed its PUSH handoff here so WE mint the commit. Guard we are
+                // the coordinator (else drop — a misrouted request); record the
+                // requested target, arbitrated by `drain_commits` alongside claims.
+                let local = world.resource::<LocalPeer>().0;
+                if self.coordinator(local) != local {
+                    log::warn!("transfer-request for {id:?} reached non-coordinator — dropped");
+                    return;
+                }
+                self.pending_transfer_requests.insert(id, to);
             }
         }
     }
@@ -1462,6 +1491,9 @@ impl Replication {
             set.remove(&peer);
         }
         self.pending_claims.retain(|_, set| !set.is_empty());
+        // Drop any pending transfer-request whose TARGET departed (ADR-0028) — a
+        // stale push to a peer that has left must not commit.
+        self.pending_transfer_requests.retain(|_, &mut t| t != peer);
     }
 
     /// HOST-MIGRATION reassignment (ADR-0025): when `departed` drops, every
@@ -1516,11 +1548,22 @@ impl Replication {
         orphans
     }
 
-    /// Initiate an A→B ownership handoff for an entity WE currently own.
-    /// Queues the reliable `OwnershipTransfer` and flips the local `Owner` in
-    /// the same tick — from this instant we stop computing and stop
-    /// collecting it, so no double-authority window can exist (the ≤½-RTT
-    /// nobody-simulates freeze is the safe direction).
+    /// Initiate an A→B ownership handoff for an entity WE currently own — the
+    /// DIRECT local-mint primitive. Queues the reliable `OwnershipTransfer` and
+    /// flips the local `Owner` in the same tick — from this instant we stop
+    /// computing and collecting it, so no double-authority window can exist (the
+    /// ≤½-RTT nobody-simulates freeze is the safe direction).
+    ///
+    /// SOLE-MINTER DISCIPLINE (ADR-0028, load-bearing but NOT structurally
+    /// enforced): this mints an `OwnerSeq` LOCALLY (`coordinator: local`), so in
+    /// Mode 2 it MUST be called only when `local` is the coordinator (or in Mode 1,
+    /// where `local` is the sole peer). A NON-coordinator using it in Mode 2
+    /// concurrently with a coordinator commit reopens the equal-seq push/pull
+    /// collision — a Mode-2 non-coordinator owner MUST use [`request_transfer`]
+    /// instead (which routes through the coordinator, the sole minter). It is not
+    /// guarded because it is also the low-level primitive the coordinator's own
+    /// handoff and the replication-mechanics tests build on (a hard guard would
+    /// break those); callers carry the invariant.
     pub fn transfer_ownership(
         &mut self,
         world: &mut World,
@@ -1626,6 +1669,42 @@ impl Replication {
         }
     }
 
+    /// REQUEST a PUSH handoff of an entity WE own, ROUTED through the coordinator
+    /// (ADR-0028 sole-minter) — the Mode-2 push. Unlike the direct
+    /// [`transfer_ownership`] (Mode 1 / the coordinator's own handoff / mechanics),
+    /// a NON-coordinator owner uses this so the coordinator is the SOLE `OwnerSeq`
+    /// minter and a concurrent push+pull can never double-mint at equal seq.
+    /// Returns `(coordinator, TransferRequest bytes)` to `send_event`; `None` if the
+    /// entity is unmapped, is NOT ours, OR we ARE the coordinator (then we record it
+    /// directly — `drain_commits` mints it). Flips NO `Owner` — the owner waits for
+    /// the commit (the no-authority-pre-commit direction, like `claim_ownership`).
+    pub fn request_transfer(
+        &mut self,
+        world: &mut World,
+        entity: Entity,
+        to: PeerId,
+    ) -> Option<(PeerId, Box<[u8]>)> {
+        let local = world.resource::<LocalPeer>().0;
+        // Only the current owner may hand an entity off.
+        let owner = world.get::<Owner>(entity).map(|o| o.0)?;
+        if authority_of(owner, local) != Authority::Local {
+            return None;
+        }
+        let id = self.map.by_entity.get(&entity).map(|r| r.id)?;
+        let coordinator = self.coordinator(local);
+        if coordinator == local {
+            self.pending_transfer_requests.insert(id, to);
+            return None;
+        }
+        match encode_event(&event(NetEvent::TransferRequest { id, to })) {
+            Ok(bytes) => Some((coordinator, bytes.into_boxed_slice())),
+            Err(err) => {
+                log::error!("transfer-request encode for {id:?} failed: {err}");
+                None
+            }
+        }
+    }
+
     /// COORDINATOR: arbitrate every pending claim (ADR-0025 A-handshake). For each
     /// claimed entity WE track: the winner is the LOWEST-id claimant
     /// (`elect_owner`); mint `{prev.seq + 1, coordinator: local}`, apply the commit
@@ -1642,30 +1721,47 @@ impl Replication {
     /// for a third-party-owned entity, recipients collapse to `claimants ∪ prior
     /// owner` and any other observer heals via resync — the designed backstop.
     ///
-    /// CAVEAT (deferred cross-owner rules): this is safe only when an entity uses
-    /// EITHER owner-push (`transfer_ownership`) OR coordinator-pull (claim/commit),
-    /// not both concurrently — the two mint the rank independently and can collide
-    /// at equal `seq`. And exactly-one-coordinator relies on a CONSISTENT `peers`
-    /// view; a persistent split (two peers each believing they are the coordinator)
-    /// is NOT bounded by the equal-seq tiebreak. Both close with the deferred
-    /// `net_pump` Disconnected / membership-consensus wiring; see `DECISIONS.md`.
+    /// SOLE-MINTER (ADR-0028): the coordinator arbitrates BOTH pull-claims AND
+    /// push [`NetEvent::TransferRequest`]s in one pass, so it is the ONLY peer that
+    /// mints an `OwnerSeq` in Mode 2 — a concurrent push+pull on one entity is
+    /// serialized into a SINGLE commit (candidates = `claimants ∪ {transfer
+    /// target}`, winner = `elect_owner`), and the old push/pull equal-seq collision
+    /// cannot arise. (Exactly-one-coordinator still relies on a consistent `peers`
+    /// view; a transient split is bounded by the seq gate + resync and resolved once
+    /// views reconcile — ADR-0028 (b); direct `transfer_ownership` remains a Mode-1
+    /// / coordinator / mechanics primitive.)
     pub fn drain_commits(&mut self, world: &mut World) -> Vec<(PeerId, Box<[u8]>)> {
         let local = world.resource::<LocalPeer>().0;
         let am_coordinator = self.coordinator(local) == local;
-        let mut claims: Vec<(NetEntityId, Vec<PeerId>)> = std::mem::take(&mut self.pending_claims)
-            .into_iter()
-            .map(|(id, set)| {
-                let mut v: Vec<PeerId> = set.into_iter().collect();
-                v.sort();
-                (id, v)
-            })
-            .collect();
-        claims.sort_by_key(|(id, _)| *id);
+        let claims = std::mem::take(&mut self.pending_claims);
+        let requests = std::mem::take(&mut self.pending_transfer_requests);
+        // Every entity with a pending pull (claim) or push (transfer request),
+        // id-sorted for deterministic output.
+        let mut ids: Vec<NetEntityId> = claims.keys().chain(requests.keys()).copied().collect();
+        ids.sort();
+        ids.dedup();
         let mut out = Vec::new();
-        for (id, claimants) in claims {
+        for id in ids {
+            // Candidates = the claimants (pull) ∪ the requested push target. The
+            // push target joins the SAME election, so push+pull mint ONE commit.
+            let mut candidates: Vec<PeerId> = claims
+                .get(&id)
+                .map(|s| s.iter().copied().collect())
+                .unwrap_or_default();
+            if let Some(&target) = requests.get(&id) {
+                // Only a LIVE member may win a pushed handoff — never commit an
+                // entity to a peer we don't track (a bogus/stale target would
+                // freeze it at a non-member; auditor). Claimants are live by
+                // construction (they reached us on the reliable channel).
+                if self.peers.contains(&target) || target == local {
+                    candidates.push(target);
+                }
+            }
+            candidates.sort();
+            candidates.dedup();
             // Resolve what we need to arbitrate. If we are no longer the
             // coordinator, or don't track the entity / can't read its owner+rank,
-            // it is unarbitrable → reject every claimant (never a silent drop).
+            // it is unarbitrable → reject every candidate (never a silent drop).
             let arbitrable = if am_coordinator {
                 self.map.by_id.get(&id).copied().and_then(|e| {
                     let owner = world.get::<Owner>(e).map(|o| o.0)?;
@@ -1676,11 +1772,11 @@ impl Replication {
                 None
             };
             let Some((entity, current_owner, current_seq)) = arbitrable else {
-                push_rejects(&mut out, id, &claimants);
+                push_rejects(&mut out, id, &candidates);
                 continue;
             };
-            let Some(winner) = elect_owner(claimants.iter().copied()) else {
-                continue; // claimants non-empty by construction (unreachable)
+            let Some(winner) = elect_owner(candidates.iter().copied()) else {
+                continue; // candidates non-empty (id came from a claim or request)
             };
             let new_seq = OwnerSeq {
                 seq: current_seq.seq + 1,
@@ -1689,10 +1785,10 @@ impl Replication {
             // Apply the commit to our own proxy (advances the record + demotes us
             // if we were the owner). Same strict-rank gate as every owner change.
             self.apply_ranked_owner_change(world, entity, winner, new_seq);
-            // Recipients that must re-tag: the claimants + the demoting prior owner,
+            // Recipients that must re-tag: the candidates + the demoting prior owner,
             // plus any peer we ourselves send this entity to — minus us (applied
             // above). See the `known`-expansion caveat in the doc comment.
-            let mut recipients: HashSet<PeerId> = claimants.iter().copied().collect();
+            let mut recipients: HashSet<PeerId> = candidates.iter().copied().collect();
             recipients.insert(current_owner);
             for (peer, known_set) in &self.known {
                 if known_set.contains(&entity) {
@@ -1712,9 +1808,13 @@ impl Replication {
                     Err(err) => log::error!("commit encode to {peer:?} failed: {err}"),
                 }
             }
-            // Explicit rejection to every LOSING claimant (the commit re-tags their
+            // Explicit rejection to every LOSING candidate (the commit re-tags their
             // proxy; this is the required explicit claim-failed signal).
-            let losers: Vec<PeerId> = claimants.iter().copied().filter(|&c| c != winner).collect();
+            let losers: Vec<PeerId> = candidates
+                .iter()
+                .copied()
+                .filter(|&c| c != winner)
+                .collect();
             push_rejects(&mut out, id, &losers);
         }
         out
@@ -1724,6 +1824,12 @@ impl Replication {
     /// tests of the claim-routing guard (a claim to a non-coordinator records none).
     pub fn has_pending_claim(&self, id: NetEntityId) -> bool {
         self.pending_claims.contains_key(&id)
+    }
+
+    /// Whether we (as coordinator) hold a pending transfer-request for `id`
+    /// (ADR-0028) — white-box accessor for the sole-minter push tests.
+    pub fn has_pending_transfer_request(&self, id: NetEntityId) -> bool {
+        self.pending_transfer_requests.contains_key(&id)
     }
 
     /// A peer connected: track it (ADR-0021). Its entities are announced by the

@@ -153,6 +153,11 @@ pub fn net_pump(world: &mut World) {
                     PeerState::Disconnected => {
                         log::info!("[server] peer disconnected: {proto:?}");
                         net.repl.untrack_peer(proto);
+                        // Host-migration reassignment (ADR-0025 B): re-tag the
+                        // departed peer's entities to the lowest surviving peer so
+                        // no proxy is frozen at a dead owner. Pure-local + idempotent
+                        // (its doc mandates calling it right after untrack_peer).
+                        net.repl.reassign_orphans(world, proto);
                         // Reset the processed-input high-water (ADR-0022) so a
                         // reconnect with a fresh input-seq namespace isn't frozen
                         // by a stale marker (auditor F4).
@@ -213,6 +218,13 @@ pub fn net_pump(world: &mut World) {
     send_directed(&mut net.transport, reqs);
     let resp = net.repl.drain_resync_responses(world);
     send_directed(&mut net.transport, resp);
+
+    // Coordinator ownership arbitration (ADR-0025 A / ADR-0028): if WE are the
+    // coordinator (lowest live peer), arbitrate queued claims/transfer-requests
+    // into directed OwnershipCommit/ClaimRejected. No-op when not the coordinator
+    // or nothing is pending; drains every frame (reliable, rare).
+    let commits = net.repl.drain_commits(world);
+    send_directed(&mut net.transport, commits);
 
     // Send on the network tick only.
     net.acc += dt;
