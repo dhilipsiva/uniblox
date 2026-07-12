@@ -818,7 +818,22 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   F2 peer-sort + F3 hash-mismatch test + F4 idempotency assertion all actioned).
 - **Deviation from the design:** the `Digest` rides the RELIABLE channel (a `NetEvent` variant) rather than a
   new unreliable state-channel message — simpler (no channel disambiguation), the reliability cost is small
-  (periodic, compact, on a slow cadence). **Deferred:** production-pump wiring of `collect_resync` on a slow
-  virtual-clock cadence; per-entry ack granularity; E4/coordinator healing.
-- **Status:** Stages 1 + 2 ACCEPTED (2026-07-12) — the handoff-depth item is complete; the separate
-  anti-entropy-resync TODO item is largely absorbed (only the pump cadence + E4/coordinator remain).
+  (periodic, compact, on a slow cadence).
+- **Stage 3 — production-pump wiring (Accepted 2026-07-12):** `server::net_pump` now DRIVES resync. A free
+  `send_directed(transport, msgs)` (the extracted ack-routing loop) sends every directed batch; `drain_resync_
+  requests` + `drain_resync_responses` fire EVERY FRAME (prompt, one-shot — rate-limited upstream by the digest
+  cadence, next to `drain_acks`); `collect_resync` fires on a SLOW separate accumulator (`Net.resync_acc`,
+  `RESYNC_INTERVAL` 500 ms, decoupled from the 50 ms net tick, anti-burst-clamped like `net.acc`). The RECEIVE
+  side needed nothing (the `apply_events` Digest/ResyncRequest/ResyncSpawn arms already run in `recv_events`).
+  Evidence: `server/tests/headless_app.rs::resync_heals_injected_desync_over_pump` — a stationary server entity
+  is confirmed-quiet (delta stream silent + digest carries a hash — the load-bearing settle-to-quiet guard),
+  the client's Remote proxy is corrupted, and the digest→request→ResyncSpawn round restores it over real
+  hermetic WebRTC; resync is the ONLY heal path (verified: disabling the digest send HANGS the test), 3×
+  flake-clean; M3/M4/ack/focused transparent (drains empty when nothing diverges); full workspace green;
+  clippy `-D warnings` native (server is native-only) + wasm32 protocol/replication; fmt clean. netcode-audited
+  → MERGE (cadence sound, routing byte-faithful, heal non-vacuous; auditor N1 post-settle re-baseline actioned).
+  A real production CLIENT pump (future gameplay build) must adopt the same three resync sends the test Client
+  now carries. **Deferred:** per-entry ack granularity; E4/coordinator healing.
+- **Status:** Stages 1 + 2 + 3 ACCEPTED (2026-07-12) — handoff depth + anti-entropy resync are complete and
+  wired into the production pump; the separate anti-entropy-resync TODO item is absorbed (only E4/coordinator
+  healing remains, on the double-ownership item).

@@ -43,6 +43,13 @@ pub const TICK_HZ: f64 = 64.0;
 /// open-questions register — measured, not locked, in the Instrumentation item.
 pub const NET_INTERVAL: Duration = Duration::from_millis(50);
 
+/// The anti-entropy resync DIGEST interval (ADR-0024) — a SLOW background cadence
+/// (10× the net tick), decoupled from it. Bounds steady-state digest chatter; the
+/// heal latency of a silent divergence is ≈ one interval + ~1 RTT, which is fine
+/// for a repair the delta stream provably cannot make. Requests/responses fire
+/// promptly (every frame), rate-limited upstream by this cadence.
+pub const RESYNC_INTERVAL: Duration = Duration::from_millis(500);
+
 /// FixedUpdate tick counter — the 64 Hz evidence for tests and, later, the
 /// instrumentation table.
 #[derive(Resource, Default)]
@@ -63,12 +70,33 @@ pub struct Net {
     transport: Transport,
     repl: Replication,
     acc: Duration,
+    /// Virtual-clock accumulator for the SLOW resync digest cadence (ADR-0024),
+    /// separate from `acc` (the net tick).
+    resync_acc: Duration,
     /// Focused mode (ADR-0023 c): when `Some(r)`, each connecting client gets a
     /// server-owned avatar it controls and an AOI focused on it (enter radius
     /// `r`). `None` ⇒ the unbounded Mode-3 default (every client sees all).
     focus_radius: Option<f32>,
     /// Monotonic per-connection lane for placing avatars at disjoint positions.
     avatar_lane: u64,
+}
+
+/// Route a batch of DIRECTED events `(target protocol id, encoded bytes)` on the
+/// reliable channel: map each protocol id back to its transport peer and
+/// `send_event`. The shared send path for acks + resync (ADR-0024).
+fn send_directed(transport: &mut Transport, msgs: Vec<(PeerId, Box<[u8]>)>) {
+    if msgs.is_empty() {
+        return;
+    }
+    let connected: Vec<_> = transport.connected_peers().collect();
+    for (target, bytes) in msgs {
+        if let Some(peer) = connected
+            .iter()
+            .find(|p| PeerId::from_uuid_bytes(*p.0.as_bytes()) == target)
+        {
+            let _ = transport.send_event(*peer, bytes);
+        }
+    }
 }
 
 /// Feed engine-core's `SimDt` contract from the fixed clock. Inside
@@ -175,17 +203,16 @@ pub fn net_pump(world: &mut World) {
     // Emit acks for state we received (ADR-0020) so senders advance their delta
     // baselines. Directed back to each sender (map protocol id → transport peer).
     let acks = net.repl.drain_acks();
-    if !acks.is_empty() {
-        let connected: Vec<_> = net.transport.connected_peers().collect();
-        for (target, ack) in acks {
-            if let Some(peer) = connected
-                .iter()
-                .find(|p| PeerId::from_uuid_bytes(*p.0.as_bytes()) == target)
-            {
-                let _ = net.transport.send_event(*peer, ack);
-            }
-        }
-    }
+    send_directed(&mut net.transport, acks);
+
+    // Anti-entropy resync (ADR-0024), PROMPT (every frame — one-shot, already
+    // rate-limited upstream by the slow digest cadence): a divergence detected
+    // from a received digest requests the fix next frame; a received request is
+    // answered with a ResyncSpawn next frame. Empty (no-op) when nothing diverges.
+    let reqs = net.repl.drain_resync_requests();
+    send_directed(&mut net.transport, reqs);
+    let resp = net.repl.drain_resync_responses(world);
+    send_directed(&mut net.transport, resp);
 
     // Send on the network tick only.
     net.acc += dt;
@@ -229,6 +256,21 @@ pub fn net_pump(world: &mut World) {
                 let _ = net.transport.send_event(*peer, ev);
             }
         }
+    }
+
+    // Anti-entropy resync DIGEST on the SLOW cadence (ADR-0024), decoupled from
+    // the net tick. Each connected peer gets a per-peer summary of the entities
+    // it owns; the receiver detects a diverged proxy and pulls a fix (the prompt
+    // request/response above). `Time<Virtual>` clamps `dt` at 250 ms < 500 ms, so
+    // a stall fires at most one digest — the anti-burst clamp is belt-and-braces.
+    net.resync_acc += dt;
+    if net.resync_acc >= RESYNC_INTERVAL {
+        net.resync_acc -= RESYNC_INTERVAL;
+        if net.resync_acc >= RESYNC_INTERVAL {
+            net.resync_acc = Duration::ZERO;
+        }
+        let digests = net.repl.collect_resync(world);
+        send_directed(&mut net.transport, digests);
     }
 
     world.insert_non_send(net);
@@ -296,6 +338,7 @@ fn build_server_app_inner(
         transport,
         repl,
         acc: Duration::ZERO,
+        resync_acc: Duration::ZERO,
         focus_radius,
         avatar_lane: 0,
     });

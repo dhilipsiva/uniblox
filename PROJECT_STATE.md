@@ -24,11 +24,13 @@ hysteresis — two-radius band `set_aoi_hysteresis`, enter at `r_inner` / exit a
 preserved) + stage c (opt-in per-client avatar+focus hook — `build_server_app_focused`: a server-owned
 `ControlledBy` avatar per connection, AOI focused on it each net tick, disconnect despawns + prunes
 `PendingInputs`; a client sees only its focus radius over the real pump). **Handoff depth + anti-entropy
-resync (ADR-0024) DONE:** deep handoff is covered (hand-back, repeated/cycle, packet-loss) and the R6
-cross-sender reordering gap (frozen wrong-owner proxy) now HEALS via a digest→request→`ResyncSpawn` resync
-round (the owner privileged-corrects the proxy owner + state; own-authority + responder-owns + AOI re-guards).
+resync (ADR-0024) DONE + WIRED into the pump:** deep handoff is covered (hand-back, repeated/cycle,
+packet-loss); the R6 cross-sender reordering gap (frozen wrong-owner proxy) HEALS via a
+digest→request→`ResyncSpawn` round (own-authority + responder-owns + AOI re-guards); and `server::net_pump`
+now DRIVES resync — requests/responses every frame, digests on a slow `RESYNC_INTERVAL` (500 ms) accumulator —
+proven by `resync_heals_injected_desync_over_pump` (an injected desync self-heals over real transport).
 Next Phase-3 threads: double-ownership coordination / host-migration (also heals the E4 never-witnessed-owner
-orphan resync can't); the production-pump resync cadence.
+orphan resync can't).
 
 ## Done
 - **Cargo workspace** — virtual manifest, 9 crates under `crates/*` (glob members),

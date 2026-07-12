@@ -10,8 +10,11 @@ Implemented (the Mode-3 headless runtime, ADR-0014 — the authority-swap gate P
 at 1/64 s — NOT the `bevy` umbrella; `MinimalPlugins` lives in `bevy_internal`),
 FixedUpdate = `sync_sim_dt` → `count_tick` → `advance_tick` → `apply_input` → `simulate`
 (chained; `SimDt` fed from the fixed clock at the app boundary), Update = exclusive
-`net_pump` (NonSend `Net`; receive every frame, emit acks (`drain_acks`) every frame,
-collect+send at `NET_INTERVAL` 50 ms via a virtual-clock accumulator).
+`net_pump` (NonSend `Net`; receive every frame, emit acks (`drain_acks`) + resync
+requests/responses (`drain_resync_requests`/`drain_resync_responses`) every frame,
+collect+send at `NET_INTERVAL` 50 ms via a virtual-clock accumulator, and resync
+DIGESTS (`collect_resync`) on a SLOW separate `RESYNC_INTERVAL` 500 ms accumulator —
+ADR-0024; the `send_directed` helper routes every directed batch).
 Mode 3 is expressed purely as data: the server spawns/owns everything. Exit via
 `Messages<AppExit>` (0.19 renamed Events→Messages). M3/M4 tests drive the real App;
 demo entities must keep nonzero vel.x (test predicates observe replay-ordered proxies).
