@@ -28,8 +28,8 @@ use bevy_ecs::message::Messages;
 use bevy_ecs::prelude::*;
 use bevy_time::{Fixed, Time, TimePlugin, Virtual};
 use engine_core::{
-    Position, ProcessedInput, SimDt, Velocity, advance_tick, apply_input, insert_sim, simulate,
-    spawn_owned,
+    ControlledBy, LocalPeer, PendingInputs, Position, ProcessedInput, SimDt, Velocity,
+    advance_tick, apply_input, insert_sim, simulate, spawn_owned,
 };
 use protocol::PeerId;
 use replication::Replication;
@@ -48,6 +48,14 @@ pub const NET_INTERVAL: Duration = Duration::from_millis(50);
 #[derive(Resource, Default)]
 pub struct TickCount(pub u64);
 
+/// AOI focus (ADR-0023 c): the exit radius is this multiple of the focus (enter)
+/// radius — a hysteresis band so an entity crossing a client's focus edge does
+/// not flicker Spawn/Despawn.
+const FOCUS_HYSTERESIS: f32 = 1.25;
+/// Per-connection avatar lane spacing, as a multiple of the focus radius. Must
+/// exceed `2 * FOCUS_HYSTERESIS` so per-client foci are disjoint.
+const FOCUS_LANE_FACTOR: f32 = 4.0;
+
 /// The networking bundle. NOT Send/Sync-bound: stored as a NonSend resource
 /// and taken/reinserted around the exclusive pump (there is no
 /// `non_send_resource_scope` helper in 0.19).
@@ -55,6 +63,12 @@ pub struct Net {
     transport: Transport,
     repl: Replication,
     acc: Duration,
+    /// Focused mode (ADR-0023 c): when `Some(r)`, each connecting client gets a
+    /// server-owned avatar it controls and an AOI focused on it (enter radius
+    /// `r`). `None` ⇒ the unbounded Mode-3 default (every client sees all).
+    focus_radius: Option<f32>,
+    /// Monotonic per-connection lane for placing avatars at disjoint positions.
+    avatar_lane: u64,
 }
 
 /// Feed engine-core's `SimDt` contract from the fixed clock. Inside
@@ -87,16 +101,52 @@ pub fn net_pump(world: &mut World) {
                         // announced per-peer by the next collect_all via
                         // AOI-ENTER — no blanket replay (existence is now gated).
                         net.repl.on_peer_connected(proto);
+                        // Focused mode (ADR-0023 c): give the client a
+                        // server-OWNED avatar it CONTROLS (Owner=server keeps Mode 3
+                        // authoritative; ControlledBy=client is the input/focus
+                        // link). A distinct lane per connection keeps foci disjoint.
+                        // Its AOI is focused on it each net tick, below.
+                        if let Some(radius) = net.focus_radius {
+                            let local = world.resource::<LocalPeer>().0;
+                            let lane = net.avatar_lane;
+                            net.avatar_lane += 1;
+                            let avatar = spawn_owned(
+                                world,
+                                local,
+                                Position {
+                                    x: radius * FOCUS_LANE_FACTOR * lane as f32,
+                                    y: 0.0,
+                                },
+                                Velocity { x: 0.0, y: 0.0 },
+                            );
+                            world.entity_mut(avatar).insert(ControlledBy(proto));
+                        }
                     }
                     PeerState::Disconnected => {
                         log::info!("[server] peer disconnected: {proto:?}");
                         net.repl.untrack_peer(proto);
                         // Reset the processed-input high-water (ADR-0022) so a
                         // reconnect with a fresh input-seq namespace isn't frozen
-                        // by a stale marker (auditor F4). (The avatar's
-                        // PendingInputs entry is cleared when it despawns.)
+                        // by a stale marker (auditor F4).
                         if let Some(mut processed) = world.get_resource_mut::<ProcessedInput>() {
                             processed.0.remove(&proto);
+                        }
+                        // Despawn the client's avatar (ADR-0023 c) via the
+                        // ControlledBy scan, and PRUNE its PendingInputs — that map
+                        // is not pruned anywhere else, so without this every
+                        // reconnect would leak a queue. The next collect_all's
+                        // `dead` set retires the map entry (no Despawn is wired —
+                        // no other peer had the avatar in focus).
+                        let avatar = world
+                            .query::<(Entity, &ControlledBy)>()
+                            .iter(world)
+                            .find(|(_, cb)| cb.0 == proto)
+                            .map(|(e, _)| e);
+                        if let Some(avatar) = avatar {
+                            if let Some(mut pending) = world.get_resource_mut::<PendingInputs>() {
+                                pending.0.remove(&avatar);
+                            }
+                            world.despawn(avatar);
                         }
                     }
                 }
@@ -145,9 +195,24 @@ pub fn net_pump(world: &mut World) {
         if net.acc >= NET_INTERVAL {
             net.acc = Duration::ZERO;
         }
-        // Per-peer collect (ADR-0021 interest management): each peer gets its
-        // own AOI-gated outbox. The server leaves AOI unset (every client sees
-        // all demo entities); a per-client gameplay focus is future client work.
+        // Focus each client's AOI on the entity it controls (ADR-0023 c). Gather
+        // the (peer, avatar-position) pairs first (world read), then set each AOI,
+        // then collect — set_aoi_* MUST precede collect_all (it reads self.aoi).
+        // Unfocused mode leaves AOI unset ⇒ every client sees all (the Mode-3
+        // fail-open default). A moving avatar's focus follows it each net tick.
+        if let Some(radius) = net.focus_radius {
+            let focuses: Vec<(PeerId, (f32, f32))> = world
+                .query::<(&ControlledBy, &Position)>()
+                .iter(world)
+                .map(|(cb, pos)| (cb.0, (pos.x, pos.y)))
+                .collect();
+            for (peer, center) in focuses {
+                net.repl
+                    .set_aoi_hysteresis(peer, center, radius, radius * FOCUS_HYSTERESIS);
+            }
+        }
+        // Per-peer collect (ADR-0021 interest management): each peer gets its own
+        // AOI-gated outbox (focused above, or unbounded in the demo default).
         // Map each protocol peer back to its transport peer for the send.
         let connected: Vec<_> = net.transport.connected_peers().collect();
         for (target, out) in net.repl.collect_all(world) {
@@ -172,8 +237,31 @@ pub fn net_pump(world: &mut World) {
 /// Assemble the headless authoritative server App around an already-connected
 /// transport (its signaling id already known → `local`). Spawns `entity_count`
 /// server-owned demo entities — the ONLY mode-defining input: the server owns
-/// everything, so every client applies everything.
+/// everything, so every client applies everything. Every client sees ALL demo
+/// entities (unbounded AOI — the Mode-3 fail-open default).
 pub fn build_server_app(transport: Transport, local: PeerId, entity_count: usize) -> App {
+    build_server_app_inner(transport, local, entity_count, None)
+}
+
+/// Like [`build_server_app`], but FOCUSED (ADR-0023 c): each connecting client
+/// gets a server-owned avatar it controls, and its AOI is focused on that avatar
+/// with enter radius `focus_radius` — so a client sees only entities within its
+/// focus (out-of-focus entities are withheld in state AND existence).
+pub fn build_server_app_focused(
+    transport: Transport,
+    local: PeerId,
+    entity_count: usize,
+    focus_radius: f32,
+) -> App {
+    build_server_app_inner(transport, local, entity_count, Some(focus_radius))
+}
+
+fn build_server_app_inner(
+    transport: Transport,
+    local: PeerId,
+    entity_count: usize,
+    focus_radius: Option<f32>,
+) -> App {
     let mut app = App::new();
     app.add_plugins((
         TaskPoolPlugin::default(),
@@ -208,6 +296,8 @@ pub fn build_server_app(transport: Transport, local: PeerId, entity_count: usize
         transport,
         repl,
         acc: Duration::ZERO,
+        focus_radius,
+        avatar_lane: 0,
     });
     // `advance_tick` bumps engine_core::Tick (the snapshot time axis, ADR-0022);
     // `count_tick` keeps the server-local TickCount (the 64 Hz evidence test).

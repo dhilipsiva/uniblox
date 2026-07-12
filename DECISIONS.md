@@ -752,5 +752,25 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   warnings` native + wasm32; fmt clean. netcode-audited → MERGE (wiring correct, band read-cheat sealed,
   baseline survival holds; auditor F1 actioned, F2/F3 test-strength gaps closed — B8 now asserts state
   continues for a known band entity, B7 asserts no Despawn on the dip).
-- **Stage c:** pending (opt-in per-client avatar + AOI focus hook).
-- **Status:** Stages a + b Accepted (2026-07-12); c in progress.
+- **Stage c — per-client AOI focus / avatar hook (Accepted 2026-07-12):** Mode 3 left every client's AOI unset
+  (fail-open ⇒ sees all). Now an OPT-IN focused server (`build_server_app_focused`, `Net.focus_radius`) gives
+  each connecting client a server-OWNED avatar it CONTROLS (`spawn_owned` + `ControlledBy(peer)` — Owner=server
+  keeps Mode 3 authoritative; ControlledBy is the input/focus link, the audited ADR-0022 predicted-avatar
+  model) at a distinct lane (`focus_radius * 4 * lane`, so foci are disjoint), and focuses that client's AOI on
+  the avatar each net tick via `set_aoi_hysteresis(peer, avatar_pos, r, r*1.25)`. Borrow order: gather
+  `(ControlledBy, Position)` (world read) → `set_aoi_*` (repl mutate) → `collect_all`. Disconnect despawns the
+  avatar (via the `ControlledBy(peer)` scan) AND prunes its `PendingInputs` entry — that map was NEVER pruned
+  anywhere (a per-reconnect leak the moment avatars exist; the old disconnect comment was aspirational —
+  auditor). `build_server_app(_,_,N)` delegates unfocused (`None`) so M3/M4 are byte-unchanged. No echo/re-sim:
+  the avatar is server-authoritative, the client emits inputs only (authority gate). Evidence: headless_app 5
+  green over the real pump (`focused_server_withholds_out_of_focus_entities` — a client sees only its avatar +
+  a near entity, an x=1e6 entity NEVER leaks in state OR existence; `two_focused_clients_see_disjoint_sets` —
+  disjoint non-empty focus sets, neither sees the far entity; M3/M4 unchanged), 3× flake-clean; full workspace
+  green; clippy `-D warnings` native; fmt clean. netcode-audited → MERGE (PendingInputs prune correct + keyed
+  by avatar entity, no echo, borrow order sound, tests non-vacuous, M3/M4 intact; auditor F2 non-empty guard
+  added).
+- **Status:** Stages a + b + c ACCEPTED (2026-07-12) — the interest-management follow-ups item is complete.
+  Deferred: a `slice_metrics` focused-bandwidth NUMBER (Instrumentation item — the win is already proven
+  correct by A2/D1); the shared-per-tick snapshot's remaining perf (two `in_radius` scans + an unbounded-peer
+  clone); AOI-focus for a REAL controllable client (this exercises the server hook with a stub client — a
+  moving avatar's focus already follows it).

@@ -21,6 +21,14 @@ client-OWNED stationary entity (Mode-2-shaped) goes quiet once the server's ack-
 confirms it — the test `Client` carries the client-side ack/collect pump wiring a real
 client will need.
 
+**Per-client AOI focus (ADR-0023 c):** `build_server_app_focused(t,l,n,focus_radius)` is an
+OPT-IN focused server (`Net.focus_radius`). On connect it spawns a server-OWNED avatar the
+client CONTROLS (`spawn_owned` + `ControlledBy(peer)`) at a distinct lane; each net tick it
+focuses that client's AOI on its avatar (`set_aoi_hysteresis`, from the `ControlledBy` scan,
+BEFORE `collect_all`). Disconnect despawns the avatar (ControlledBy scan) and prunes its
+`PendingInputs`. `build_server_app` stays unfocused (unbounded — the M3/M4 default). Tests
+`focused_server_withholds_out_of_focus_entities` + `two_focused_clients_see_disjoint_sets`.
+
 ## Crate-local invariants
 - Runs the **identical simulation** as the client (same `engine-core` systems),
   with authority reassigned to the server — **NO logic fork**.
