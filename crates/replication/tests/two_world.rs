@@ -2532,3 +2532,496 @@ fn hoist_quantized_value_is_peer_invariant() {
         "velocity quantized from the spawn coords, not the position"
     );
 }
+
+// ═══════════════════════ Group R — handoff depth (ADR-0024) ═══════════════════════
+
+/// R-HB1 — hand-back A→B→A restores the ORIGINAL owner. A's original entity
+/// (spawner=A) becomes a B-owned proxy A must apply remote state to, then on the
+/// hand-back A re-adopts its own entity (resolved via the persistent id-map,
+/// lib.rs:848-878) and RE-BASELINES full-mask (the send_state drop on transfer-
+/// away, lib.rs:1108-1114).
+#[test]
+fn handback_a_b_a_restores_original_owner() {
+    let mut a = TestPeer::new(1);
+    let mut b = TestPeer::new(2);
+    let e_a = a.spawn(0.0, 0.0, 2.0, 0.0);
+
+    let out = a.collect_for(b.id);
+    let original_id = spawn_ids(&out.events)[0];
+    b.deliver_all(a.id, &out);
+    let proxy = b.entity_owned_by(a.id);
+    flush_acks(&mut b, &mut a);
+
+    // A→B: A stops owning + collecting e_a; B adopts and simulates it.
+    a.repl
+        .transfer_ownership(&mut a.world, e_a, b.id)
+        .expect("A owns e_a");
+    assert_eq!(a.owner(e_a), b.id, "A's Owner flips immediately");
+    let t = a.collect_for(b.id);
+    assert!(
+        state_entries(&t).is_empty(),
+        "A collects no state for a transferred entity"
+    );
+    b.deliver_events(a.id, &t.events);
+    assert_eq!(b.owner(proxy), b.id, "B adopts");
+    b.sim_tick(); // B moves the adopted entity
+
+    // B replicates back to A: A applies B's state to its OWN original entity
+    // (by_id → e_a, owner==from==B). The load-bearing hand-back subtlety.
+    let back = b.collect_for(a.id);
+    a.deliver_all(b.id, &back);
+    assert_eq!(a.owner(e_a), b.id, "A still sees e_a as B-owned");
+    assert!(
+        approx(a.pos(e_a).x, b.pos(proxy).x),
+        "A applies the new owner's state to its own original entity"
+    );
+
+    // Hand-back B→A: A re-adopts e_a.
+    b.repl
+        .transfer_ownership(&mut b.world, proxy, a.id)
+        .expect("B owns the proxy");
+    let t2 = b.collect_for(a.id);
+    a.deliver_events(b.id, &t2.events);
+    assert_eq!(a.owner(e_a), a.id, "A re-adopts its original entity");
+
+    // A resumes simulating and RE-BASELINES full-mask (proves the send_state drop).
+    let frozen = a.pos(e_a);
+    a.sim_tick();
+    assert!(
+        a.pos(e_a).x > frozen.x,
+        "A re-simulates the re-adopted entity"
+    );
+    let re = a.collect_for(b.id);
+    let entries = state_entries(&re);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].id, original_id,
+        "identity survives the round trip"
+    );
+    assert_eq!(entries[0].mask(), 0b11, "re-adopt re-baselines full-mask");
+
+    // B applies the round-trip without duplicating the proxy (idempotent re-Spawn).
+    b.deliver_all(a.id, &re);
+    assert_eq!(b.owner(proxy), a.id, "B's proxy tracks the hand-back to A");
+    assert_eq!(b.entity_count(), 1, "no duplicate proxy");
+    assert!(approx(b.pos(proxy).x, a.pos(e_a).x));
+}
+
+/// R-HB2 — a witnessing observer D tracks the full A→B→A ownership round trip.
+/// TRAP: the intermediate owner B must replicate to D BETWEEN adopting and
+/// handing back, else e ∉ B.known[D] and B's hand-back Transfer never reaches D
+/// (that would be an R6-class freeze, not this happy path).
+#[test]
+fn handback_observer_tracks_ownership_roundtrip() {
+    let mut a = TestPeer::new(1);
+    let mut b = TestPeer::new(2);
+    let mut d = TestPeer::new(3);
+    let e_a = a.spawn(0.0, 0.0, 2.0, 0.0);
+    a.track(b.id);
+    a.track(d.id);
+    let outs = a.collect_all();
+    b.deliver_all(a.id, outbox_for(&outs, b.id).unwrap());
+    d.deliver_all(a.id, outbox_for(&outs, d.id).unwrap());
+    let proxy_b = b.entity_owned_by(a.id);
+    let proxy_d = d.entity_owned_by(a.id);
+
+    // A→B: tell BOTH B and D.
+    a.repl
+        .transfer_ownership(&mut a.world, e_a, b.id)
+        .expect("A owns e_a");
+    let outs = a.collect_all();
+    b.deliver_events(a.id, &outbox_for(&outs, b.id).unwrap().events);
+    d.deliver_events(a.id, &outbox_for(&outs, d.id).unwrap().events);
+    assert_eq!(d.owner(proxy_d), b.id, "observer sees A→B");
+
+    // TRAP: B replicates to D so e enters B.known[D] before the hand-back.
+    b.track(a.id);
+    b.track(d.id);
+    b.sim_tick();
+    d.deliver_all(b.id, &b.collect_for(d.id));
+
+    // Hand-back B→A: tell both A and D.
+    b.repl
+        .transfer_ownership(&mut b.world, proxy_b, a.id)
+        .expect("B owns the proxy");
+    let outs = b.collect_all();
+    a.deliver_events(b.id, &outbox_for(&outs, a.id).unwrap().events);
+    d.deliver_events(b.id, &outbox_for(&outs, d.id).unwrap().events);
+    assert_eq!(
+        d.owner(proxy_d),
+        a.id,
+        "observer sees the full round trip B→A"
+    );
+    assert_eq!(d.entity_count(), 1, "no proxy churn");
+}
+
+/// R-RT1 — repeated transfers A→B→A→B: the NetEntityId is stable across every
+/// hop and a witnessing observer D's proxy owner tracks each one. (Each hand-off
+/// needs the current owner to replicate to D first — the known[D] trap.)
+#[test]
+fn repeated_transfers_a_b_a_b_identity_stable() {
+    let mut a = TestPeer::new(1);
+    let mut b = TestPeer::new(2);
+    let mut d = TestPeer::new(3);
+    let e = a.spawn(0.0, 0.0, 2.0, 0.0);
+    let original_id = net_id(a.id, e);
+    a.track(b.id);
+    a.track(d.id);
+    let outs = a.collect_all();
+    b.deliver_all(a.id, outbox_for(&outs, b.id).unwrap());
+    d.deliver_all(a.id, outbox_for(&outs, d.id).unwrap());
+    let proxy_b = b.entity_owned_by(a.id);
+    let proxy_d = d.entity_owned_by(a.id);
+    b.track(a.id);
+    b.track(d.id);
+
+    // A→B: tell B and D.
+    a.repl
+        .transfer_ownership(&mut a.world, e, b.id)
+        .expect("A→B");
+    let outs = a.collect_all();
+    b.deliver_events(a.id, &outbox_for(&outs, b.id).unwrap().events);
+    d.deliver_events(a.id, &outbox_for(&outs, d.id).unwrap().events);
+    assert_eq!(d.owner(proxy_d), b.id, "D tracks A→B");
+    b.sim_tick();
+    d.deliver_all(b.id, &b.collect_for(d.id)); // B witnesses D before handing back
+
+    // B→A: tell A and D.
+    b.repl
+        .transfer_ownership(&mut b.world, proxy_b, a.id)
+        .expect("B→A");
+    let outs = b.collect_all();
+    a.deliver_events(b.id, &outbox_for(&outs, a.id).unwrap().events);
+    d.deliver_events(b.id, &outbox_for(&outs, d.id).unwrap().events);
+    assert_eq!(d.owner(proxy_d), a.id, "D tracks B→A");
+    a.sim_tick();
+    d.deliver_all(a.id, &a.collect_for(d.id)); // A re-witnesses D (known[D] dropped on A→B)
+
+    // A→B again: tell B and D.
+    a.repl
+        .transfer_ownership(&mut a.world, e, b.id)
+        .expect("A→B #2");
+    let outs = a.collect_all();
+    b.deliver_events(a.id, &outbox_for(&outs, b.id).unwrap().events);
+    d.deliver_events(a.id, &outbox_for(&outs, d.id).unwrap().events);
+    assert_eq!(d.owner(proxy_d), b.id, "D tracks the second A→B");
+
+    // The wire carries the STABLE original id at the final hop (D's owner-tracking
+    // above already depends on this resolving; asserted explicitly on the wire).
+    assert!(
+        outbox_for(&outs, d.id)
+            .unwrap()
+            .events
+            .iter()
+            .any(|ev| matches!(
+                decode_event(ev).unwrap().event,
+                NetEvent::OwnershipTransfer { id, .. } if id == original_id
+            )),
+        "the transfer wire carries the stable original NetEntityId"
+    );
+    assert_eq!(d.entity_count(), 1, "no proxy churn on the observer");
+    assert_eq!(b.entity_count(), 1);
+}
+
+/// R-RT2 — a full cycle A→B→C→A through THREE distinct owners (all pre-
+/// witnessing). C→A re-adopts A's ORIGINAL entity after two intervening owners
+/// (exercises the id-map `last_owner` bookkeeping, lib.rs:864-866).
+#[test]
+fn cycle_a_b_c_a_all_witnessing() {
+    let mut a = TestPeer::new(1);
+    let mut b = TestPeer::new(2);
+    let mut c = TestPeer::new(3);
+    let e = a.spawn(0.0, 0.0, 2.0, 0.0);
+    let original_id = net_id(a.id, e);
+    // A replicates to BOTH B and C so each witnesses e (can adopt it).
+    a.track(b.id);
+    a.track(c.id);
+    let outs = a.collect_all();
+    b.deliver_all(a.id, outbox_for(&outs, b.id).unwrap());
+    c.deliver_all(a.id, outbox_for(&outs, c.id).unwrap());
+    let proxy_b = b.entity_owned_by(a.id);
+    let proxy_c = c.entity_owned_by(a.id);
+
+    // A→B: tell B (new owner) and C (future owner, must keep witnessing).
+    a.repl
+        .transfer_ownership(&mut a.world, e, b.id)
+        .expect("A→B");
+    let outs = a.collect_all();
+    b.deliver_events(a.id, &outbox_for(&outs, b.id).unwrap().events);
+    c.deliver_events(a.id, &outbox_for(&outs, c.id).unwrap().events);
+    assert_eq!(c.owner(proxy_c), b.id, "C witnesses A→B");
+    b.track(a.id);
+    b.track(c.id);
+    b.sim_tick();
+    a.deliver_all(b.id, &b.collect_for(a.id)); // B → A (A must witness for C→A later)
+    c.deliver_all(b.id, &b.collect_for(c.id)); // B → C
+
+    // B→C: tell C (new owner) and A (future owner).
+    b.repl
+        .transfer_ownership(&mut b.world, proxy_b, c.id)
+        .expect("B→C");
+    let outs = b.collect_all();
+    a.deliver_events(b.id, &outbox_for(&outs, a.id).unwrap().events);
+    c.deliver_events(b.id, &outbox_for(&outs, c.id).unwrap().events);
+    assert_eq!(c.owner(proxy_c), c.id, "C adopts B→C");
+    assert_eq!(a.owner(e), c.id, "A's proxy tracks B→C");
+    c.track(a.id);
+    c.sim_tick();
+    a.deliver_all(c.id, &c.collect_for(a.id)); // C → A witnesses
+
+    // C→A: A re-adopts its ORIGINAL entity after two intervening owners.
+    c.repl
+        .transfer_ownership(&mut c.world, proxy_c, a.id)
+        .expect("C→A");
+    let ct = c.collect_for(a.id);
+    // The C→A transfer wire carries A's ORIGINAL id (spawner=A), proving identity
+    // survived two intervening owners (C could not mint in A's namespace).
+    assert!(
+        ct.events.iter().any(|ev| matches!(
+            decode_event(ev).unwrap().event,
+            NetEvent::OwnershipTransfer { id, .. } if id == original_id
+        )),
+        "the wire carries the stable original NetEntityId across the cycle"
+    );
+    a.deliver_events(c.id, &ct.events);
+    assert_eq!(
+        a.owner(e),
+        a.id,
+        "A re-adopts its original entity after the cycle"
+    );
+    assert_eq!(b.entity_count(), 1);
+    assert_eq!(c.entity_count(), 1);
+}
+
+/// R-RT3 (WHITE-BOX) — the transfer-path analogue of B4: a round trip A→B→A
+/// RE-BASELINES the entity (the send_state drop, lib.rs:1108-1114), so a STALE
+/// ack (< the re-adopt run_start) must NOT confirm the re-adopted value. Without
+/// the drop, a pre-round-trip ack would falsely confirm → A goes silent →
+/// permanent divergence. Guards a currently-untested invariant.
+#[test]
+fn roundtrip_rebaseline_stale_ack_does_not_confirm() {
+    let mut a = TestPeer::new(1);
+    let mut b = TestPeer::new(2);
+    let e = a.spawn(1.0, 0.0, 0.0, 0.0); // stationary
+    let e_id = net_id(a.id, e);
+    let out = a.collect_for(b.id);
+    b.deliver_all(a.id, &out);
+    let proxy = b.entity_owned_by(a.id);
+    flush_acks(&mut b, &mut a); // acked_seq[b] = 1
+
+    // A→B→A round trip.
+    a.repl
+        .transfer_ownership(&mut a.world, e, b.id)
+        .expect("A→B");
+    b.deliver_events(a.id, &a.collect_for(b.id).events);
+    b.repl
+        .transfer_ownership(&mut b.world, proxy, a.id)
+        .expect("B→A");
+    a.deliver_events(b.id, &b.collect_for(a.id).events);
+    assert_eq!(a.owner(e), a.id, "A re-adopts");
+
+    // A re-collects e at a FRESH run_start (send_state[b][e] was dropped). If the
+    // drop regressed, `re` would be quiet (falsely confirmed) → state_seq panics.
+    let re = a.collect_for(b.id);
+    let reenter_seq = state_seq(&re);
+    assert!(
+        state_entries(&re).iter().any(|s| s.id == e_id),
+        "e is re-sent on re-adopt"
+    );
+
+    // A stale ack (< the re-adopt run_start) must NOT confirm it.
+    inject_ack(&mut a, b.id, reenter_seq - 1);
+    assert!(
+        state_entries(&a.collect_for(b.id))
+            .iter()
+            .any(|s| s.id == e_id),
+        "a stale ack (< re-adopt run_start) must not confirm the re-baselined entity"
+    );
+    // A correct ack ≥ the re-adopt run_start confirms it.
+    inject_ack(&mut a, b.id, reenter_seq);
+    assert!(
+        !state_entries(&a.collect_for(b.id))
+            .iter()
+            .any(|s| s.id == e_id),
+        "e quiet once b acks ≥ the re-adopt run_start"
+    );
+}
+
+/// R-LOSS1 — a state packet DROPPED around a handoff heals via the fresh owner's
+/// delta, and a late stale packet from the OLD owner is inert (LWW + the
+/// `owner!=from` gate — no wrong-owner apply, no resurrection).
+#[test]
+fn state_drop_around_handoff_heals_and_no_wrong_owner() {
+    let mut a = TestPeer::new(1);
+    let mut b = TestPeer::new(2);
+    let mut d = TestPeer::new(3);
+    let e = a.spawn(0.0, 0.0, 2.0, 0.0);
+    a.track(b.id);
+    a.track(d.id);
+    let outs = a.collect_all();
+    b.deliver_all(a.id, outbox_for(&outs, b.id).unwrap());
+    d.deliver_all(a.id, outbox_for(&outs, d.id).unwrap());
+    let proxy_b = b.entity_owned_by(a.id);
+    let proxy_d = d.entity_owned_by(a.id);
+
+    // A moves e and its new state to D is DROPPED (seq 2, never delivered).
+    a.sim_tick();
+    let lost = a.collect_for(d.id);
+    assert!(lost.state.is_some());
+
+    // A→B: tell B and D.
+    a.repl
+        .transfer_ownership(&mut a.world, e, b.id)
+        .expect("A→B");
+    let outs = a.collect_all();
+    b.deliver_events(a.id, &outbox_for(&outs, b.id).unwrap().events);
+    d.deliver_events(a.id, &outbox_for(&outs, d.id).unwrap().events);
+    assert_eq!(d.owner(proxy_d), b.id, "D sees A→B");
+
+    // B (fresh owner) replicates to D — its full-mask delta heals the drop. Sim
+    // B TWICE so it reaches x=2.0, DISTINCT from the stale old-owner value (1.0),
+    // so the owner-gate drop below is actually discriminating (auditor).
+    b.track(d.id);
+    b.sim_tick();
+    b.sim_tick();
+    d.deliver_all(b.id, &b.collect_for(d.id));
+    assert!(
+        approx(d.pos(proxy_d).x, b.pos(proxy_b).x),
+        "the fresh owner's delta heals the dropped packet"
+    );
+
+    // Late-deliver the dropped OLD-owner packet (stale value 1.0 ≠ B's 2.0): inert
+    // by the owner gate — its seq 2 > D.last_seq[a]=1 so LWW alone would ADMIT it,
+    // so the assertion below would FAIL if the `owner!=from` gate were removed.
+    let healed = d.pos(proxy_d);
+    d.deliver_state(a.id, lost.state.as_ref().unwrap());
+    assert_eq!(
+        healed.x.to_bits(),
+        d.pos(proxy_d).x.to_bits(),
+        "a stale old-owner packet must not apply over the new owner"
+    );
+}
+
+/// R-LOSS2 — reordered state around a handoff: the NEW owner's newer state
+/// applies, then the OLD owner's earlier (higher-seq) in-flight state is inert by
+/// the `owner!=from` gate even though LWW would admit it.
+#[test]
+fn reordered_state_around_transfer_dropped() {
+    let mut a = TestPeer::new(1);
+    let mut b = TestPeer::new(2);
+    let mut d = TestPeer::new(3);
+    let e = a.spawn(0.0, 0.0, 2.0, 0.0);
+    a.track(b.id);
+    a.track(d.id);
+    let outs = a.collect_all();
+    b.deliver_all(a.id, outbox_for(&outs, b.id).unwrap());
+    d.deliver_all(a.id, outbox_for(&outs, d.id).unwrap());
+    let proxy_b = b.entity_owned_by(a.id);
+    let proxy_d = d.entity_owned_by(a.id);
+
+    // Capture A's in-flight state (seq 2) BEFORE the transfer.
+    a.sim_tick();
+    let in_flight = a.collect_for(d.id).state.unwrap();
+
+    // A→B; D adopts the new owner.
+    a.repl
+        .transfer_ownership(&mut a.world, e, b.id)
+        .expect("A→B");
+    let outs = a.collect_all();
+    b.deliver_events(a.id, &outbox_for(&outs, b.id).unwrap().events);
+    d.deliver_events(a.id, &outbox_for(&outs, d.id).unwrap().events);
+
+    // B's newer state applies at D. Sim B TWICE so b_val=2.0 is DISTINCT from the
+    // captured in-flight value (1.0) — else the drop below would be unobservable.
+    b.track(d.id);
+    b.sim_tick();
+    b.sim_tick();
+    d.deliver_all(b.id, &b.collect_for(d.id));
+    let b_val = b.pos(proxy_b).x;
+    assert!(approx(d.pos(proxy_d).x, b_val), "new-owner state applies");
+
+    // Now the reordered OLD-owner in-flight (value 1.0, seq 2 > D.last_seq[a]=1 so
+    // LWW ADMITS it) arrives — inert by the owner gate. Would FAIL (d.pos → 1.0)
+    // if the `owner!=from` gate were removed.
+    d.deliver_state(a.id, &in_flight);
+    assert!(
+        approx(d.pos(proxy_d).x, b_val),
+        "reordered old-owner in-flight is dropped by the owner gate"
+    );
+}
+
+/// R6-1 — chained-transfer cross-sender REORDERING freezes an observer at the
+/// WRONG owner (the documented ADR-0013 R6 gap). A→B→C with observer D; D
+/// receives T2(B→C) before T1(A→B). T2 is dropped (owner mismatch), T1 flips D to
+/// owner B, and C's state is then rejected forever. Stage 2 (resync) heals this;
+/// here we PIN the gap deterministically (as E4 pins its orphan).
+#[test]
+fn r6_chained_reorder_freezes_observer_at_wrong_owner() {
+    let mut a = TestPeer::new(1);
+    let mut b = TestPeer::new(2);
+    let mut c = TestPeer::new(3);
+    let mut d = TestPeer::new(4);
+    let e = a.spawn(0.0, 0.0, 2.0, 0.0);
+    a.track(b.id);
+    a.track(c.id);
+    a.track(d.id);
+    let outs = a.collect_all();
+    b.deliver_all(a.id, outbox_for(&outs, b.id).unwrap());
+    c.deliver_all(a.id, outbox_for(&outs, c.id).unwrap());
+    d.deliver_all(a.id, outbox_for(&outs, d.id).unwrap());
+    let proxy_c = c.entity_owned_by(a.id);
+    let proxy_d = d.entity_owned_by(a.id);
+
+    // A→B: deliver to B and C in order; CAPTURE T1 for D and withhold it.
+    a.repl
+        .transfer_ownership(&mut a.world, e, b.id)
+        .expect("A→B");
+    let outs = a.collect_all();
+    b.deliver_events(a.id, &outbox_for(&outs, b.id).unwrap().events);
+    c.deliver_events(a.id, &outbox_for(&outs, c.id).unwrap().events);
+    let t1_d = outbox_for(&outs, d.id).unwrap().events.clone(); // WITHHELD from D
+    assert_eq!(c.owner(proxy_c), b.id, "C tracks A→B in order");
+
+    // B AOI-enters e for C and D (so a B→C transfer reaches both); apply to C only.
+    b.track(a.id);
+    b.track(c.id);
+    b.track(d.id);
+    b.sim_tick();
+    let bcast = b.collect_all();
+    c.deliver_all(b.id, outbox_for(&bcast, c.id).unwrap()); // C applies (owner B == from B)
+    // (withhold B's state from D; e is now in b.known[d])
+
+    // B→C: deliver to C in order; CAPTURE T2 for D and withhold it.
+    let proxy_b = b.entity_owned_by(b.id);
+    b.repl
+        .transfer_ownership(&mut b.world, proxy_b, c.id)
+        .expect("B→C");
+    let outs = b.collect_all();
+    c.deliver_events(b.id, &outbox_for(&outs, c.id).unwrap().events);
+    let t2_d = outbox_for(&outs, d.id).unwrap().events.clone(); // WITHHELD from D
+    assert_eq!(c.owner(proxy_c), c.id, "C adopts B→C");
+
+    // ADVERSE cross-sender order at D: T2 (from B) FIRST, then T1 (from A).
+    d.deliver_events(b.id, &t2_d); // owner(A) != from(B) → DROPPED (the R6 loss)
+    d.deliver_events(a.id, &t1_d); // owner(A) == from(A) → flips D to owner B
+
+    // The FROZEN gap: D records owner B, the real owner is C.
+    assert_eq!(
+        d.owner(proxy_d),
+        b.id,
+        "R6 gap: observer frozen at the WRONG owner (B), real owner is C"
+    );
+    let before = d.pos(proxy_d);
+    c.sim_tick();
+    let cstate = c.collect_for(d.id);
+    assert!(
+        cstate.state.is_some(),
+        "C genuinely emits state for e (so the rejection below is non-vacuous)"
+    );
+    d.deliver_state(c.id, cstate.state.as_ref().unwrap());
+    assert_eq!(
+        before.x.to_bits(),
+        d.pos(proxy_d).x.to_bits(),
+        "R6 gap: the real owner C's state is rejected by the wrong-owner proxy"
+    );
+}
