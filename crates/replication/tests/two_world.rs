@@ -12,7 +12,7 @@ use bevy_ecs::prelude::*;
 use engine_core::{
     Controlled, ControlledBy, INTERP_DELAY_TICKS, InputHistory, Intent, InterpBuffer, Owner,
     Position, RenderPos, RenderTick, Tick, Velocity, apply_input, copy_owned_render, insert_sim,
-    interpolate, predict, record_input, simulate, spawn_owned,
+    interpolate, predict, record_input, reset_render_role, simulate, spawn_owned,
 };
 use protocol::{
     EventMsg, NetEntityId, NetEvent, PeerId, StateEntry, WIRE_VERSION, decode_event, decode_state,
@@ -40,12 +40,14 @@ impl TestPeer {
         // simulate. One input per tick BEFORE integration.
         let mut schedule = Schedule::default();
         schedule.add_systems((apply_input, simulate).chain());
-        // The render step (ADR-0022): interpolated remotes lerp their buffer,
-        // then predicted (controlled) entities replay their input history, then
-        // owned entities copy Position — all write only RenderPos; ordered so
-        // predict wins over a stale InterpBuffer and Local authority wins last.
+        // The render step (ADR-0022): reset_render_role first maintains the
+        // per-entity role on a handoff/control change (flush/seed from the
+        // authoritative Position), THEN interpolated remotes lerp their buffer,
+        // predicted (controlled) entities replay their input history, and owned
+        // entities copy Position — all write only RenderPos; ordered so predict
+        // wins over a stale InterpBuffer and Local authority wins last.
         let mut render = Schedule::default();
-        render.add_systems((interpolate, predict, copy_owned_render).chain());
+        render.add_systems((reset_render_role, interpolate, predict, copy_owned_render).chain());
         let repl = Replication::new(&mut world);
         TestPeer {
             id: PeerId(id),
@@ -2152,5 +2154,164 @@ fn underrun_stops_server_matching_client() {
     assert!(
         approx(c.pos(proxy).x, 1.0) && approx(c.render_pos(proxy).x, 1.0),
         "client converged with no forward pop"
+    );
+}
+
+// ═══════════ Stage C — handoff interplay (ADR-0022) ═══════════
+
+/// SC1 — the flagged failure mode: on ADOPTION (an interpolated remote flips to
+/// Local) the avatar renders at the AUTHORITATIVE Position, NOT the ~DELAY-behind
+/// interpolated render — no jump to the past — and the interp buffer is dropped.
+/// (The render lands at Position via BOTH `reset_render_role`'s seed AND
+/// `copy_owned_render` — the "Local wins last" co-guarantor; SC5 exercises the
+/// role reset's unmasked half — the input-history clear.)
+#[test]
+fn adopt_seeds_render_from_authoritative_not_interp() {
+    let mut a = TestPeer::new(1);
+    let mut b = TestPeer::new(2);
+    let e = a.spawn(0.0, 0.0, 0.0, 0.0);
+    let proxy = two_snapshots(&mut a, &mut b, e, 100, 0.0, 120, 20.0);
+    b.set_render_tick(120.0); // renders behind: RenderPos ≈ 13.6
+    b.run_render();
+    let interp_render = b.render_pos(proxy).x;
+    let auth = b.pos(proxy).x; // 20.0 (last snapped)
+    assert!(
+        interp_render < auth - TOL,
+        "interp render lags the authoritative Position"
+    );
+
+    // B ADOPTS e (A transfers e → B).
+    a.repl
+        .transfer_ownership(&mut a.world, e, b.id)
+        .expect("A owns e");
+    let out = a.collect_for(b.id);
+    b.deliver_events(a.id, &out.events);
+    assert_eq!(b.owner(proxy), b.id, "B adopted e");
+    b.run_render(); // reset_render_role: → Owned, seed from Position
+    assert!(
+        approx(b.render_pos(proxy).x, auth),
+        "adopt seeds RenderPos from the authoritative Position, not the stale interp ({interp_render})"
+    );
+    assert!(
+        b.world.get::<InterpBuffer>(proxy).is_none(),
+        "the interp buffer is dropped on adoption"
+    );
+}
+
+/// SC2 — relinquishing an owned, NON-controlled entity to a remote peer turns it
+/// Interpolated: an `InterpBuffer` is attached (it was absent while owned).
+#[test]
+fn relinquish_noncontrolled_interpolates() {
+    let mut a = TestPeer::new(1);
+    let e = a.spawn(3.0, 3.0, 0.0, 0.0);
+    a.run_render(); // reset → Owned
+    assert!(
+        a.world.get::<InterpBuffer>(e).is_none(),
+        "owned entity has no interp buffer"
+    );
+    a.repl
+        .transfer_ownership(&mut a.world, e, PeerId(9))
+        .expect("A owns e");
+    a.run_render(); // reset → Interpolated (now Remote, not Controlled)
+    assert_eq!(a.owner(e), PeerId(9));
+    assert!(
+        a.world.get::<InterpBuffer>(e).is_some(),
+        "a relinquished remote entity gets an interp buffer"
+    );
+}
+
+/// SC3 — relinquishing an owned entity while KEEPING control (Mode-2→3 style:
+/// hand authority to the server, keep driving it) turns it Predicted: an
+/// `InputHistory` is ensured and no interp buffer.
+#[test]
+fn relinquish_keeping_control_becomes_predicted() {
+    let mut a = TestPeer::new(1);
+    let e = a.spawn(0.0, 0.0, 0.0, 0.0);
+    a.world.entity_mut(e).insert(Controlled { next_seq: 1 });
+    a.run_render(); // reset → Owned (controlled but Local)
+    a.repl
+        .transfer_ownership(&mut a.world, e, PeerId(9))
+        .expect("A owns e");
+    a.run_render(); // reset → Predicted (Remote + Controlled)
+    assert_eq!(a.owner(e), PeerId(9));
+    assert!(
+        a.world.get::<InputHistory>(e).is_some(),
+        "a predicted avatar has an input history"
+    );
+    assert!(
+        a.world.get::<InterpBuffer>(e).is_none(),
+        "a predicted avatar does not interpolate"
+    );
+}
+
+/// SC4 — an observer flushes its interp buffer on ANY authority change (A→B):
+/// the buffered snapshots came from A; lerping across the A→B source
+/// discontinuity would glide through a wrong intermediate.
+#[test]
+fn interp_buffer_flushed_on_owner_change() {
+    let mut a = TestPeer::new(1);
+    let mut obs = TestPeer::new(3);
+    let b = PeerId(2);
+    let e = a.spawn(0.0, 0.0, 0.0, 0.0);
+    let proxy = two_snapshots(&mut a, &mut obs, e, 100, 0.0, 120, 20.0);
+    assert!(
+        !obs.world.get::<InterpBuffer>(proxy).unwrap().0.is_empty(),
+        "the buffer holds A's snapshots"
+    );
+    // A transfers e → B; obs (a third peer) receives the transfer.
+    a.repl
+        .transfer_ownership(&mut a.world, e, b)
+        .expect("A owns e");
+    let out = a.collect_for(obs.id);
+    obs.deliver_events(a.id, &out.events);
+    assert_eq!(obs.owner(proxy), b, "obs proxy owner flipped A→B");
+    assert!(
+        obs.world
+            .get::<InterpBuffer>(proxy)
+            .is_none_or(|buf| buf.0.is_empty()),
+        "the interp buffer is flushed on the A→B source change"
+    );
+}
+
+/// SC5 — adopting a PREDICTED avatar (Remote+Controlled, mid-prediction with
+/// un-acked inputs) to Local CLEARS its InputHistory: we are authoritative now,
+/// so the old authority's un-acked inputs must NOT replay against the new anchor.
+/// Asserts directly on InputHistory (a path `copy_owned_render` does not mask),
+/// and that the transition fires exactly once (idempotent second render).
+#[test]
+fn adopt_predicted_avatar_clears_input_history() {
+    let mut s = TestPeer::new(1);
+    let mut c = TestPeer::new(2);
+    let (e, proxy) = controlled_avatar(&mut s, &mut c, 0.0, 0.0);
+    for _ in 0..3 {
+        c.feed_input(proxy, 1.0, 0.0);
+    }
+    c.run_render();
+    assert!(
+        !c.world.get::<InputHistory>(proxy).unwrap().0.is_empty(),
+        "the predicted avatar has un-acked inputs"
+    );
+
+    // S hands the avatar's authority to C — C adopts it.
+    s.repl
+        .transfer_ownership(&mut s.world, e, c.id)
+        .expect("S owns e");
+    let out = s.collect_for(c.id);
+    c.deliver_events(s.id, &out.events);
+    assert_eq!(c.owner(proxy), c.id, "C adopted the avatar");
+    c.run_render(); // reset_render_role: → Owned clears InputHistory
+    assert!(
+        c.world
+            .get::<InputHistory>(proxy)
+            .is_none_or(|h| h.0.is_empty()),
+        "adopt clears the input history — stale inputs must not replay under new authority"
+    );
+    // Idempotent: a second render with no ownership change is a no-op.
+    c.run_render();
+    assert!(
+        c.world
+            .get::<InputHistory>(proxy)
+            .is_none_or(|h| h.0.is_empty()),
+        "the role transition fired once — the second render doesn't re-run it"
     );
 }
