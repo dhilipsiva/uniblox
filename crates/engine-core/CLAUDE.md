@@ -23,7 +23,10 @@ authoritative `Position` stays snap-applied (receivers never re-simulate others)
 AFTER `interpolate`). `Tick` (advanced by `advance_tick`) is the authoritative
 sim tick stamped into snapshots; `RenderTick` is the interp clock (app-advanced;
 tests set it). `push_snapshot` is cap-evicting + tick-monotonic. `spawn_owned`
-attaches `RenderPos`. Stage C (handoff role reset) to come.
+attaches `RenderPos`. **Handoff (Stage C):** `reset_render_role` (exclusive, first in the render step) diffs
+a cached `RenderRole` (Owned/Interpolated/Predicted) and on a transition flushes/seeds — drops a stale
+`InterpBuffer`/`InputHistory` and re-seeds `RenderPos` from the authoritative Position (so an adopted avatar
+never renders in the past). The item (ADR-0022) is complete.
 
 **Prediction/input (ADR-0022 Stage B):** `Controlled{next_seq}` (client marks its avatar) + `ControlledBy(peer)`
 (authority marks who drives it — ONE controlled entity per peer, the Mode-3 avatar model). `record_input`

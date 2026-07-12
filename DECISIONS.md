@@ -685,5 +685,27 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   netcode-audited → FIX-FIRST then MERGE (folded: F1 quantize-at-record, F3 zero-on-underrun + test, F4
   reconnect-marker reset, F6 wrong-prediction test; F2 one-avatar-per-peer scope + F5 reliable-channel
   dependence documented). Gap: `input_sent` isn't pruned on avatar despawn (slow leak — cleanup pass).
-- **Status:** Stages A + B accepted (2026-07-12). Stage C (handoff interplay — the `reset_render_role`
-  flush/seed on the two owner-flip sites) remains — this item is complete when all three are landed.
+- **Stage C — handoff interplay.** New engine-core: a cached `RenderRole` (Owned/Interpolated/Predicted,
+  derived from authority × `Controlled`) + `reset_render_role` (EXCLUSIVE system, first in the render step) —
+  diffs the desired role vs the cached one and, on a TRANSITION, runs the flush/seed: → Owned drops
+  `InterpBuffer` + clears `InputHistory` (now authoritative — stale inputs must NOT replay against the new
+  anchor); → Predicted drops `InterpBuffer` + ensures `InputHistory`; → Interpolated drops `InputHistory` +
+  ensures an `InterpBuffer` (kept if already present). It re-seeds `RenderPos` from the AUTHORITATIVE Position
+  (belt-and-braces — the same-frame `copy_owned_render`/`predict`/`interpolate` overwrite it in their roles;
+  the load-bearing effect is the component add/remove). replication: `apply_events` `OwnershipTransfer` flushes
+  the proxy's `InterpBuffer` on ANY authority change (its snapshots came from the OLD owner — don't lerp across
+  the A→B source discontinuity); `drain_inputs` now filters to `authority == Remote` so a self-owned
+  controlled avatar can't self-direct inputs (auditor N3). This closes the Phase-1-flagged adoption bug
+  (buffer-flush + prediction-seed on adoption).
+- **Evidence (Stage C):** two_world 69 tests green — SC1 (adopt renders at the authoritative Position, buffer
+  dropped), SC2 (relinquish non-controlled → Interpolated, buffer attached), SC3 (relinquish keeping control →
+  Predicted, history ensured, no buffer), SC4 (observer flushes the buffer on an A→B owner change), SC5 (adopt
+  a PREDICTED avatar → InputHistory cleared, transition fires exactly once — the unmasked assertion); full
+  workspace green; clippy `-D warnings` native `--all-targets` + wasm32; fmt clean. netcode-audited → MERGE
+  (auditor: no correctness bug; the seed block is defensive/over-guarded and docstrings + SC5 were tightened to
+  reflect that `copy_owned_render` co-guarantees the adopt render). Documented gaps: an A→B observer's
+  `RenderPos` freezes at the flushed mid-lerp value until B's snapshots arrive / resync (R6-class); `input_sent`
+  / `PendingInputs` aren't pruned on avatar despawn (session-lifecycle follow-up).
+- **Status:** Stages A + B + C ACCEPTED (2026-07-12) — the item is complete. Deferred fast-follows: a Mode-2
+  sender advancing `Tick`; per-entity input markers for multi-avatar-per-peer; despawn-on-disconnect avatar
+  cleanup; the actual in-browser render wiring (the separate Bevy client gameplay build).

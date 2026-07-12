@@ -14,9 +14,11 @@ only open Phase-2 thread is the real-network telemetry NUMBERS (deploy-gated). *
 delta-vs-last-acked baseline + per-peer ack tracking (ADR-0020, fixed keyframe gone), then **interest
 management / AOI (ADR-0021)** — the sender is now PER-PEER (`collect_all`) with a spatial-grid area-of-interest
 gating both state AND existence (the Mode-3 read-cheat defense), per-(peer,entity) delta baselines, and
-deterministic wire output. Next Phase-3 threads: interpolation/prediction buffers, anti-entropy resync,
-interest-management perf (a shared per-tick snapshot; AOI-flicker hysteresis), a client-acks-server
-integration test (pre-Mode-2).
+deterministic wire output; then **prediction / reconciliation / interpolation (ADR-0022)** — a separate
+`RenderPos` render layer with interpolate-others (snapshot buffer + lerp), predict-own + server reconciliation
+(input / `last_input`), and the handoff role reset. Next Phase-3 threads: anti-entropy resync, handoff depth,
+double-ownership coordination, interest-management perf (a shared per-tick snapshot; AOI-flicker hysteresis),
+a client-acks-server integration test (pre-Mode-2).
 
 ## Done
 - **Cargo workspace** — virtual manifest, 9 crates under `crates/*` (glob members),
@@ -81,6 +83,20 @@ integration test (pre-Mode-2).
   re-baseline, read-cheat existence-withholding, both chained-handoff cases) + 5 grid unit tests green;
   netcode-audited THREE times** (F1 adopted-entity orphan + its over-broad fix, both closed → MERGE). Perf
   (shared per-tick snapshot) + AOI-flicker hysteresis are Phase-3 follow-ups.
+- **Prediction / reconciliation / interpolation buffers** (ADR-0022, Phase 3, HIGH) — the full client-prediction
+  stack, landed in three audited stages behind a SEPARATE `RenderPos` render layer (authoritative `Position`
+  stays snap-applied — receivers never re-simulate others). **A (interpolate-others):** remote entities lerp a
+  per-proxy snapshot buffer at `RenderTick − 6.4 ticks`, clamping (no extrapolation); `StateMsg.tick` +
+  `WIRE_VERSION`→3. **B (predict-own + reconciliation):** a `Controlled`/`Input`/`InputHistory` subsystem +
+  `NetEvent::Input` (reliable); the client re-simulates its avatar from local input and the server's snapshot
+  re-anchors it via `StateMsg.last_input` (replaying un-acked inputs); the server processes ONE input per tick
+  (`apply_input`), zeroing on underrun. **C (handoff):** `reset_render_role` flushes/seeds on the role
+  transition (adopt seeds from the authoritative Position, not the stale interp — the Phase-1-flagged bug).
+  The settled invariant is REFINED (recorded): prediction re-simulates ONLY the locally-controlled avatar,
+  re-anchored each snapshot — bounded/self-correcting, NOT a determinism requirement (lockstep stays rejected).
+  **two_world 69 tests + wire round-trips green; netcode-audited each stage (A MERGE, B FIX-FIRST→MERGE, C
+  MERGE).** Fast-follows: Mode-2 `Tick` advance, multi-avatar per-entity markers, despawn cleanup, the
+  in-browser render wiring (the client gameplay build).
 - **THE AUTHORITY-SWAP GATE: PASSED** (ADR-0014, HIGH) — `crates/server` is the Mode-3 headless runtime
   (standalone bevy_app+bevy_time, 64 Hz FixedUpdate, exclusive net pump at ~20 Hz virtual-clock cadence,
   Messages<AppExit>). The M1–M4 battery is the documented side-by-side run: same simulation, same

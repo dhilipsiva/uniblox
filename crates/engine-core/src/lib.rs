@@ -395,6 +395,89 @@ pub fn push_pending_input(pending: &mut PendingInputs, entity: Entity, input: In
     }
 }
 
+/// The render role of an entity, cached so [`reset_render_role`] can detect a
+/// TRANSITION (handoff / control change) and run the flush/seed exactly once.
+/// Internal bookkeeping — derived from `(authority × Controlled)`.
+#[derive(Component, Clone, Copy, PartialEq, Eq, Debug)]
+enum RenderRole {
+    /// authority Local — the local sim IS the truth (`RenderPos = Position`).
+    Owned,
+    /// authority Remote, not controlled — interpolate a snapshot buffer.
+    Interpolated,
+    /// authority Remote, controlled — predict from input, reconcile to snapshots.
+    Predicted,
+}
+
+/// Maintain each entity's render role on a CHANGE — the handoff interplay
+/// (ADR-0022 Stage C). Diffs the desired role (from `authority × Controlled`)
+/// against a cached [`RenderRole`] and, on a transition, runs the flush/seed:
+/// - **→ Owned** (adopt / spawn-owned): drop `InterpBuffer`; clear
+///   `InputHistory` (now authoritative — no reconcile).
+/// - **→ Predicted** (relinquish-but-keep-control / Mode-3 avatar): drop
+///   `InterpBuffer`; ensure a fresh `InputHistory`.
+/// - **→ Interpolated** (relinquish to a remote / observe): drop `InputHistory`;
+///   ensure an `InterpBuffer` (kept if already present — a new proxy's buffer).
+///
+/// On a transition it also re-seeds `RenderPos` from the AUTHORITATIVE `Position`
+/// (never the stale interpolated `RenderPos`) so an entity is never left
+/// rendering ~DELAY in the past across a role change (the Phase-1 auditor's
+/// flagged adoption bug). In the standard schedule this seed is belt-and-braces:
+/// the same-frame `copy_owned_render`/`predict`/`interpolate` overwrite it in
+/// their respective roles — it is the sole writer only for a freshly-relinquished
+/// Interpolated entity whose buffer is still empty. The load-bearing effect is
+/// the component add/remove (drop a stale `InterpBuffer`/`InputHistory` so old
+/// snapshots can't lerp / old inputs can't replay against the new authority). An
+/// exclusive system for single-site, deterministic structural changes.
+pub fn reset_render_role(world: &mut World) {
+    let local = world.resource::<LocalPeer>().0;
+    let mut transitions: Vec<(Entity, RenderRole)> = Vec::new();
+    {
+        let mut q = world.query::<(Entity, &Owner, Option<&Controlled>, Option<&RenderRole>)>();
+        for (e, owner, controlled, cached) in q.iter(world) {
+            let desired = if authority_of(owner.0, local) == Authority::Local {
+                RenderRole::Owned
+            } else if controlled.is_some() {
+                RenderRole::Predicted
+            } else {
+                RenderRole::Interpolated
+            };
+            if cached.copied() != Some(desired) {
+                transitions.push((e, desired));
+            }
+        }
+    }
+    for (e, role) in transitions {
+        match role {
+            RenderRole::Owned => {
+                world.entity_mut(e).remove::<InterpBuffer>();
+                if let Some(mut hist) = world.get_mut::<InputHistory>(e) {
+                    hist.0.clear();
+                }
+            }
+            RenderRole::Predicted => {
+                world.entity_mut(e).remove::<InterpBuffer>();
+                if world.get::<InputHistory>(e).is_none() {
+                    world.entity_mut(e).insert(InputHistory::default());
+                }
+            }
+            RenderRole::Interpolated => {
+                world.entity_mut(e).remove::<InputHistory>();
+                if world.get::<InterpBuffer>(e).is_none() {
+                    world.entity_mut(e).insert(InterpBuffer::default());
+                }
+            }
+        }
+        // Seed RenderPos from the AUTHORITATIVE Position (never the stale interp).
+        if let Some(pos) = world.get::<Position>(e).copied()
+            && let Some(mut render) = world.get_mut::<RenderPos>(e)
+        {
+            render.x = pos.x;
+            render.y = pos.y;
+        }
+        world.entity_mut(e).insert(role);
+    }
+}
+
 /// Spawn a simulated entity with an explicit owner. In gameplay this is the
 /// spawner itself (the default-ownership rule: an entity is owned by the peer
 /// that creates it); the replication receive path passes the REMOTE owner when

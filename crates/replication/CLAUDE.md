@@ -25,7 +25,10 @@ new proxies. Interpolation itself lives in engine-core (`RenderPos`/`interpolate
 `apply_events` gains an `Input` arm (server queues into `PendingInputs`); `drain_inputs` (client sends un-sent
 `InputHistory` to the avatar's authority); `apply_state` prunes `InputHistory` by `StateMsg.last_input`
 (reconciliation); `collect_all` stamps per-peer `last_input` from `ProcessedInput`. The predicted avatar is
-`Remote` ⇒ the authority gate already excludes it (client emits inputs only, never state). Handoff: local Owner flips immediately (no double-authority window).
+`Remote` ⇒ the authority gate already excludes it (client emits inputs only, never state). **Stage C
+(handoff):** the `OwnershipTransfer` handler flushes the proxy's `InterpBuffer` on any authority change (source
+discontinuity); `drain_inputs` sends only for `authority==Remote` entities (no self-directed inputs). The
+role transition itself is engine-core's `reset_render_role`. Handoff: local Owner flips immediately (no double-authority window).
 `interest` submodule = `SpatialGrid` (cell-bucketed, floor-celled, exact-dist² filter) + `Aoi`. **46-test
 two-World battery + 5 grid unit tests + codec + e2e-over-real-transport green; netcode-audited THREE times (F1
 orphan blocker + its over-broad fix, both closed → MERGE).** Phase 3 still owns: interpolation buffers,

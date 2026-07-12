@@ -828,9 +828,17 @@ impl Replication {
                 if let Some(rec) = self.map.by_entity.get_mut(&proxy) {
                     rec.last_owner = new_owner;
                 }
-                // If new_owner == LocalPeer, authority_of flips to Local on
-                // the next simulate/collect — the receiver switches from
-                // apply to compute with no extra code path.
+                // Flush the interpolation buffer on ANY authority change
+                // (ADR-0022 Stage C): its snapshots came from the OLD owner;
+                // lerping across the source discontinuity would glide through a
+                // wrong intermediate. (If new_owner == local, the role reset
+                // removes the buffer entirely on adoption.) The role transition
+                // itself — flip apply↔compute, seed prediction from the
+                // authoritative Position — is `reset_render_role`'s job on the
+                // next render step (authority_of flips with no extra code path).
+                if let Some(mut buf) = world.get_mut::<InterpBuffer>(proxy) {
+                    buf.0.clear();
+                }
             }
             NetEvent::Ack { seq } => {
                 // Delta baseline (ADR-0020): `from` confirms it has applied up
@@ -875,11 +883,16 @@ impl Replication {
     /// `(target, bytes)`; the caller does `send_event(target, bytes)`. Call once
     /// per pump after recording inputs; the reliable channel delivers each once.
     pub fn drain_inputs(&mut self, world: &mut World) -> Vec<(PeerId, Box<[u8]>)> {
+        let local = world.resource::<LocalPeer>().0;
         // Snapshot (entity, authority, unsent inputs) so the world borrow ends
-        // before we mutate `input_sent`.
+        // before we mutate `input_sent`. Only entities we do NOT own (authority
+        // Remote — the predicted case) send inputs; a self-owned controlled
+        // avatar (Mode 1/2) computes directly and must not self-direct inputs
+        // (auditor N3 — matters once a handoff adopts a controlled avatar).
         let pending: Vec<(Entity, PeerId, Vec<Input>)> = {
             let mut q = world.query::<(Entity, &Owner, &Controlled, &InputHistory)>();
             q.iter(world)
+                .filter(|(_, owner, _, _)| authority_of(owner.0, local) == Authority::Remote)
                 .filter_map(|(entity, owner, _, hist)| {
                     let sent = self.input_sent.get(&entity).copied().unwrap_or(0);
                     let inputs: Vec<Input> =
