@@ -736,5 +736,21 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   MERGE (byte-identity + invariants intact: authority-gate-first, no `Changed`, deterministic `NetEntityId`
   order, single per-tick quantization; the only delta is a release-invisible earlier `debug_assert` on a
   documented sim bug — arguably an improvement).
-- **Stages b, c:** pending (b: two-radius hysteresis; c: opt-in per-client avatar + AOI focus hook).
-- **Status:** Stage a Accepted (2026-07-12); b + c in progress.
+- **Stage b — AOI-flicker hysteresis (Accepted 2026-07-12):** the `Aoi` circle gained a two-radius band
+  (`radius_inner`, `radius_outer`) — an entity ENTERS at `dist ≤ r_inner` and EXITS only at `dist > r_outer`;
+  in the band a known entity stays and an unknown one is withheld, so one oscillating across the boundary no
+  longer churns Spawn/Despawn. `collect_all` derives `visible_outer` (EXIT `!visible_outer` + STATE
+  `visible_known` + the unbounded arm) and `visible_inner` (ENTER only) from two `in_radius` scans; the
+  per-peer order (dead→transfer→exit→enter→state) is untouched. The band read-cheat holds: an entity in the
+  band never inside `r_inner` is fully withheld (enter uses `visible_inner ∩ !known`, state uses `known ∩
+  visible_outer`). `set_aoi(peer,center,radius)` is the degenerate band `inner==outer==radius` (the
+  pre-hysteresis single boundary — keeps Groups A–H green); new `set_aoi_hysteresis(peer,center,r_inner,
+  r_outer)` (`debug_assert r_inner≤r_outer`, and a release fail-safe `r_outer = r_outer.max(r_inner)` so an
+  inverted band degrades to the safe single radius, not per-tick churn — auditor F1). Evidence: two_world 74
+  green (new B6 no-churn-in-band, B7 baseline-survives-band-dip, B8 enter-at-inner/exit-at-outer + the band
+  read-cheat, B9 degenerate==single; A–H the backward-compat guardrail); full workspace green; clippy `-D
+  warnings` native + wasm32; fmt clean. netcode-audited → MERGE (wiring correct, band read-cheat sealed,
+  baseline survival holds; auditor F1 actioned, F2/F3 test-strength gaps closed — B8 now asserts state
+  continues for a known band entity, B7 asserts no Despawn on the dip).
+- **Stage c:** pending (opt-in per-client avatar + AOI focus hook).
+- **Status:** Stages a + b Accepted (2026-07-12); c in progress.

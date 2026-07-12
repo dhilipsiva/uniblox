@@ -469,19 +469,35 @@ impl Replication {
                 }
             }
 
-            // This peer's visible set: its AOI circle, or all owned if unbounded.
-            let visible: HashSet<Entity> = match aoi_p {
-                Some(a) => grid.in_radius(a.center, a.radius).into_iter().collect(),
-                None => owned.keys().copied().collect(),
+            // This peer's visible sets with a hysteresis band (ADR-0023 b):
+            // `visible_outer` is the EXIT / STATE boundary, `visible_inner` the
+            // ENTER boundary. A single-radius AOI (`set_aoi`) is the degenerate
+            // band `inner == outer`, so the two coincide and behavior is the
+            // pre-hysteresis single boundary. Unbounded ⇒ both are all owned.
+            let (visible_outer, visible_inner): (HashSet<Entity>, HashSet<Entity>) = match aoi_p {
+                Some(a) => (
+                    grid.in_radius(a.center, a.radius_outer)
+                        .into_iter()
+                        .collect(),
+                    grid.in_radius(a.center, a.radius_inner)
+                        .into_iter()
+                        .collect(),
+                ),
+                None => {
+                    let all: HashSet<Entity> = owned.keys().copied().collect();
+                    (all.clone(), all)
+                }
             };
 
-            // AOI-EXIT — known but no longer visible (still owned): despawn the
-            // proxy and drop its baseline (so a re-enter re-baselines from
-            // scratch — the run-start soundness across the visibility gap).
+            // AOI-EXIT — known but past the OUTER radius (still owned): despawn
+            // the proxy and drop its baseline (so a re-enter re-baselines from
+            // scratch — the run-start soundness across the visibility gap). A
+            // band entity (inner < dist ≤ outer) stays IN `visible_outer`, so it
+            // is NOT exited — the hysteresis anti-churn.
             let mut exits: Vec<Entity> = known_p
                 .iter()
                 .copied()
-                .filter(|e| owned.contains_key(e) && !visible.contains(e))
+                .filter(|e| owned.contains_key(e) && !visible_outer.contains(e))
                 .collect();
             exits.sort_by_key(|e| owned.get(e).map(|r| r.id));
             for e in exits {
@@ -500,8 +516,11 @@ impl Replication {
             // so a peer that never saw the original Spawn drops our state until
             // Phase-3 resync (the documented cross-sender late-join gap). Either
             // way it enters `known` so the state pass below sends it (send_p
-            // None ⇒ fresh run).
-            let mut enters: Vec<Entity> = visible
+            // None ⇒ fresh run). Enter uses the INNER radius: an entity in the
+            // band that was never inside `r_inner` is NOT entered (and, being
+            // un-`known`, is not stated below either — existence withheld in the
+            // band, the read-cheat defense).
+            let mut enters: Vec<Entity> = visible_inner
                 .iter()
                 .copied()
                 .filter(|e| owned.contains_key(e) && !known_p.contains(e))
@@ -528,7 +547,7 @@ impl Replication {
             let mut visible_known: Vec<Entity> = known_p
                 .iter()
                 .copied()
-                .filter(|e| visible.contains(e))
+                .filter(|e| visible_outer.contains(e))
                 .collect();
             visible_known.sort_by_key(|e| owned.get(e).map(|r| r.id));
             for &e in &visible_known {
@@ -981,8 +1000,49 @@ impl Replication {
     /// Mode-3 read-cheat defense MUST `set_aoi` for every peer; a forgotten call
     /// silently reveals all owned entities. (Mode 3's demo leaves it unset on
     /// purpose — clients see everything until a real gameplay focus exists.)
+    ///
+    /// This sets a SINGLE radius (the degenerate hysteresis band `inner ==
+    /// outer`) — the pre-ADR-0023 single-boundary behavior. For flicker-free
+    /// edges use [`set_aoi_hysteresis`].
     pub fn set_aoi(&mut self, peer: PeerId, center: (f32, f32), radius: f32) {
-        self.aoi.insert(peer, Aoi { center, radius });
+        self.aoi.insert(
+            peer,
+            Aoi {
+                center,
+                radius_inner: radius,
+                radius_outer: radius,
+            },
+        );
+    }
+
+    /// Set (or update) a peer's AOI with a HYSTERESIS band (ADR-0023 b): an
+    /// entity ENTERS at `dist ≤ r_inner` and EXITS only at `dist > r_outer`, so
+    /// one oscillating across the boundary doesn't churn Spawn/Despawn. Same
+    /// FAIL-OPEN caveat as [`set_aoi`] (unset ⇒ unbounded). `r_inner ≤ r_outer`.
+    pub fn set_aoi_hysteresis(
+        &mut self,
+        peer: PeerId,
+        center: (f32, f32),
+        r_inner: f32,
+        r_outer: f32,
+    ) {
+        debug_assert!(
+            r_inner <= r_outer,
+            "AOI hysteresis needs r_inner ({r_inner}) <= r_outer ({r_outer})"
+        );
+        // Fail-safe in release (where the assert is compiled out): an inverted
+        // band would churn Spawn/Despawn every tick in the annulus and starve the
+        // proxy of state — clamp to the degenerate single radius instead (auditor
+        // F1). AOI bands are code/server-set, so this only guards developer error.
+        let r_outer = r_outer.max(r_inner);
+        self.aoi.insert(
+            peer,
+            Aoi {
+                center,
+                radius_inner: r_inner,
+                radius_outer: r_outer,
+            },
+        );
     }
 
     /// Drop a departed peer from the tracked set and ALL per-peer state. The

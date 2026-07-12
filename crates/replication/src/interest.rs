@@ -18,12 +18,20 @@ use bevy_ecs::entity::Entity;
 /// (which is per-peer) — a query iterates `ceil(radius / cell)` cells per axis.
 pub(crate) const DEFAULT_CELL: f32 = 16.0;
 
-/// A peer's area of interest: a circle in world space. Absent (no AOI set for a
-/// peer) means "unbounded" — that peer sees every owned entity.
+/// A peer's area of interest: a circle in world space with a HYSTERESIS band
+/// (ADR-0023 b). An entity ENTERS the AOI at `dist ≤ radius_inner` and EXITS
+/// only at `dist > radius_outer`; in the band (`radius_inner < dist ≤
+/// radius_outer`) a known entity stays and an unknown one is withheld — so an
+/// entity oscillating across the boundary doesn't churn Spawn/Despawn. A
+/// single-radius AOI (`set_aoi`) sets `radius_inner == radius_outer` (the
+/// degenerate band = the pre-hysteresis single boundary). Absent (no AOI set for
+/// a peer) means "unbounded" — that peer sees every owned entity. Invariant:
+/// `radius_inner ≤ radius_outer`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Aoi {
     pub center: (f32, f32),
-    pub radius: f32,
+    pub radius_inner: f32,
+    pub radius_outer: f32,
 }
 
 /// Integer grid cell coordinate.
