@@ -29,8 +29,14 @@ packet-loss); the R6 cross-sender reordering gap (frozen wrong-owner proxy) HEAL
 digest→request→`ResyncSpawn` round (own-authority + responder-owns + AOI re-guards); and `server::net_pump`
 now DRIVES resync — requests/responses every frame, digests on a slow `RESYNC_INTERVAL` (500 ms) accumulator —
 proven by `resync_heals_injected_desync_over_pump` (an injected desync self-heals over real transport).
-Next Phase-3 threads: double-ownership coordination / host-migration (also heals the E4 never-witnessed-owner
-orphan resync can't).
+**Ownership-handoff failure modes (ADR-0025) underway:** stage B — host-migration reassignment on owner-drop
+(`reassign_orphans`: each survivor deterministically re-tags a departed owner's entities to the lowest-peer-ID
+survivor via `elect_owner`, with NO wire event — authority is derived; the elected survivor simulates, the
+rest re-tag their proxy) DONE, and it CLOSES the ADR-0024 E4 orphan (exactly one survivor now holds a Local
+proxy → witnesses heal via state, non-witnesses via resync). Remaining: the double-ownership coordinator-seq
+arbitration (full claim/commit/reject through a coordinator = lowest-peer-ID; a per-entity `OwnerSeq` gate on
+every owner-mutating apply; WIRE 4→5) — a large coupled build, decided design in the TODO. Next Phase-3
+threads: that double-ownership arbitration; cross-owner interaction rules.
 
 ## Done
 - **Cargo workspace** — virtual manifest, 9 crates under `crates/*` (glob members),
