@@ -149,6 +149,11 @@ fn event_round_trip_reserves_signature() {
             id: id(1, 7, 0),
             new_owner: PeerId(9),
         },
+        NetEvent::Ack { seq: 42 },
+        NetEvent::Input {
+            seq: 7,
+            intent: quantize_vec2(1.0, -1.0),
+        },
     ];
     for event in events {
         let unsigned = EventMsg {

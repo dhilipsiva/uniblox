@@ -10,8 +10,9 @@
 
 use bevy_ecs::prelude::*;
 use engine_core::{
-    INTERP_DELAY_TICKS, Owner, Position, RenderPos, RenderTick, Tick, Velocity, copy_owned_render,
-    insert_sim, interpolate, simulate, spawn_owned,
+    Controlled, ControlledBy, INTERP_DELAY_TICKS, InputHistory, Intent, InterpBuffer, Owner,
+    Position, RenderPos, RenderTick, Tick, Velocity, apply_input, copy_owned_render, insert_sim,
+    interpolate, predict, record_input, simulate, spawn_owned,
 };
 use protocol::{
     EventMsg, NetEntityId, NetEvent, PeerId, StateEntry, WIRE_VERSION, decode_event, decode_state,
@@ -35,14 +36,16 @@ impl TestPeer {
     fn new(id: u64) -> Self {
         let mut world = World::new();
         insert_sim(&mut world, PeerId(id), DT);
+        // Sim: apply_input (server, ADR-0022 — no-op without ControlledBy) then
+        // simulate. One input per tick BEFORE integration.
         let mut schedule = Schedule::default();
-        schedule.add_systems(simulate);
-        // The render step (ADR-0022): interpolated remotes lerp their snapshot
-        // buffer, then owned entities copy Position — both write only RenderPos,
-        // so copy_owned_render runs LAST (an adopted entity may still carry a
-        // stale InterpBuffer; Local authority must win). Chained for that order.
+        schedule.add_systems((apply_input, simulate).chain());
+        // The render step (ADR-0022): interpolated remotes lerp their buffer,
+        // then predicted (controlled) entities replay their input history, then
+        // owned entities copy Position — all write only RenderPos; ordered so
+        // predict wins over a stale InterpBuffer and Local authority wins last.
         let mut render = Schedule::default();
-        render.add_systems((interpolate, copy_owned_render).chain());
+        render.add_systems((interpolate, predict, copy_owned_render).chain());
         let repl = Replication::new(&mut world);
         TestPeer {
             id: PeerId(id),
@@ -85,6 +88,32 @@ impl TestPeer {
 
     fn render_pos(&self, e: Entity) -> RenderPos {
         *self.world.get::<RenderPos>(e).unwrap()
+    }
+
+    /// CLIENT: designate this proxy as the locally-controlled avatar (predicted
+    /// role) — add `Controlled` + `InputHistory`, drop the interpolation buffer.
+    fn set_controlled(&mut self, e: Entity) {
+        self.world
+            .entity_mut(e)
+            .insert((Controlled { next_seq: 1 }, InputHistory::default()))
+            .remove::<InterpBuffer>();
+    }
+
+    /// SERVER: mark this entity as driven by `peer` (the authority applies that
+    /// peer's inputs to it).
+    fn set_controlled_by(&mut self, e: Entity, peer: PeerId) {
+        self.world.entity_mut(e).insert(ControlledBy(peer));
+    }
+
+    /// CLIENT: record one input (desired velocity) on a controlled entity.
+    fn feed_input(&mut self, e: Entity, vx: f32, vy: f32) {
+        record_input(&mut self.world, e, Intent { vx, vy });
+    }
+
+    /// Read the velocity of an entity (for the "prediction touches no
+    /// authoritative Velocity" assertion).
+    fn vel(&self, e: Entity) -> Velocity {
+        *self.world.get::<Velocity>(e).unwrap()
     }
 
     /// Track a destination peer so `collect_all` produces its outbox.
@@ -182,6 +211,30 @@ fn flush_acks(receiver: &mut TestPeer, sender: &mut TestPeer) {
 /// The outbox `collect_all` produced for peer `p`, if any.
 fn outbox_for(outs: &[(PeerId, Outbox)], p: PeerId) -> Option<&Outbox> {
     outs.iter().find(|(peer, _)| *peer == p).map(|(_, o)| o)
+}
+
+/// Drain `client`'s inputs and deliver them to the avatar's authority `server`
+/// (ADR-0022 Stage B) — the input-flow analogue of `flush_acks`.
+fn flush_inputs(client: &mut TestPeer, server: &mut TestPeer) {
+    let inputs = client.repl.drain_inputs(&mut client.world);
+    for (target, bytes) in inputs {
+        assert_eq!(target, server.id, "an input targets the avatar's authority");
+        server
+            .repl
+            .apply_events(&mut server.world, client.id, &bytes);
+    }
+}
+
+/// Stand up a Mode-3-style controlled avatar: `s` (server) owns E at (x,y) and
+/// marks it `ControlledBy(c)`; `c` (client) builds a proxy for E and designates
+/// it its controlled/predicted avatar. Returns (E on server, proxy on client).
+fn controlled_avatar(s: &mut TestPeer, c: &mut TestPeer, x: f32, y: f32) -> (Entity, Entity) {
+    let e = s.spawn(x, y, 0.0, 0.0);
+    s.set_controlled_by(e, c.id);
+    c.deliver_all(s.id, &s.collect_for(c.id)); // C builds the proxy
+    let proxy = c.entity_owned_by(s.id);
+    c.set_controlled(proxy);
+    (e, proxy)
 }
 
 fn state_entries(outbox: &Outbox) -> Vec<StateEntry> {
@@ -1790,4 +1843,314 @@ fn owned_render_tracks_position() {
         "owned render tracks the authoritative Position"
     );
     assert!(auth.x > 3.0, "owned entity moved under the local sim");
+}
+
+// ═══════════ Stage B — predict-own + input + reconciliation (ADR-0022) ═══════════
+
+/// Build + deliver a manual snapshot to `c` from `s` for entity id (of server
+/// entity `e`): seq, last_input, and (x,y). For the LWW / marker tests.
+fn deliver_snapshot(
+    c: &mut TestPeer,
+    s: PeerId,
+    e_id: NetEntityId,
+    seq: u64,
+    last_input: u64,
+    x: f32,
+    y: f32,
+) {
+    let bytes = protocol::encode_state(&protocol::StateMsg {
+        version: protocol::WIRE_VERSION,
+        seq,
+        tick: 0,
+        last_input,
+        entries: vec![StateEntry {
+            id: e_id,
+            pos: Some(protocol::quantize_vec2(x, y)),
+            vel: None,
+        }],
+    })
+    .unwrap();
+    c.deliver_state(s, &bytes);
+}
+
+/// SB1 — one input moves the render position IMMEDIATELY (no round-trip lag),
+/// while the authoritative Position is untouched.
+#[test]
+fn predicted_avatar_has_no_input_lag() {
+    let mut s = TestPeer::new(1);
+    let mut c = TestPeer::new(2);
+    let (_e, proxy) = controlled_avatar(&mut s, &mut c, 0.0, 0.0);
+    c.feed_input(proxy, 2.0, 0.0);
+    c.run_render();
+    assert!(
+        c.render_pos(proxy).x > TOL,
+        "input moves the render position immediately"
+    );
+    assert!(
+        approx(c.pos(proxy).x, 0.0),
+        "authoritative Position not yet advanced"
+    );
+}
+
+/// SB2 — the predicted avatar LEADS the authority by the un-acked input window.
+#[test]
+fn predicted_avatar_leads_authority_by_input_window() {
+    let mut s = TestPeer::new(1);
+    let mut c = TestPeer::new(2);
+    let (e, proxy) = controlled_avatar(&mut s, &mut c, 0.0, 0.0);
+    for _ in 0..4 {
+        c.feed_input(proxy, 1.0, 0.0);
+    }
+    c.run_render();
+    flush_inputs(&mut c, &mut s);
+    for _ in 0..2 {
+        s.sim_tick(); // server processes 2 of the 4
+    }
+    assert!(approx(s.pos(e).x, 1.0), "server processed 2 inputs");
+    c.deliver_all(s.id, &s.collect_for(c.id)); // last_input = 2, pos 1.0
+    c.run_render();
+    let auth = c.pos(proxy).x; // 1.0
+    let render = c.render_pos(proxy).x; // 1.0 + 2 un-acked * 0.5 = 2.0
+    assert!(approx(auth, 1.0), "authority through 2 inputs");
+    assert!(approx(render, 2.0), "render leads by the 2 un-acked inputs");
+    assert!(render > auth + TOL, "prediction leads the authority");
+}
+
+/// SB3 — prediction writes ONLY RenderPos; authoritative Position AND Velocity
+/// are untouched (the predicted avatar is Remote — the sender never emits it).
+#[test]
+fn prediction_writes_only_render_pos() {
+    let mut s = TestPeer::new(1);
+    let mut c = TestPeer::new(2);
+    let (_e, proxy) = controlled_avatar(&mut s, &mut c, 5.0, 7.0);
+    let pos_before = c.pos(proxy);
+    let vel_before = c.vel(proxy);
+    for _ in 0..3 {
+        c.feed_input(proxy, 2.0, -1.0);
+    }
+    c.run_render();
+    assert_eq!(
+        c.pos(proxy).x.to_bits(),
+        pos_before.x.to_bits(),
+        "prediction must not touch Position"
+    );
+    assert_eq!(c.pos(proxy).y.to_bits(), pos_before.y.to_bits());
+    assert_eq!(
+        c.vel(proxy).x.to_bits(),
+        vel_before.x.to_bits(),
+        "prediction must not touch Velocity"
+    );
+    assert_eq!(c.vel(proxy).y.to_bits(), vel_before.y.to_bits());
+    assert!(
+        (c.render_pos(proxy).x - pos_before.x).abs() > TOL,
+        "RenderPos advanced"
+    );
+}
+
+/// SB4 ★ reconciliation snaps to the authority + replays un-acked inputs and
+/// CONVERGES: the re-anchor never moves a correct prediction (no oscillation),
+/// and once all inputs are processed RenderPos == Position.
+#[test]
+fn reconcile_snaps_and_replays_converges() {
+    let mut s = TestPeer::new(1);
+    let mut c = TestPeer::new(2);
+    let (e, proxy) = controlled_avatar(&mut s, &mut c, 0.0, 0.0);
+
+    for _ in 0..5 {
+        c.feed_input(proxy, 1.0, 0.0);
+    }
+    c.run_render();
+    assert!(
+        approx(c.render_pos(proxy).x, 2.5),
+        "predicted 5 steps ahead"
+    );
+    assert!(approx(c.pos(proxy).x, 0.0), "authority not advanced yet");
+    flush_inputs(&mut c, &mut s);
+
+    for _ in 0..3 {
+        s.sim_tick(); // process 3 of 5
+    }
+    c.deliver_all(s.id, &s.collect_for(c.id)); // last_input 3, pos 1.5
+    assert!(
+        approx(c.pos(proxy).x, 1.5),
+        "reconcile snapped Position to the authority"
+    );
+    c.run_render();
+    assert!(
+        approx(c.render_pos(proxy).x, 2.5),
+        "re-anchored — prediction unchanged (no oscillation)"
+    );
+
+    for _ in 0..2 {
+        s.sim_tick(); // process the rest
+    }
+    c.deliver_all(s.id, &s.collect_for(c.id)); // last_input 5
+    c.run_render();
+    assert!(
+        approx(c.render_pos(proxy).x, 2.5) && approx(c.pos(proxy).x, 2.5),
+        "converged: RenderPos == Position"
+    );
+    assert!(approx(s.pos(e).x, 2.5), "authority processed all 5");
+}
+
+/// SB5 — a CORRECT prediction reconciles with NO pop: the snapshot apply doesn't
+/// move RenderPos (client math == server math).
+#[test]
+fn reconcile_no_oscillation_on_correct_prediction() {
+    let mut s = TestPeer::new(1);
+    let mut c = TestPeer::new(2);
+    let (_e, proxy) = controlled_avatar(&mut s, &mut c, 0.0, 0.0);
+    for _ in 0..10 {
+        c.feed_input(proxy, 1.0, 0.0);
+        c.run_render();
+        let before = c.render_pos(proxy).x;
+        flush_inputs(&mut c, &mut s);
+        s.sim_tick();
+        c.deliver_all(s.id, &s.collect_for(c.id)); // reconcile
+        c.run_render();
+        let after = c.render_pos(proxy).x;
+        assert!(
+            approx(before, after),
+            "correct prediction reconciles with no pop: {before} vs {after}"
+        );
+    }
+}
+
+/// SB6 — the server applies each input seq EXACTLY once (a duplicate is skipped
+/// without consuming a tick); `last_input` is monotonic; the client converges.
+#[test]
+fn reconcile_bounded_under_input_reorder() {
+    let mut s = TestPeer::new(1);
+    let mut c = TestPeer::new(2);
+    let (e, proxy) = controlled_avatar(&mut s, &mut c, 0.0, 0.0);
+    for _ in 0..3 {
+        c.feed_input(proxy, 1.0, 0.0);
+    }
+    let inputs = c.repl.drain_inputs(&mut c.world); // seq 1, 2, 3
+    assert_eq!(inputs.len(), 3);
+    // Deliver I1, I1(dup), I2, I3 — the dup must be ignored (seq <= last).
+    for &i in &[0usize, 0, 1, 2] {
+        s.repl.apply_events(&mut s.world, c.id, &inputs[i].1);
+    }
+    // 3 sim ticks process exactly the 3 DISTINCT inputs (the dup costs no tick):
+    // pos = 3 * 0.5 = 1.5. A double-apply would have left I3 unprocessed here.
+    for _ in 0..3 {
+        s.sim_tick();
+    }
+    assert!(
+        approx(s.pos(e).x, 1.5),
+        "each distinct input applied exactly once"
+    );
+    c.deliver_all(s.id, &s.collect_for(c.id)); // last_input 3
+    c.run_render();
+    assert!(
+        approx(c.pos(proxy).x, 1.5) && approx(c.render_pos(proxy).x, 1.5),
+        "converged after the duplicate"
+    );
+}
+
+/// SB7 — a stale (older-seq) snapshot with a smaller last_input is LWW-dropped
+/// and does NOT un-prune the input history or overwrite the Position.
+#[test]
+fn stale_snapshot_marker_monotonic() {
+    let mut s = TestPeer::new(1);
+    let mut c = TestPeer::new(2);
+    let (e, proxy) = controlled_avatar(&mut s, &mut c, 0.0, 0.0);
+    let id = net_id(s.id, e);
+    for _ in 0..3 {
+        c.feed_input(proxy, 1.0, 0.0);
+    }
+    // Fresh snapshot: seq 10, last_input 2, pos 1.0 ⇒ prunes I1,I2, history=[I3].
+    deliver_snapshot(&mut c, s.id, id, 10, 2, 1.0, 0.0);
+    // Stale snapshot: seq 5 (< 10), last_input 0, pos 99 ⇒ LWW-dropped.
+    deliver_snapshot(&mut c, s.id, id, 5, 0, 99.0, 0.0);
+    c.run_render();
+    assert!(
+        approx(c.pos(proxy).x, 1.0),
+        "the stale snapshot's Position was LWW-dropped"
+    );
+    assert!(
+        approx(c.render_pos(proxy).x, 1.5),
+        "history still [I3] (1.0 + 1 input) — the stale marker did not un-prune"
+    );
+}
+
+/// SB8 — the client NEVER emits authored state/events for its predicted avatar
+/// (it is Remote/server-owned ⇒ the authority gate excludes it); only inputs
+/// flow, via the input channel.
+#[test]
+fn client_never_sends_state_for_predicted_avatar() {
+    let mut s = TestPeer::new(1);
+    let mut c = TestPeer::new(2);
+    let (_e, proxy) = controlled_avatar(&mut s, &mut c, 0.0, 0.0);
+    c.feed_input(proxy, 1.0, 0.0);
+    c.run_render();
+    c.track(s.id);
+    let outs = c.collect_all();
+    assert!(
+        outs.is_empty(),
+        "the client authors no state/events for its predicted avatar"
+    );
+    assert!(
+        !c.repl.drain_inputs(&mut c.world).is_empty(),
+        "inputs flow via the input channel instead"
+    );
+}
+
+/// SB9 ★ THE headline reconciliation: correcting a WRONG prediction. When the
+/// authority's Position DIVERGES from the client's prediction, the snapshot
+/// re-anchors RenderPos to server truth and replays the un-acked inputs from
+/// there — the correction the whole stack exists for (auditor F6).
+#[test]
+fn reconcile_corrects_a_wrong_prediction() {
+    let mut s = TestPeer::new(1);
+    let mut c = TestPeer::new(2);
+    let (e, proxy) = controlled_avatar(&mut s, &mut c, 0.0, 0.0);
+    let id = net_id(s.id, e);
+    for _ in 0..3 {
+        c.feed_input(proxy, 1.0, 0.0);
+    }
+    c.run_render();
+    assert!(approx(c.render_pos(proxy).x, 1.5), "client predicted ahead");
+    // The authority DIVERGES: it processed input 1 but the avatar is at 5.0
+    // (not the predicted 0.5) — e.g. a wall / server push. seq 10 > last_seq 1.
+    deliver_snapshot(&mut c, s.id, id, 10, 1, 5.0, 0.0);
+    c.run_render();
+    assert!(
+        approx(c.pos(proxy).x, 5.0),
+        "Position snapped to the divergent authority"
+    );
+    assert!(
+        approx(c.render_pos(proxy).x, 6.0),
+        "RenderPos corrected to server (5.0) + the 2 un-acked inputs (1.0)"
+    );
+}
+
+/// SB10 — on UNDERRUN (the client's inputs stop arriving) the server zeros
+/// velocity and stops, rather than drifting on a held velocity — matching the
+/// client's replay (no input ⇒ no displacement), so no forward pop (auditor F3).
+#[test]
+fn underrun_stops_server_matching_client() {
+    let mut s = TestPeer::new(1);
+    let mut c = TestPeer::new(2);
+    let (e, proxy) = controlled_avatar(&mut s, &mut c, 0.0, 0.0);
+    for _ in 0..2 {
+        c.feed_input(proxy, 1.0, 0.0);
+    }
+    c.run_render();
+    flush_inputs(&mut c, &mut s);
+    // Process the 2 inputs, then 3 MORE ticks with an empty queue (underrun).
+    for _ in 0..5 {
+        s.sim_tick();
+    }
+    assert!(
+        approx(s.pos(e).x, 1.0),
+        "underrun stops the server (no held-velocity drift past the inputs)"
+    );
+    c.deliver_all(s.id, &s.collect_for(c.id)); // last_input 2, pos 1.0
+    c.run_render();
+    assert!(
+        approx(c.pos(proxy).x, 1.0) && approx(c.render_pos(proxy).x, 1.0),
+        "client converged with no forward pop"
+    );
 }
