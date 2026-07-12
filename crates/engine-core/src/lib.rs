@@ -14,10 +14,10 @@
 //!   determinism — receivers apply replicated snapshots and interpolate).
 //! - Single-ownership: exactly one [`Owner`] per entity; default owner = spawner.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use bevy_ecs::prelude::*;
-use protocol::PeerId;
+use protocol::{PeerId, dequantize, quantize};
 
 /// 2D position, in world units. Plain `f32` fields (not a math-lib type): the
 /// replication quantizer (fixed-point positions, later in Phase 1) walks these
@@ -99,6 +99,64 @@ pub const INTERP_DELAY_TICKS: f64 = 6.4;
 
 /// Max buffered snapshots per interpolated entity (~1.6 s at 20 Hz net).
 const INTERP_BUFFER_CAP: usize = 32;
+
+/// The 2D intent of one input command (ADR-0022 Stage B): a desired velocity for
+/// the mini-game (whose sim is `pos += vel*dt`). Set by the input device / test.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct Intent {
+    pub vx: f32,
+    pub vy: f32,
+}
+
+/// One input command: a monotonic per-controlled-entity `seq` + its `intent`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Input {
+    pub seq: u64,
+    pub intent: Intent,
+}
+
+/// CLIENT marker (ADR-0022): THIS instance drives this entity with input and
+/// mints its monotonic input seqs. Orthogonal to [`Owner`] — in Mode 3 the
+/// avatar is `Controlled` here yet owned (authority) by the server: the
+/// PREDICTED role (`authority == Remote` + `Controlled`).
+#[derive(Component, Clone, Copy, Debug)]
+pub struct Controlled {
+    pub next_seq: u64,
+}
+
+/// AUTHORITY marker (ADR-0022): this entity is driven by the given peer — the
+/// authority applies that peer's inputs to it. The client↔avatar association
+/// (session join, future) sets this; tests designate it.
+///
+/// SCOPE (auditor F2): Stage B assumes ONE controlled entity per peer (the
+/// Mode-3 avatar model). The reconciliation marker `StateMsg.last_input` is
+/// per-peer-message and `ProcessedInput` is per-peer, so two entities marked
+/// with the same peer would share one input stream (the second starves).
+/// Multi-avatar-per-peer needs a per-entity wire marker — a future item.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct ControlledBy(pub PeerId);
+
+/// CLIENT (ADR-0022): applied-but-unacked inputs on the controlled avatar,
+/// replayed each [`predict`] tick from the authoritative anchor. Pruned by the
+/// reconciliation marker; capped ([`INPUT_CAP`]) — bounded prediction error if
+/// the authority stalls.
+#[derive(Component, Default)]
+pub struct InputHistory(pub VecDeque<Input>);
+
+/// SERVER (ADR-0022): per-controlled-entity input jitter buffer, filled by the
+/// receiver, drained ONE-per-tick by [`apply_input`].
+#[derive(Resource, Default)]
+pub struct PendingInputs(pub HashMap<Entity, VecDeque<Input>>);
+
+/// SERVER (ADR-0022): the newest input seq PROCESSED per controlling peer —
+/// stamped into that peer's snapshot as the reconciliation marker
+/// (`StateMsg.last_input`).
+#[derive(Resource, Default)]
+pub struct ProcessedInput(pub HashMap<PeerId, u64>);
+
+/// Max buffered inputs (client history / server pending) — bounds prediction
+/// error / server memory if a peer stalls.
+const INPUT_CAP: usize = 128;
 
 /// The result of the authority decision for one entity in one instance.
 /// Deliberately binary — handoff needs no third state (it mutates [`Owner`]).
@@ -232,6 +290,111 @@ pub fn push_snapshot(buf: &mut InterpBuffer, snap: Snapshot) {
     }
 }
 
+/// CLIENT (ADR-0022): record an input on a controlled entity — mint
+/// `Input{next_seq, intent}`, push it to the entity's [`InputHistory`], and bump
+/// `next_seq`. The input device / test calls this once per sim tick before
+/// [`predict`]. No-op if the entity isn't `Controlled` / has no history.
+pub fn record_input(world: &mut World, entity: Entity, intent: Intent) {
+    // Store the intent EXACTLY as it will cross the wire (quantize → dequantize),
+    // so the client's replay reproduces the server's applied Velocity bit-for-bit
+    // for a representable value — a correct prediction reconciles with NO pop
+    // (auditor F1: predicting the raw value left a sub-unit pop each snapshot).
+    let intent = Intent {
+        vx: dequantize(quantize(intent.vx)),
+        vy: dequantize(quantize(intent.vy)),
+    };
+    let Some(seq) = world.get_mut::<Controlled>(entity).map(|mut c| {
+        let s = c.next_seq;
+        c.next_seq += 1;
+        s
+    }) else {
+        return;
+    };
+    if let Some(mut hist) = world.get_mut::<InputHistory>(entity) {
+        hist.0.push_back(Input { seq, intent });
+        while hist.0.len() > INPUT_CAP {
+            hist.0.pop_front();
+        }
+    }
+}
+
+/// CLIENT prediction (ADR-0022): for each controlled entity, recompute
+/// `RenderPos` from the authoritative `Position` ANCHOR + replay of the un-acked
+/// [`InputHistory`] (one dt step per input). Recomputed from the anchor every
+/// tick — so it never accumulates float error and re-pins to server truth on
+/// every snapshot. NEVER writes authoritative `Position`/`Velocity` (the
+/// predicted avatar is `Remote`, so the sender structurally never emits it).
+pub fn predict(
+    dt: Res<SimDt>,
+    mut q: Query<(&Position, &InputHistory, &mut RenderPos), With<Controlled>>,
+) {
+    for (pos, hist, mut render) in &mut q {
+        let (mut x, mut y) = (pos.x, pos.y);
+        for input in &hist.0 {
+            x += input.intent.vx * dt.0;
+            y += input.intent.vy * dt.0;
+        }
+        render.x = x;
+        render.y = y;
+    }
+}
+
+/// SERVER (ADR-0022): process ONE queued input per controlled entity — set its
+/// authoritative `Velocity = intent` (or ZERO on underrun) and record
+/// `ProcessedInput[peer] = seq`. Runs in `FixedUpdate` BEFORE `simulate`, so
+/// `simulate` integrates exactly ONE input's displacement per tick — the
+/// alignment that lets the client's replay (one `intent*dt` per history entry)
+/// reproduce the server and reconciliation converge. Skips a seq ≤
+/// already-processed (duplicate/stale, consumes no tick). On underrun (no fresh
+/// input) it ZEROS Velocity — matching `predict`, which adds nothing for a tick
+/// with no input (a "held" velocity would move the server past the client's
+/// replay ⇒ a forward pop on every stall — auditor F3). Inputs MUST arrive
+/// reliable+ordered: a gap advances the marker past the missing input, which the
+/// client then over-prunes with no recovery (no anti-entropy for inputs).
+pub fn apply_input(
+    mut pending: ResMut<PendingInputs>,
+    mut processed: ResMut<ProcessedInput>,
+    mut q: Query<(Entity, &ControlledBy, &mut Velocity)>,
+) {
+    for (entity, controlled_by, mut vel) in &mut q {
+        let peer = controlled_by.0;
+        let last = processed.0.get(&peer).copied().unwrap_or(0);
+        let mut fresh = None;
+        if let Some(queue) = pending.0.get_mut(&entity) {
+            while let Some(input) = queue.front().copied() {
+                queue.pop_front();
+                if input.seq <= last {
+                    continue; // duplicate / already processed — skip, don't consume a tick
+                }
+                fresh = Some(input);
+                break; // exactly ONE fresh input per tick
+            }
+        }
+        match fresh {
+            Some(input) => {
+                vel.x = input.intent.vx;
+                vel.y = input.intent.vy;
+                processed.0.insert(peer, input.seq);
+            }
+            None => {
+                // Underrun: no movement this tick (matches the client's replay).
+                vel.x = 0.0;
+                vel.y = 0.0;
+            }
+        }
+    }
+}
+
+/// SERVER receiver helper (ADR-0022): queue a received input for its controlled
+/// entity, capping the jitter buffer at [`INPUT_CAP`].
+pub fn push_pending_input(pending: &mut PendingInputs, entity: Entity, input: Input) {
+    let queue = pending.0.entry(entity).or_default();
+    queue.push_back(input);
+    while queue.len() > INPUT_CAP {
+        queue.pop_front();
+    }
+}
+
 /// Spawn a simulated entity with an explicit owner. In gameplay this is the
 /// spawner itself (the default-ownership rule: an entity is owned by the peer
 /// that creates it); the replication receive path passes the REMOTE owner when
@@ -254,4 +417,9 @@ pub fn insert_sim(world: &mut World, local: PeerId, dt: f32) {
     world.insert_resource(SimDt(dt));
     world.insert_resource(Tick(0));
     world.insert_resource(RenderTick(0.0));
+    // Server input-processing state (ADR-0022) — empty on a client (apply_input
+    // is a no-op without ControlledBy entities); present so the system's ResMut
+    // params always resolve.
+    world.insert_resource(PendingInputs::default());
+    world.insert_resource(ProcessedInput::default());
 }

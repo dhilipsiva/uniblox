@@ -27,7 +27,10 @@ use bevy_app::{App, AppExit, FixedUpdate, ScheduleRunnerPlugin, TaskPoolPlugin, 
 use bevy_ecs::message::Messages;
 use bevy_ecs::prelude::*;
 use bevy_time::{Fixed, Time, TimePlugin, Virtual};
-use engine_core::{Position, SimDt, Velocity, advance_tick, insert_sim, simulate, spawn_owned};
+use engine_core::{
+    Position, ProcessedInput, SimDt, Velocity, advance_tick, apply_input, insert_sim, simulate,
+    spawn_owned,
+};
 use protocol::PeerId;
 use replication::Replication;
 use transport::{PeerState, Transport};
@@ -88,6 +91,13 @@ pub fn net_pump(world: &mut World) {
                     PeerState::Disconnected => {
                         log::info!("[server] peer disconnected: {proto:?}");
                         net.repl.untrack_peer(proto);
+                        // Reset the processed-input high-water (ADR-0022) so a
+                        // reconnect with a fresh input-seq namespace isn't frozen
+                        // by a stale marker (auditor F4). (The avatar's
+                        // PendingInputs entry is cleared when it despawns.)
+                        if let Some(mut processed) = world.get_resource_mut::<ProcessedInput>() {
+                            processed.0.remove(&proto);
+                        }
                     }
                 }
             }
@@ -201,9 +211,12 @@ pub fn build_server_app(transport: Transport, local: PeerId, entity_count: usize
     });
     // `advance_tick` bumps engine_core::Tick (the snapshot time axis, ADR-0022);
     // `count_tick` keeps the server-local TickCount (the 64 Hz evidence test).
+    // `apply_input` (ADR-0022 Stage B) drains ONE client input per controlled
+    // entity BEFORE simulate, so simulate integrates exactly one dt step per
+    // input (the alignment reconciliation depends on).
     app.add_systems(
         FixedUpdate,
-        (sync_sim_dt, count_tick, advance_tick, simulate).chain(),
+        (sync_sim_dt, count_tick, advance_tick, apply_input, simulate).chain(),
     );
     app.add_systems(Update, net_pump);
     app

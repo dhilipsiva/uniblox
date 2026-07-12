@@ -23,7 +23,15 @@ authoritative `Position` stays snap-applied (receivers never re-simulate others)
 AFTER `interpolate`). `Tick` (advanced by `advance_tick`) is the authoritative
 sim tick stamped into snapshots; `RenderTick` is the interp clock (app-advanced;
 tests set it). `push_snapshot` is cap-evicting + tick-monotonic. `spawn_owned`
-attaches `RenderPos`. Stages B (predict-own/reconcile) + C (handoff) to come.
+attaches `RenderPos`. Stage C (handoff role reset) to come.
+
+**Prediction/input (ADR-0022 Stage B):** `Controlled{next_seq}` (client marks its avatar) + `ControlledBy(peer)`
+(authority marks who drives it — ONE controlled entity per peer, the Mode-3 avatar model). `record_input`
+mints an `Input{seq,intent}` (quantized→dequantized, so the replay matches the server) into `InputHistory`.
+`predict` (client): `RenderPos = Position anchor + replay(InputHistory)` — never writes authoritative
+Position/Velocity. `apply_input` (server, FixedUpdate before simulate): pops ONE fresh input per controlled
+entity → `Velocity=intent`, `ProcessedInput[peer]=seq`; ZEROS on underrun (matches predict). Inputs go on the
+RELIABLE channel; reconciliation is client-side (`apply_state` prunes history by `StateMsg.last_input`).
 
 ## Crate-local invariants
 - **The SAME systems run in all three modes; only authority assignment differs.**

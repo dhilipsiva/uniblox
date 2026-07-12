@@ -167,6 +167,12 @@ pub enum NetEvent {
     /// per-peer confirmed baseline and stop re-sending confirmed values.
     /// Ephemeral bookkeeping — never signed (`sig` stays `None`).
     Ack { seq: u64 },
+    /// A client input command for its controlled avatar (ADR-0022 Stage B):
+    /// sent DIRECTED (client → the avatar's authority) on the RELIABLE channel,
+    /// so the authority processes each input once, in order (`last_input`
+    /// advances contiguously). `seq` is per-controlled-entity monotonic;
+    /// `intent` is the quantized desired velocity.
+    Input { seq: u64, intent: QVec2 },
 }
 
 /// Wire encode/decode errors. Decode failures are expected runtime events

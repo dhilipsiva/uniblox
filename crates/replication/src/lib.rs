@@ -67,8 +67,9 @@ use std::collections::{HashMap, HashSet};
 use bevy_ecs::prelude::*;
 use bevy_ecs::system::SystemState;
 use engine_core::{
-    Authority, InterpBuffer, LocalPeer, Owner, Position, Snapshot, Tick, Velocity, authority_of,
-    push_snapshot, spawn_owned,
+    Authority, Controlled, ControlledBy, Input, InputHistory, Intent, InterpBuffer, LocalPeer,
+    Owner, PendingInputs, Position, ProcessedInput, Snapshot, Tick, Velocity, authority_of,
+    push_pending_input, push_snapshot, spawn_owned,
 };
 use protocol::{
     EventMsg, NetEntityId, NetEvent, PeerId, QVec2, StateEntry, StateMsg, WIRE_VERSION,
@@ -263,6 +264,9 @@ pub struct Replication {
     applied_seq: HashMap<PeerId, u64>,
     /// RECEIVER, per sender: the highest seq we have acked back.
     ack_sent: HashMap<PeerId, u64>,
+    /// CLIENT, per controlled entity: the highest input seq we have SENT to its
+    /// authority (ADR-0022 Stage B), so `drain_inputs` sends each input once.
+    input_sent: HashMap<Entity, u64>,
     /// The tracked peer set (added on connect, dropped on departure).
     peers: HashSet<PeerId>,
 }
@@ -281,6 +285,7 @@ impl Replication {
             acked_seq: HashMap::new(),
             applied_seq: HashMap::new(),
             ack_sent: HashMap::new(),
+            input_sent: HashMap::new(),
             peers: HashSet::new(),
         }
     }
@@ -304,6 +309,13 @@ impl Replication {
         // The authoritative sim tick stamped into every snapshot (ADR-0022), the
         // interpolation time axis. Absent (a world without the resource) ⇒ 0.
         let tick = world.get_resource::<Tick>().map_or(0, |t| t.0);
+        // Per-peer newest PROCESSED input seq — the reconciliation marker
+        // (ADR-0022 Stage B). Cloned so the per-peer loop can read it while the
+        // world is borrowed for other reads. Empty ⇒ 0 for every peer.
+        let processed_input = world
+            .get_resource::<ProcessedInput>()
+            .map(|p| p.0.clone())
+            .unwrap_or_default();
 
         // 1. Snapshot owned+alive rows; mint ids (map only — existence is
         //    announced PER PEER on AOI-enter, never globally); build the grid +
@@ -529,9 +541,9 @@ impl Replication {
                     version: WIRE_VERSION,
                     seq,
                     tick,
-                    // last_input is stamped per-peer in Stage B (server
-                    // reconciliation); 0 until then (no input processed).
-                    last_input: 0,
+                    // Per-peer reconciliation marker (ADR-0022): the newest input
+                    // seq from THIS peer that the authority has processed.
+                    last_input: processed_input.get(&p).copied().unwrap_or(0),
                     entries,
                 };
                 match encode_state(&msg) {
@@ -635,6 +647,7 @@ impl Replication {
         // message of its run) until a later message fully applies — bounded,
         // for the state-before-spawn race, by the reliable Spawn's arrival.
         let msg_tick = msg.tick; // captured before the loop moves msg.entries
+        let msg_last_input = msg.last_input;
         let mut fully_applied = true;
         for entry in msg.entries {
             // Unknown id: state-before-spawn, post-despawn straggler, or
@@ -688,6 +701,29 @@ impl Replication {
                         y: pos.y,
                     },
                 );
+            }
+        }
+
+        // Reconciliation (ADR-0022 Stage B): this authority has processed our
+        // inputs through `last_input`, and the entries above are the state that
+        // results — so drop input-history entries with `seq <= last_input` for
+        // every entity WE control that THIS sender owns. The next `predict`
+        // replays only the survivors from the freshly-snapped Position anchor,
+        // re-pinning the prediction to server truth (no accumulation, no
+        // oscillation). Skipped when last_input is 0 (nothing processed).
+        if msg_last_input > 0 {
+            let controlled: Vec<Entity> = world
+                .query::<(Entity, &Owner, &Controlled)>()
+                .iter(world)
+                .filter(|(_, owner, _)| owner.0 == from)
+                .map(|(e, ..)| e)
+                .collect();
+            for e in controlled {
+                if let Some(mut hist) = world.get_mut::<InputHistory>(e) {
+                    while hist.0.front().is_some_and(|i| i.seq <= msg_last_input) {
+                        hist.0.pop_front();
+                    }
+                }
             }
         }
         // Ack ONLY a message we fully held. Monotonic across increasing seqs
@@ -804,7 +840,73 @@ impl Replication {
                 let slot = self.acked_seq.entry(from).or_insert(0);
                 *slot = (*slot).max(seq);
             }
+            NetEvent::Input { seq, intent } => {
+                // AUTHORITY side (ADR-0022 Stage B): queue this client's input
+                // for the entity it controls (the one marked `ControlledBy(from)`
+                // — set by session join / the test). `apply_input` drains one per
+                // tick. A message for a peer that controls nothing is dropped.
+                let target = world
+                    .query::<(Entity, &ControlledBy)>()
+                    .iter(world)
+                    .find(|(_, cb)| cb.0 == from)
+                    .map(|(e, _)| e);
+                if let Some(entity) = target
+                    && let Some(mut pending) = world.get_resource_mut::<PendingInputs>()
+                {
+                    push_pending_input(
+                        &mut pending,
+                        entity,
+                        Input {
+                            seq,
+                            intent: Intent {
+                                vx: dequantize(intent.x),
+                                vy: dequantize(intent.y),
+                            },
+                        },
+                    );
+                }
+            }
         }
+    }
+
+    /// CLIENT → AUTHORITY inputs (ADR-0022 Stage B): for every entity WE control,
+    /// produce a DIRECTED `NetEvent::Input` (to its authority, i.e. its `Owner`)
+    /// for each `InputHistory` entry not yet sent (`seq > input_sent`). Returns
+    /// `(target, bytes)`; the caller does `send_event(target, bytes)`. Call once
+    /// per pump after recording inputs; the reliable channel delivers each once.
+    pub fn drain_inputs(&mut self, world: &mut World) -> Vec<(PeerId, Box<[u8]>)> {
+        // Snapshot (entity, authority, unsent inputs) so the world borrow ends
+        // before we mutate `input_sent`.
+        let pending: Vec<(Entity, PeerId, Vec<Input>)> = {
+            let mut q = world.query::<(Entity, &Owner, &Controlled, &InputHistory)>();
+            q.iter(world)
+                .filter_map(|(entity, owner, _, hist)| {
+                    let sent = self.input_sent.get(&entity).copied().unwrap_or(0);
+                    let inputs: Vec<Input> =
+                        hist.0.iter().copied().filter(|i| i.seq > sent).collect();
+                    (!inputs.is_empty()).then_some((entity, owner.0, inputs))
+                })
+                .collect()
+        };
+        let mut out = Vec::new();
+        for (entity, authority, inputs) in pending {
+            let mut max_sent = self.input_sent.get(&entity).copied().unwrap_or(0);
+            for input in inputs {
+                let msg = event(NetEvent::Input {
+                    seq: input.seq,
+                    intent: quantize_vec2(input.intent.vx, input.intent.vy),
+                });
+                match encode_event(&msg) {
+                    Ok(bytes) => {
+                        out.push((authority, bytes.into_boxed_slice()));
+                        max_sent = max_sent.max(input.seq);
+                    }
+                    Err(err) => log::error!("input encode failed: {err}"),
+                }
+            }
+            self.input_sent.insert(entity, max_sent);
+        }
+        out
     }
 
     /// RECEIVER → SENDER acks (ADR-0020): for every sender whose newest FULLY

@@ -21,7 +21,11 @@ DETERMINISTIC (emissions sorted by `NetEntityId`, peers by `PeerId`). Still: cac
 `drain_acks` → directed `NetEvent::Ack`). **ADR-0022 Stage A (interpolate-others):** `collect_all` stamps
 `StateMsg.tick`; `apply_state` additionally pushes a snapshot into the proxy's `InterpBuffer` (a pure
 side-record — authoritative `Position` snap-apply unchanged); the Spawn handler attaches an `InterpBuffer` to
-new proxies. Interpolation itself lives in engine-core (`RenderPos`/`interpolate`). Handoff: local Owner flips immediately (no double-authority window).
+new proxies. Interpolation itself lives in engine-core (`RenderPos`/`interpolate`). **Stage B (predict/reconcile):**
+`apply_events` gains an `Input` arm (server queues into `PendingInputs`); `drain_inputs` (client sends un-sent
+`InputHistory` to the avatar's authority); `apply_state` prunes `InputHistory` by `StateMsg.last_input`
+(reconciliation); `collect_all` stamps per-peer `last_input` from `ProcessedInput`. The predicted avatar is
+`Remote` ⇒ the authority gate already excludes it (client emits inputs only, never state). Handoff: local Owner flips immediately (no double-authority window).
 `interest` submodule = `SpatialGrid` (cell-bucketed, floor-celled, exact-dist² filter) + `Aoi`. **46-test
 two-World battery + 5 grid unit tests + codec + e2e-over-real-transport green; netcode-audited THREE times (F1
 orphan blocker + its over-broad fix, both closed → MERGE).** Phase 3 still owns: interpolation buffers,

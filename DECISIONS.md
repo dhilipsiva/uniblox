@@ -652,5 +652,38 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   push-snapshot tick-monotonicity guard, the 3-snapshot test). Documented gaps for later stages: a Mode-2
   sender must advance `Tick` to actually smooth (else tick=0 ⇒ clamp-to-latest); an entity adopted to/from
   Local keeps/lacks a buffer until the Stage-C role reset (RenderPos can go stale) — closed in Stage C.
-- **Status:** Stage A accepted (2026-07-12). Stages B (predict + input + reconciliation) and C (handoff
-  interplay) remain — this item is complete when all three are landed.
+- **Stage B — predict-own + input + server reconciliation.** New engine-core: `Intent{vx,vy}`,
+  `Input{seq,intent}`, `Controlled{next_seq}` (CLIENT: I drive it + mint its input seqs), `ControlledBy(peer)`
+  (AUTHORITY: peer P drives it — Stage B assumes ONE controlled entity per peer, the Mode-3 avatar model),
+  `InputHistory(VecDeque<Input>)` (client, capped), `PendingInputs`/`ProcessedInput` resources (server).
+  Systems: `predict` (client — `RenderPos = Position anchor + replay(InputHistory)`, one `intent*dt` per entry,
+  recomputed from the anchor each tick so it never accumulates float error and NEVER writes authoritative
+  `Position`/`Velocity`); `apply_input` (server, FixedUpdate BEFORE simulate — pops ONE fresh input per
+  controlled entity, `Velocity=intent`, `ProcessedInput[peer]=seq`; skips `seq<=last` without consuming a
+  tick; **ZEROS Velocity on underrun** so the server matches the client's replay — a held velocity would drift
+  past it and pop, auditor F3). `record_input` stores the intent quantized→dequantized so the replay matches
+  the server's applied Velocity bit-for-bit (auditor F1). Wire: `NetEvent::Input{seq,intent}` on the RELIABLE
+  channel (each processed once, in order — `last_input` advances contiguously; a gap over-prunes with no
+  recovery, so inputs MUST stay reliable, auditor F5). replication: `apply_events` Input arm (server queues
+  into `PendingInputs[ControlledBy(from) entity]`); `drain_inputs` (client sends un-sent history entries,
+  directed to the avatar's `Owner`); `apply_state` prunes `InputHistory` by `msg.last_input`; `collect_all`
+  stamps `StateMsg.last_input` per-peer from `ProcessedInput`. server: chains `apply_input`; clears
+  `ProcessedInput[peer]` on disconnect so a reconnecting fresh input-seq namespace isn't frozen (auditor F4).
+  **The authority gate needs NO change** — a predicted avatar is `Remote`, so `collect_all` structurally never
+  emits its state/Spawn (the client sends inputs only).
+- **Reconciliation converges without float determinism:** `RenderPos` is re-pinned to the authoritative
+  `Position` every snapshot and only extrapolates the un-acked `(last_input, next_seq]` window; the marker is
+  monotonic (LWW drops stale snapshots) and prune is `seq<=last_input`, exactly aligned to "Position reflects
+  inputs through last_input" — so a CORRECT prediction reconciles with no pop, and a WRONG one snaps to server
+  truth + replays. Bit-exactness never required (the invariant refinement).
+- **Evidence (Stage B):** two_world 64 tests green — SB1–SB10: no input lag, prediction leads by the un-acked
+  window, prediction writes only RenderPos (Position+Velocity bit-unchanged), reconcile snaps+replays+converges,
+  no pop on a correct prediction, a duplicate skipped once (marker monotonic), a stale LWW-dropped marker
+  doesn't un-prune, the client never emits its predicted avatar's state, **reconcile corrects a WRONG
+  prediction** (the headline), **underrun stops the server** (no drift) — plus the `NetEvent::Input` wire
+  round-trip; full workspace green; clippy `-D warnings` native `--all-targets` + wasm32; fmt clean.
+  netcode-audited → FIX-FIRST then MERGE (folded: F1 quantize-at-record, F3 zero-on-underrun + test, F4
+  reconnect-marker reset, F6 wrong-prediction test; F2 one-avatar-per-peer scope + F5 reliable-channel
+  dependence documented). Gap: `input_sent` isn't pruned on avatar despawn (slow leak — cleanup pass).
+- **Status:** Stages A + B accepted (2026-07-12). Stage C (handoff interplay — the `reset_render_role`
+  flush/seed on the two owner-flip sites) remains — this item is complete when all three are landed.

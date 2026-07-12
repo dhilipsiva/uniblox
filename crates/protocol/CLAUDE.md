@@ -11,7 +11,8 @@ DETERMINISTIC per-peer wire output; the ordering has no wire meaning), quantizat
 (`QUANT_SCALE`=1024, tolerance ≤1/2048 for |v|≤16384, saturating), `StateMsg`/`StateEntry`
 (Options-only presence, derived mask, ABSOLUTE values — never arithmetic deltas; `StateMsg` also carries
 `tick` — the interpolation time axis — and `last_input` — the reconciliation marker, ADR-0022), `EventMsg` with
-the reserved-but-None signature field (Phase 6), versioned postcard codecs (mismatch → clean Err). **`WIRE_VERSION`=3.**
+the reserved-but-None signature field (Phase 6) + the `NetEvent::Input{seq,intent}` client-input variant
+(ADR-0022 Stage B, reliable channel), versioned postcard codecs (mismatch → clean Err). **`WIRE_VERSION`=3.**
 The `{engine, content, schema}` version triple lands in Phase 5.
 
 ## Crate-local invariants
