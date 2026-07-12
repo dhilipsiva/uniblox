@@ -128,6 +128,12 @@ impl TestPeer {
         self.repl.set_aoi(peer, center, radius);
     }
 
+    /// Set a peer's AOI with a hysteresis band: enter at `dist ≤ r_inner`, exit
+    /// at `dist > r_outer` (ADR-0023 b — no churn in the band).
+    fn set_aoi_hysteresis(&mut self, peer: PeerId, center: (f32, f32), r_inner: f32, r_outer: f32) {
+        self.repl.set_aoi_hysteresis(peer, center, r_inner, r_outer);
+    }
+
     /// The per-peer collect for the whole tracked set — drive ONCE per tick.
     fn collect_all(&mut self) -> Vec<(PeerId, Outbox)> {
         self.repl.collect_all(&mut self.world)
@@ -1159,6 +1165,167 @@ fn aoi_exit_no_repeat_despawn() {
             "no repeat despawn while it stays out"
         );
     }
+}
+
+/// B6 — HYSTERESIS: an entity oscillating inside the band (`r_inner < dist ≤
+/// r_outer`) after entering does NOT churn Spawn/Despawn — the anti-flicker
+/// payoff (ADR-0023 b). Single-radius today would Despawn/Spawn every crossing.
+#[test]
+fn hysteresis_in_band_no_spawn_no_despawn() {
+    let mut a = TestPeer::new(1);
+    let mut b = TestPeer::new(2);
+    a.track(b.id);
+    a.set_aoi_hysteresis(b.id, (0.0, 0.0), 5.0, 10.0);
+    let e = a.spawn(3.0, 0.0, 0.0, 0.0); // dist 3 ≤ r_inner → enters
+    let out = a.collect_for(b.id);
+    assert_eq!(spawn_ids(&out.events).len(), 1, "enters at ≤ r_inner");
+    b.deliver_all(a.id, &out);
+
+    // Oscillate strictly inside the band (5 < dist ≤ 10) for several ticks.
+    for x in [7.0f32, 6.0, 9.0, 7.0, 10.0, 6.0] {
+        a.world.get_mut::<Position>(e).unwrap().x = x;
+        let out = a.collect_for(b.id);
+        assert!(
+            spawn_ids(&out.events).is_empty(),
+            "no re-Spawn oscillating in the band (dist {x})"
+        );
+        assert_eq!(
+            despawn_count(&out),
+            0,
+            "no Despawn oscillating in the band (dist {x})"
+        );
+        b.deliver_all(a.id, &out);
+    }
+    assert_eq!(
+        b.entity_count(),
+        1,
+        "the proxy is retained through the band"
+    );
+}
+
+/// B7 — HYSTERESIS: a band dip does NOT drop the delta baseline (no full-mask
+/// re-send, no re-Spawn). Contrast B3, where a true AOI-exit re-baselines.
+#[test]
+fn hysteresis_baseline_survives_band_dip() {
+    let mut a = TestPeer::new(1);
+    let mut b = TestPeer::new(2);
+    a.track(b.id);
+    a.set_aoi_hysteresis(b.id, (0.0, 0.0), 5.0, 10.0);
+    let e = a.spawn(3.0, 0.0, 0.0, 0.0); // enters (≤ r_inner)
+    b.deliver_all(a.id, &a.collect_for(b.id));
+    flush_acks(&mut b, &mut a); // confirmed → quiet
+
+    // Dip into the band: the value changed so state re-sends the delta, but there
+    // is NO re-Spawn and NO Despawn (still known, never exited) and the baseline
+    // is NOT dropped.
+    a.world.get_mut::<Position>(e).unwrap().x = 7.0; // band
+    let out = a.collect_for(b.id);
+    assert!(
+        spawn_ids(&out.events).is_empty(),
+        "a band dip must NOT re-Spawn (the entity never exited)"
+    );
+    assert_eq!(
+        despawn_count(&out),
+        0,
+        "a band dip must NOT Despawn — guards EXIT wired to the OUTER radius"
+    );
+    b.deliver_all(a.id, &out);
+    flush_acks(&mut b, &mut a);
+
+    // Stationary in the band + confirmed ⇒ quiet. A dropped baseline would have
+    // forced a full-mask re-send here (as a true exit+re-enter does — B3).
+    assert!(
+        a.collect_for(b.id).state.is_none(),
+        "confirmed band entity is quiet — the baseline survived the dip"
+    );
+}
+
+/// B8 — HYSTERESIS full loop + the band read-cheat: enter ONLY at `≤ r_inner`,
+/// exit ONLY at `> r_outer`, and an entity that appears in the band but was
+/// NEVER inside `r_inner` is FULLY withheld (no Spawn, no state — the D1
+/// read-cheat, in the band).
+#[test]
+fn hysteresis_enters_at_inner_exits_at_outer() {
+    let mut a = TestPeer::new(1);
+    let mut b = TestPeer::new(2);
+    a.track(b.id);
+    a.set_aoi_hysteresis(b.id, (0.0, 0.0), 5.0, 10.0);
+    let e = a.spawn(20.0, 0.0, 0.0, 0.0); // > r_outer
+    let out = a.collect_for(b.id);
+    assert!(
+        out.state.is_none() && spawn_ids(&out.events).is_empty(),
+        "far entity: fully withheld"
+    );
+
+    // In the band but never entered r_inner ⇒ fully withheld (read-cheat).
+    a.world.get_mut::<Position>(e).unwrap().x = 7.0; // band, unknown
+    let out = a.collect_for(b.id);
+    assert!(
+        out.state.is_none() && spawn_ids(&out.events).is_empty(),
+        "a never-entered band entity leaks NOTHING (existence gating in the band)"
+    );
+
+    // Cross ≤ r_inner ⇒ enter.
+    a.world.get_mut::<Position>(e).unwrap().x = 3.0; // ≤ r_inner
+    let out = a.collect_for(b.id);
+    assert_eq!(spawn_ids(&out.events).len(), 1, "enters at ≤ r_inner");
+    b.deliver_all(a.id, &out);
+
+    // Back into the band ⇒ stays known (no despawn); state CONTINUES for the
+    // changed value (guards STATE wired to the OUTER radius — an inner-wired
+    // state pass would starve the still-spawned band proxy).
+    a.world.get_mut::<Position>(e).unwrap().x = 7.0; // band, now known
+    let out = a.collect_for(b.id);
+    assert_eq!(
+        despawn_count(&out),
+        0,
+        "known band entity stays (no exit at ≤ r_outer)"
+    );
+    assert!(
+        out.state.is_some(),
+        "a known band entity keeps receiving state (STATE uses r_outer, not r_inner)"
+    );
+    b.deliver_all(a.id, &out);
+    assert_eq!(b.entity_count(), 1);
+    let proxy = b.entity_owned_by(a.id);
+    assert!(
+        approx(b.pos(proxy).x, 7.0),
+        "the band proxy tracks the authoritative position (not frozen)"
+    );
+
+    // Past r_outer ⇒ exit.
+    a.world.get_mut::<Position>(e).unwrap().x = 12.0; // > r_outer
+    let out = a.collect_for(b.id);
+    assert_eq!(despawn_count(&out), 1, "exits only past r_outer");
+    b.deliver_all(a.id, &out);
+    assert_eq!(b.entity_count(), 0);
+}
+
+/// B9 — backward-compat: `set_aoi` (single radius) is the degenerate band
+/// (`r_inner == r_outer == radius`) — enter at `≤ r`, exit at `> r`, exactly the
+/// pre-hysteresis single-boundary behavior (what keeps Groups A–H green).
+#[test]
+fn degenerate_band_equals_single_radius() {
+    let mut a = TestPeer::new(1);
+    let mut b = TestPeer::new(2);
+    a.track(b.id);
+    a.set_aoi(b.id, (0.0, 0.0), 5.0); // single radius ⇒ inner == outer == 5
+    let e = a.spawn(3.0, 0.0, 0.0, 0.0); // ≤ 5 → in
+    let out = a.collect_for(b.id);
+    assert_eq!(spawn_ids(&out.events).len(), 1, "enters at ≤ r");
+    b.deliver_all(a.id, &out);
+
+    // dist 7 > 5: with no band it exits IMMEDIATELY (unlike hysteresis, where
+    // 5 < 7 ≤ 10 would linger).
+    a.world.get_mut::<Position>(e).unwrap().x = 7.0;
+    let out = a.collect_for(b.id);
+    assert_eq!(
+        despawn_count(&out),
+        1,
+        "exits at > r (no band to linger in)"
+    );
+    b.deliver_all(a.id, &out);
+    assert_eq!(b.entity_count(), 0);
 }
 
 // ═══════════════════════ Group C — per-peer independence ═══════════════════════
