@@ -16,7 +16,7 @@ use engine_core::{
 };
 use protocol::{
     EventMsg, NetEntityId, NetEvent, PeerId, StateEntry, WIRE_VERSION, decode_event, decode_state,
-    encode_event,
+    encode_event, quantize_vec2,
 };
 use replication::{Outbox, Replication};
 
@@ -2313,5 +2313,55 @@ fn adopt_predicted_avatar_clears_input_history() {
             .get::<InputHistory>(proxy)
             .is_none_or(|h| h.0.is_empty()),
         "the role transition fired once — the second render doesn't re-run it"
+    );
+}
+
+// ═══════════ Group Q — shared per-tick snapshot (quantization hoist, ADR-0021 (a)) ═══════════
+
+/// Q1 — the quantized value is PEER-INVARIANT: two unbounded peers seeing the
+/// SAME owned entity in one `collect_all` receive an IDENTICAL `StateEntry`
+/// (id + quantized pos/vel). This is the correctness precondition for hoisting
+/// quantization into the once-per-tick snapshot (compute `QVec2` once per owned
+/// entity, not per (peer,entity)) — it holds before AND after the refactor (a
+/// characterization guard), and the byte-exact battery (T35, A/B/C, the SA/SB
+/// interp suites) proves the wire output itself is unchanged.
+#[test]
+fn hoist_quantized_value_is_peer_invariant() {
+    let mut a = TestPeer::new(1);
+    let x = TestPeer::new(2);
+    let y = TestPeer::new(3);
+    a.track(x.id);
+    a.track(y.id);
+    // Non-integer coords so quantization is actually exercised (an integer would
+    // quantize to itself trivially and hide a per-peer recompute divergence).
+    a.spawn(3.25, -7.5, 1.5, -0.25);
+
+    let outs = a.collect_all();
+    let ex = state_entries(outbox_for(&outs, x.id).expect("X outbox"));
+    let ey = state_entries(outbox_for(&outs, y.id).expect("Y outbox"));
+    assert_eq!(ex.len(), 1, "X gets the one entity");
+    assert_eq!(ey.len(), 1, "Y gets the one entity");
+    assert_eq!(
+        ex[0].mask(),
+        0b11,
+        "full-mask first send — invariance must cover BOTH quantized components"
+    );
+    assert_eq!(
+        ex[0], ey[0],
+        "the quantized StateEntry must be identical across peers (peer-invariant \
+         quantization — the hoist precondition)"
+    );
+    // Pin the ACTUAL quantized values to the spawn coords — an independent guard
+    // (a symmetric hoist bug like swapping qpos/qvel would keep the two peers
+    // equal above but map the wrong field here).
+    assert_eq!(
+        ex[0].pos,
+        Some(quantize_vec2(3.25, -7.5)),
+        "position quantized from the spawn coords, not the velocity"
+    );
+    assert_eq!(
+        ex[0].vel,
+        Some(quantize_vec2(1.5, -0.25)),
+        "velocity quantized from the spawn coords, not the position"
     );
 }
