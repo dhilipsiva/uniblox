@@ -837,3 +837,33 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
 - **Status:** Stages 1 + 2 + 3 ACCEPTED (2026-07-12) — handoff depth + anti-entropy resync are complete and
   wired into the production pump; the separate anti-entropy-resync TODO item is absorbed (only E4/coordinator
   healing remains, on the double-ownership item).
+
+## ADR-0025 — Ownership-handoff failure modes (host-migration + coordinator-seq arbitration)
+- **Context:** two unhandled failure modes — an owner DROP orphaned its entities (frozen at `Owner(departed)`
+  on every survivor; `untrack_peer` never touched them), and DOUBLE-OWNERSHIP (conflicting ownership
+  assertions — the R6 cross-sender reorder, or a Mode-2 claim) had no arbiter beyond "drop a non-current-owner"
+  which merely FROZE. Decided (user): **lowest-peer-ID** election; **full claim/commit/reject** coordinator
+  arbitration. Built as deterministic replication-layer primitives (test-drivable, no timers); the full Mode-2
+  coordinator *service* is Phase 5 (reuses this rule). A shared pure `elect_owner(candidates) = candidates.min()`
+  (`PeerId: Ord` is deliberately for this) serves both the host-migration election and the coordinator identity.
+- **Stage B — host-migration reassignment (Accepted 2026-07-12):** `reassign_orphans(world, departed) ->
+  Vec<Entity>` — each survivor computes `elected = elect_owner((self.peers \ {departed}) ∪ {local})` (the
+  `∪ {local}` is load-bearing: `self.peers` excludes local, so a survivor that is ITSELF the minimum would else
+  elect the lowest OTHER peer), scans the LIVE `Owner == departed` predicate (never a snapshot — idempotency),
+  and for each sets `Owner:=elected`, `last_owner=elected`, flushes the `InterpBuffer` (old-owner snapshots
+  must not lerp across the discontinuity; `reset_render_role` only drops it on →Owned/→Predicted, so a remote
+  re-tag would keep them). NO wire event: the election is a pure function of the agreed surviving membership +
+  the stable `NetEntityId→Owner` map, so the elected survivor sets `Owner:=local` and INDEPENDENTLY simulates
+  (authority is DERIVED, never announced — like `reset_render_role`); others re-tag their proxy (freeze lifts
+  when the elected owner's state arrives). Exactly-once = deterministic election ⇒ one Local owner; idempotent.
+  **Closes the ADR-0024 E4 orphan:** reassignment gives EXACTLY ONE survivor a Local proxy (what E4 lacked) —
+  a witness heals via the elected owner's state; a never-witnessed peer via the existing resync (the elected
+  owner's `collect_all` AOI-enters the entity → `collect_resync` Digest → `ResyncSpawn` orphan-create).
+  Evidence: two_world 94 green (HM1 the "reassigned exactly once" acceptance, HM4 the buffer flush white-box,
+  HM7 all-survivors-agree, HM8 the E4 closure via reassign+resync). netcode-audited → MERGE (sound,
+  deterministic, exactly-once, idempotent, single-ownership preserved; the E4 closure genuine; +a "re-tagged
+  survivor doesn't simulate" guard). **Carry-forward (Stage A):** exactly-once relies on a CONSISTENT
+  membership view — an inconsistent view could let two survivors self-elect; the deferred `net_pump`
+  Disconnected wiring must guarantee consistent `track/untrack` or gate adoption on Stage A's ownership seq.
+- **Stages A-kernel (ownership seq tiebreak) + A-handshake (claim/commit/reject):** pending.
+- **Status:** Stage B Accepted (2026-07-12); A-kernel + A-handshake in progress.

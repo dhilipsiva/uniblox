@@ -1313,6 +1313,58 @@ impl Replication {
         self.resync_wanted.remove(&peer);
     }
 
+    /// HOST-MIGRATION reassignment (ADR-0025): when `departed` drops, every
+    /// surviving peer reassigns the entities `departed` owned to a deterministic
+    /// new owner — the LOWEST surviving peer id (`elect_owner`). Because the
+    /// election is a pure function of the agreed surviving membership + the stable
+    /// `NetEntityId→Owner` map, every survivor computes the SAME winner with NO
+    /// coordination message: the elected survivor sets `Owner:=local` and
+    /// independently starts simulating (authority is DERIVED, never announced —
+    /// like `reset_render_role`); the others re-tag their proxy to the elected
+    /// owner (the freeze lifts when its state arrives). Returns the reassigned
+    /// entities. Idempotent: it keys off the LIVE `Owner == departed` predicate,
+    /// so a re-call finds nothing. Call it on the pump's peer-Disconnected signal
+    /// (after `untrack_peer`).
+    pub fn reassign_orphans(&mut self, world: &mut World, departed: PeerId) -> Vec<Entity> {
+        let local = world.resource::<LocalPeer>().0;
+        // Candidate set = surviving membership + ourselves. `self.peers` EXCLUDES
+        // the local peer, so we MUST add `local` or a survivor that is itself the
+        // true minimum would wrongly elect the lowest OTHER peer.
+        let candidates = self
+            .peers
+            .iter()
+            .copied()
+            .filter(|&p| p != departed)
+            .chain(std::iter::once(local));
+        let Some(elected) = elect_owner(candidates) else {
+            return Vec::new(); // unreachable — `local` is always a candidate
+        };
+        // Key off the LIVE `Owner == departed` predicate (never a snapshot list —
+        // that would double-apply on a re-call).
+        let orphans: Vec<Entity> = world
+            .query::<(Entity, &Owner)>()
+            .iter(world)
+            .filter(|(_, o)| o.0 == departed)
+            .map(|(e, _)| e)
+            .collect();
+        for &e in &orphans {
+            if let Some(mut owner) = world.get_mut::<Owner>(e) {
+                owner.0 = elected;
+            }
+            if let Some(rec) = self.map.by_entity.get_mut(&e) {
+                rec.last_owner = elected;
+            }
+            // Flush the InterpBuffer: its snapshots came from the departed owner;
+            // lerping across the source discontinuity glides through a wrong
+            // intermediate. `reset_render_role` only drops the buffer on
+            // →Owned/→Predicted, so an `elected != local` re-tag keeps it here.
+            if let Some(mut buf) = world.get_mut::<InterpBuffer>(e) {
+                buf.0.clear();
+            }
+        }
+        orphans
+    }
+
     /// Initiate an A→B ownership handoff for an entity WE currently own.
     /// Queues the reliable `OwnershipTransfer` and flips the local `Owner` in
     /// the same tick — from this instant we stop computing and stop
@@ -1382,6 +1434,14 @@ fn event(event: NetEvent) -> EventMsg {
         sig: None, // reserved; nothing signs in the slice (Phase 6)
         event,
     }
+}
+
+/// The host-migration / coordinator election (ADR-0025): the LOWEST peer id among
+/// the candidates. Pure + deterministic — every peer computes the same winner
+/// from the same agreed membership, so no coordination message is needed. Reused
+/// for the coordinator identity in the seq-arbitration stage.
+fn elect_owner(candidates: impl IntoIterator<Item = PeerId>) -> Option<PeerId> {
+    candidates.into_iter().min()
 }
 
 fn qpos(pos: &Position) -> QVec2 {
