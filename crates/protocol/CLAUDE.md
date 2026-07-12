@@ -13,9 +13,11 @@ DETERMINISTIC per-peer wire output; the ordering has no wire meaning), quantizat
 `tick` — the interpolation time axis — and `last_input` — the reconciliation marker, ADR-0022), `EventMsg` with
 the reserved-but-None signature field (Phase 6) + the `NetEvent::Input{seq,intent}` client-input variant
 (ADR-0022 Stage B, reliable channel) + the **ADR-0024 anti-entropy resync** variants `NetEvent::{Digest{entries:
-Vec<DigestEntry>}, ResyncRequest{ids}, ResyncSpawn{id,pos,vel}}` (`DigestEntry{id, state_hash: Option<u32>}`;
-all reliable, directed), versioned postcard codecs (mismatch → clean Err). **`WIRE_VERSION`=4.**
-The `{engine, content, schema}` version triple lands in Phase 5.
+Vec<DigestEntry>}, ResyncRequest{ids}, ResyncSpawn{id,pos,vel,seq}}` (`DigestEntry{id, state_hash: Option<u32>}`;
+all reliable, directed) + the **ADR-0025 A ownership-arbitration rank** `OwnerSeq{seq:u64, coordinator:PeerId}`
+(lexicographic `Ord` — `seq` dominant, `coordinator` breaks equal-seq ties toward the higher id) which now rides
+`OwnershipTransfer{id,new_owner,seq}` AND `ResyncSpawn`, versioned postcard codecs (mismatch → clean Err).
+**`WIRE_VERSION`=5.** The `{engine, content, schema}` version triple lands in Phase 5.
 
 ## Crate-local invariants
 - The `{engine, content, schema}` version triple lives here; it is the desync

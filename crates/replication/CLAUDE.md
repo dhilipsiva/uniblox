@@ -49,10 +49,22 @@ gap (a frozen wrong-owner proxy) now HEALS via resync: `collect_resync` (per-pee
 ids + a confirmed-value hash) → receiver flags divergence (missing / wrong-owner / stale-hash) → directed
 `ResyncRequest` (`drain_resync_requests`) → the owner's privileged `ResyncSpawn` (`drain_resync_responses`,
 re-filtered by current-ownership + AOI) which create-or-corrects the proxy (own-authority guard; bypasses the
-`owner!=from` / `spawner!=from` gates as the current authority). Phase 3 still owns: message splitting,
-per-entry ack granularity, the production-pump resync cadence, and the remaining cross-sender gap NOT healable
-by digest/refetch — a chained handoff to a NEVER-witnessed new owner of an adopted entity (no peer holds a
-Local proxy → coordinator / host-migration item).
+`owner!=from` / `spawner!=from` gates as the current authority).
+**ADR-0025 host-migration + ownership-seq arbitration:** **Stage B** — `reassign_orphans(world, departed)`
+re-tags a dropped owner's entities to `elect_owner(peers ∪ local)` (lowest live id), pure-local, no wire,
+rank-PRESERVING (closes the ADR-0024 E4 orphan). **Stage A-kernel** — a per-entity monotonic
+`OwnerSeq{seq,coordinator}` (`NetIdRecord.owner_seq`, seeded `{0,spawner}`) is now the arbiter for EVERY owner
+change: `transfer_ownership` mints `{prev.seq+1, coordinator:local}`, and the `OwnershipTransfer` apply gate is
+**`seq > rec.owner_seq` (strict), REPLACING the old `owner!=from` check** — so the R6 cross-sender reorder now
+RESOLVES BY RANK at the source (no freeze; the resync's R6-freeze-heal role is retired — its residual role is the
+stale-silent-value heal, a LOST-transfer wrong-owner proxy, orphan refetch, and E4). `ResyncSpawn` is now
+seq-gated too (own-authority guard → same-owner value-heal accept-regardless → owner-change `>=` heal →
+orphan-create adopts the rank), which CLOSES the stale-former-owner backdoor. The `>=`(resync)/`>`(transfer)
+asymmetry is deliberate + auditor-verified. `owner_seq(entity)` is a white-box test accessor. The STATE owner
+gate (`apply_state`, `owner!=from`) is UNCHANGED. Phase 3 still owns: message splitting, per-entry ack
+granularity, the **A-handshake** claim/commit/reject PULL path (`ClaimOwnership` → coordinator-arbitrated
+`OwnershipCommit`/`ClaimRejected`), and the deferred consistent-membership (`net_pump` Disconnected) wiring that
+Stage B's exactly-once reassignment relies on.
 
 ## Crate-local invariants
 - **Single-ownership per entity ⇒ last-write-wins, NO CRDT.** One authority per

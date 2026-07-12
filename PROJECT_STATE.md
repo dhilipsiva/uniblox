@@ -33,10 +33,18 @@ proven by `resync_heals_injected_desync_over_pump` (an injected desync self-heal
 (`reassign_orphans`: each survivor deterministically re-tags a departed owner's entities to the lowest-peer-ID
 survivor via `elect_owner`, with NO wire event — authority is derived; the elected survivor simulates, the
 rest re-tag their proxy) DONE, and it CLOSES the ADR-0024 E4 orphan (exactly one survivor now holds a Local
-proxy → witnesses heal via state, non-witnesses via resync). Remaining: the double-ownership coordinator-seq
-arbitration (full claim/commit/reject through a coordinator = lowest-peer-ID; a per-entity `OwnerSeq` gate on
-every owner-mutating apply; WIRE 4→5) — a large coupled build, decided design in the TODO. Next Phase-3
-threads: that double-ownership arbitration; cross-owner interaction rules.
+proxy → witnesses heal via state, non-witnesses via resync). **Stage A-kernel — the `OwnerSeq` gate DONE:** a
+per-entity monotonic `OwnerSeq{seq,coordinator}` (`NetIdRecord.owner_seq`, seeded `{0,spawner}`; **WIRE 4→5**)
+now arbitrates every owner change — `transfer_ownership` mints `{prev.seq+1, coordinator:local}`, and the
+`OwnershipTransfer` apply gate is `seq > rec.owner_seq` (strict), **REPLACING the old `owner!=from` check**, so
+the R6 cross-sender reorder now RESOLVES BY RANK at the source (no freeze — resync's R6-freeze-heal role is
+retired; its residual role is the stale-value / lost-transfer / orphan / E4 heals). `ResyncSpawn` is seq-gated
+too (own-authority guard → same-owner value-heal → owner-change `>=` heal → orphan adopts the rank), closing the
+stale-former-owner backdoor; the `>=`(resync)/`>`(transfer) asymmetry is deliberate + auditor-verified. two_world
+99 green (Group AK + reworked R6); netcode-audited → MERGE. Remaining: the **A-handshake** claim/commit/reject
+PULL path (`ClaimOwnership` → coordinator = lowest-peer-ID → `OwnershipCommit`/`ClaimRejected`). Next Phase-3
+threads: that A-handshake; the deferred consistent-membership (`net_pump` Disconnected) wiring; cross-owner
+interaction rules.
 
 ## Done
 - **Cargo workspace** — virtual manifest, 9 crates under `crates/*` (glob members),
