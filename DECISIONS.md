@@ -931,3 +931,32 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
 - **Status:** Stage B + Stage A-kernel + Stage A-handshake Accepted (2026-07-12). The ADR-0025 item is
   COMPLETE; the cross-owner push/pull-exclusion + membership-consensus hardening is tracked as the deferred
   `net_pump` Disconnected / cross-owner-interaction thread.
+
+## ADR-0026 — Cross-owner interaction quality gap: an accepted latency ceiling (predict-own / interpolate-others)
+- **Context:** the settled "no cross-platform float determinism" invariant (`CONTEXT.md §2`) forces the
+  ADR-0022 render split — receivers **interpolate** entities owned by others and **predict** only entities they
+  own. A direct consequence: when two *remotely-owned* entities interact, EVERY observer sees BOTH through
+  interpolation and predicts NEITHER, so remote-vs-remote interactions carry inherently higher latency (≈ one
+  interpolation delay + RTT). This was captured in the raw research (`docs/claude.txt`: "the Mode-2 quality gap
+  is intrinsic, not a bug") and as a `TODO.md` tradeoff-ledger row, but was not yet recorded as a decision in
+  the canonical "why" docs — leaving a future contributor/agent free to try to "helpfully" close it by
+  re-simulating others locally, which would reintroduce the rejected lockstep/determinism.
+  **DISAMBIGUATION (load-bearing):** this is the interpolation-**latency** sense of "cross-owner". It is
+  DISTINCT from ADR-0025's "cross-owner interaction rules", which is the OWNERSHIP-ARBITRATION thread
+  (push/pull mutual-exclusion + who-decides-a-cross-owner-interaction). This ADR is only about the render/
+  latency quality gap; the deterministic single-authority *rule* for a cross-owner interaction is a separate,
+  still-open `TODO.md` item.
+- **Decision:** ACCEPT the gap as a permanent **quality ceiling** (not a bug), within the design envelope
+  (`CONTEXT.md §4`: low-stakes casual/creative/co-op, small sessions, no hidden information, no real-money).
+  **Never re-simulate remote-vs-remote interactions locally** — the `netcode-auditor` already enforces "no
+  re-simulation of others", and doing so needs the rejected cross-platform determinism. The intended
+  *resolution direction* (keep Mode-2 cross-owner interactions COARSE — positional overlap, not frame-perfect
+  collision — and reserve precise/competitive interaction for the authoritative Mode 3) is the companion
+  `TODO.md` item and is NOT decided here. Recorded in `CONTEXT.md §2` (the accepted consequence, next to its
+  causal invariant) and `CONTEXT.md §4` (the "ceilings to accept, never fix" list, marked a netcode-quality —
+  not anti-cheat — ceiling).
+- **Consequences:** the limitation is now a written decision, not folklore — a "reduce the lag by predicting
+  others" proposal is refused on sight with a pointer here. No code, no invariant change: this RECORDS an
+  existing invariant's consequence (ADR-0022 stands; the receiver still snap-applies + interpolates). The gap's
+  commercial framing (precise play is the Mode-3 upsell) reinforces §5.
+- **Status:** Accepted (2026-07-13).
