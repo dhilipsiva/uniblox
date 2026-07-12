@@ -11,18 +11,19 @@
 use serde::{Deserialize, Serialize};
 
 /// Wire-format version, checked on decode. Bump on ANY message-shape change.
-/// v5 (ADR-0025 A / Phase 3): double-ownership arbitration by coordinator
+/// v6 (ADR-0025 A-handshake / Phase 3): the coordinator PULL handshake —
+/// `NetEvent` gains `ClaimOwnership`, `OwnershipCommit`, and `ClaimRejected`.
+/// v5 (ADR-0025 A-kernel / Phase 3): double-ownership arbitration by coordinator
 /// sequence number — a per-entity monotonic [`OwnerSeq`] rides every
 /// owner-mutating event: `OwnershipTransfer` and `ResyncSpawn` gain a `seq`
-/// field, and `NetEvent` gains the coordinator claim/commit/reject handshake
-/// (`ClaimOwnership`, `OwnershipCommit`, `ClaimRejected`). v4 (ADR-0024):
+/// field. v4 (ADR-0024):
 /// anti-entropy resync — `NetEvent` gains `Digest` (a sender's per-peer summary
 /// of the entities it owns, for divergence detection), `ResyncRequest` (a
 /// receiver asks the owner to re-assert ids it diverged on), and `ResyncSpawn`
 /// (the owner's privileged create-or-correct that heals a frozen wrong-owner /
 /// orphaned proxy). v3 (ADR-0022): `StateMsg` gains `tick` + `last_input`. v2
 /// added `NetEvent::Ack`. Pre-release hard cutover.
-pub const WIRE_VERSION: u8 = 5;
+pub const WIRE_VERSION: u8 = 6;
 
 /// Fixed-point quantization scale: world units × 1024.
 ///
@@ -250,6 +251,25 @@ pub enum NetEvent {
         vel: QVec2,
         seq: OwnerSeq,
     },
+    /// CLAIM ownership of an entity you do NOT currently own (ADR-0025
+    /// A-handshake — the Mode-2 PULL). Directed to the COORDINATOR (the lowest
+    /// live peer id). It flips NO `Owner` anywhere — the claimant assumes nothing
+    /// until it receives an [`NetEvent::OwnershipCommit`] naming it. Reliable.
+    ClaimOwnership { id: NetEntityId },
+    /// The coordinator's arbitrated GRANT of a claim (ADR-0025 A-handshake):
+    /// `new_owner` (the lowest-id claimant) wins the entity at `seq` — a fresh
+    /// [`OwnerSeq`] `{prev.seq + 1, coordinator: self}`. Sent to every peer that
+    /// must re-tag (the claimants, the demoting prior owner, the coordinator's own
+    /// AOI-knowers); gated `seq > proxy.seq`, identical to a transfer. Reliable.
+    OwnershipCommit {
+        id: NetEntityId,
+        new_owner: PeerId,
+        seq: OwnerSeq,
+    },
+    /// The coordinator tells a LOSING claimant its claim did not win (ADR-0025
+    /// A-handshake). No state change (the claimant never pre-flipped); the pump
+    /// may re-claim. Reliable, directed.
+    ClaimRejected { id: NetEntityId },
 }
 
 /// Wire encode/decode errors. Decode failures are expected runtime events
@@ -406,6 +426,35 @@ mod tests {
                     coordinator: PeerId(1),
                 },
             },
+        ] {
+            let msg = EventMsg {
+                version: WIRE_VERSION,
+                sig: None,
+                event,
+            };
+            let bytes = encode_event(&msg).expect("encode");
+            assert_eq!(decode_event(&bytes).expect("decode"), msg);
+        }
+    }
+
+    #[test]
+    fn handshake_events_round_trip() {
+        let id = NetEntityId {
+            spawner: PeerId(4),
+            index: 2,
+            generation: 0,
+        };
+        for event in [
+            NetEvent::ClaimOwnership { id },
+            NetEvent::OwnershipCommit {
+                id,
+                new_owner: PeerId(2),
+                seq: OwnerSeq {
+                    seq: 7,
+                    coordinator: PeerId(1),
+                },
+            },
+            NetEvent::ClaimRejected { id },
         ] {
             let msg = EventMsg {
                 version: WIRE_VERSION,

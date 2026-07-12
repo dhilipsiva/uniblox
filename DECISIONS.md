@@ -899,6 +899,35 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   WIRE 5. netcode-audited → MERGE (the seq gate is a sound total order along the single-ownership chain; the
   `>=`/`>` asymmetry, the pure seed, the backdoor closure, and single-ownership all verified; +the two
   defensive missing-`Owner` guards it recommended).
-- **Stage A-handshake (claim/commit/reject):** pending — the Mode-2 PULL path (`ClaimOwnership` →
-  coordinator-arbitrated `OwnershipCommit`/`ClaimRejected`), coordinator = `elect_owner(peers ∪ local)`.
-- **Status:** Stage B + Stage A-kernel Accepted (2026-07-12); A-handshake pending.
+- **Stage A-handshake — claim/commit/reject (Accepted 2026-07-12):** the Mode-2 PULL path. WIRE 5→6 adds
+  `NetEvent::{ClaimOwnership{id}, OwnershipCommit{id,new_owner,seq}, ClaimRejected{id}}`. `claim_ownership`
+  resolves the id, computes the coordinator = `elect_owner(peers ∪ {local})` (lowest live id, reuses the
+  host-migration election), and returns `(coordinator, ClaimOwnership bytes)` — flipping NO `Owner` (the
+  no-pre-commit-authority guarantee is structural); if WE are the coordinator it records its own claim
+  locally (no self-send). The coordinator's `ClaimOwnership` apply guards `coordinator==local` then records
+  `pending_claims[id].insert(from)`. `drain_commits` (deterministic, no timers) arbitrates each claimed
+  entity: `winner = elect_owner(claimants)` (lowest id), mint `{prev.seq + 1, coordinator: local}`, apply to
+  its OWN proxy via the SHARED `apply_ranked_owner_change` (the strict-`>` kernel gate, now used by transfer,
+  commit, and this self-apply — a single source of truth), emit `OwnershipCommit` to `claimants ∪ {prior
+  owner}` (the prior owner is included so it DEMOTES — else double-authority) plus `ClaimRejected` to the
+  losers. The commit apply arm has NO own-authority guard (unlike `ResyncSpawn`): a commit is MEANT to demote
+  the current owner, and the strict-`>` rank gate drops stale/duplicate replays — coordinator-migration ties
+  resolve toward the higher coordinator. Evidence: two_world 105 green (Group AK-H: two-claims→one-commit+one-
+  reject+prior-owner-demotes [the 145/148 acceptance], no-pre-commit-authority, loser-re-claims-and-wins,
+  claim-to-non-coordinator-ignored, newer-coordinator-wins-equal-seq-tie, unarbitrable-claim-rejected);
+  protocol handshake codec + WIRE 6; full workspace green. netcode-audited → MERGE-with-follow-ups.
+  - **Auditor liveness fix (actioned):** a claim the coordinator cannot arbitrate (no longer the coordinator,
+    or an entity it does not track — e.g. outside its AOI) is now **rejected**, not silently black-holed, so
+    the claimant re-routes/retries (test `unarbitrable_claim_is_rejected_not_blackholed`).
+  - **Deferred carry-forwards (auditor MAJOR, documented not fixed — the "cross-owner interaction rules"
+    thread):** (1) **push/pull mutual exclusion** — `transfer_ownership` (owner push) and the coordinator pull
+    both mint the `OwnerSeq` independently and collide at equal `seq` (the tiebreak favors the higher-id
+    minter, so a concurrent push can silently override a granted claim → a transient/again-permanent double-
+    authority window). An entity must therefore use ONE mechanism at a time, or Mode 2 must route ALL ownership
+    changes through the coordinator (sole minter). (2) **Persistent dual-coordinator split** — exactly-one-
+    coordinator relies on a CONSISTENT `peers` view; the equal-seq tiebreak converges only a ONE-SHOT migration
+    (AK-H5), NOT a persistent split where two peers each self-elect and oscillate. Both close with the deferred
+    `net_pump` Disconnected / membership-consensus wiring (also the Stage-B exactly-once precondition).
+- **Status:** Stage B + Stage A-kernel + Stage A-handshake Accepted (2026-07-12). The ADR-0025 item is
+  COMPLETE; the cross-owner push/pull-exclusion + membership-consensus hardening is tracked as the deferred
+  `net_pump` Disconnected / cross-owner-interaction thread.

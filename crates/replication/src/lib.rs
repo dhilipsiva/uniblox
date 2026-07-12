@@ -296,6 +296,11 @@ pub struct Replication {
     /// [`NetEvent::Digest`] (missing / wrong-owner / stale), drained by
     /// [`drain_resync_requests`] into a directed `ResyncRequest`.
     resync_wanted: HashMap<PeerId, HashSet<NetEntityId>>,
+    /// COORDINATOR (ADR-0025 A-handshake): per entity id, the set of peers that
+    /// have `ClaimOwnership`ed it and are awaiting arbitration. Only populated
+    /// while WE are the coordinator (lowest live peer); drained by
+    /// [`drain_commits`] into `OwnershipCommit`/`ClaimRejected`.
+    pending_claims: HashMap<NetEntityId, HashSet<PeerId>>,
     /// The tracked peer set (added on connect, dropped on departure).
     peers: HashSet<PeerId>,
 }
@@ -317,6 +322,7 @@ impl Replication {
             input_sent: HashMap::new(),
             resync_requests: HashMap::new(),
             resync_wanted: HashMap::new(),
+            pending_claims: HashMap::new(),
             peers: HashSet::new(),
         }
     }
@@ -889,47 +895,17 @@ impl Replication {
                     log::warn!("transfer for unknown {id:?} from {from:?} — dropped");
                     return;
                 };
-                // A mapped proxy always carries `Owner` (spawn_owned adds it,
-                // despawn prunes the map) — but guard defensively so a malformed
-                // proxy never advances its rank without a matching owner flip
-                // (auditor NIT: a bare rank advance would then silently freeze the
-                // sender's state via the apply_state owner gate).
-                if world.get::<Owner>(proxy).is_none() {
-                    return;
-                }
                 // The OwnerSeq is the arbiter now (ADR-0025 A): accept only a
-                // STRICTLY higher rank. This REPLACES the old `owner!=from` gate —
-                // a cross-sender-reordered stale transfer carries a lower seq and
-                // is dropped here WITHOUT freezing the proxy (R6 resolves by rank).
-                // `from` is not consulted: a transfer's authority is proven by its
-                // seq (only the true current owner mints `prev.seq + 1`); a former
-                // owner's replay is strictly lower. (Forging a higher seq is a
-                // modified-client concern — the same trust envelope as the
-                // privileged `ResyncSpawn`.)
-                let Some(rec_seq) = self.map.by_entity.get(&proxy).map(|r| r.owner_seq) else {
-                    return;
-                };
-                if seq <= rec_seq {
-                    log::warn!("stale transfer for {id:?} (rank {seq:?} <= {rec_seq:?}) — dropped");
-                    return;
-                }
-                if let Some(mut owner) = world.get_mut::<Owner>(proxy) {
-                    owner.0 = new_owner;
-                }
-                if let Some(rec) = self.map.by_entity.get_mut(&proxy) {
-                    rec.last_owner = new_owner;
-                    rec.owner_seq = seq;
-                }
-                // Flush the interpolation buffer on ANY authority change
-                // (ADR-0022 Stage C): its snapshots came from the OLD owner;
-                // lerping across the source discontinuity would glide through a
-                // wrong intermediate. (If new_owner == local, the role reset
-                // removes the buffer entirely on adoption.) The role transition
-                // itself — flip apply↔compute, seed prediction from the
-                // authoritative Position — is `reset_render_role`'s job on the
-                // next render step (authority_of flips with no extra code path).
-                if let Some(mut buf) = world.get_mut::<InterpBuffer>(proxy) {
-                    buf.0.clear();
+                // STRICTLY higher rank (`apply_ranked_owner_change`). This REPLACES
+                // the old `owner!=from` gate — a cross-sender-reordered stale
+                // transfer carries a lower seq and is dropped WITHOUT freezing the
+                // proxy (R6 resolves by rank). `from` is not consulted: a
+                // transfer's authority is proven by its seq (only the true current
+                // owner mints `prev.seq + 1`); a former owner's replay is strictly
+                // lower. (Forging a higher seq is a modified-client concern — the
+                // same trust envelope as the privileged `ResyncSpawn`.)
+                if !self.apply_ranked_owner_change(world, proxy, new_owner, seq) {
+                    log::warn!("stale transfer for {id:?} (rank {seq:?}) — dropped");
                 }
             }
             NetEvent::Ack { seq } => {
@@ -1094,7 +1070,85 @@ impl Replication {
                     }
                 }
             }
+            NetEvent::ClaimOwnership { id } => {
+                // COORDINATOR side (ADR-0025 A-handshake): only the coordinator
+                // (the lowest live peer) records claims; a claim mis-routed to a
+                // non-coordinator is dropped (it would never be arbitrated).
+                let local = world.resource::<LocalPeer>().0;
+                if self.coordinator(local) != local {
+                    log::warn!("claim for {id:?} reached non-coordinator {local:?} — dropped");
+                    return;
+                }
+                self.pending_claims.entry(id).or_default().insert(from);
+            }
+            NetEvent::OwnershipCommit { id, new_owner, seq } => {
+                // The coordinator's arbitrated GRANT (ADR-0025 A-handshake):
+                // re-tag the proxy to `new_owner` at `seq`, gated by the SAME
+                // strict-rank rule as a transfer (`apply_ranked_owner_change`). If
+                // `new_owner == local` we assume authority; the loser + prior owner
+                // demote. A stale/duplicate commit (rank ≤ ours) is dropped; an
+                // equal-seq tie resolves toward the higher coordinator (a
+                // post-migration coordinator's commit outranks the old one).
+                let Some(&proxy) = self.map.by_id.get(&id) else {
+                    log::warn!("commit for unknown {id:?} from {from:?} — dropped");
+                    return;
+                };
+                if !self.apply_ranked_owner_change(world, proxy, new_owner, seq) {
+                    log::warn!("stale commit for {id:?} (rank {seq:?}) — dropped");
+                }
+            }
+            NetEvent::ClaimRejected { id } => {
+                // Our claim did not win (ADR-0025 A-handshake). Nothing to undo — a
+                // claimant never pre-flips its `Owner`. The pump may re-claim.
+                log::debug!("ownership claim for {id:?} rejected");
+            }
         }
+    }
+
+    /// Apply a RANKED owner change (ADR-0025 A): accept only a STRICTLY higher
+    /// `OwnerSeq`, then re-tag `Owner`, advance the record's rank + `last_owner`,
+    /// and flush the interp buffer (the old owner's snapshots must not lerp across
+    /// the source discontinuity — mirrors ADR-0022 Stage C). Shared by
+    /// `OwnershipTransfer`, `OwnershipCommit`, and the coordinator's own commit
+    /// self-apply so all three use the IDENTICAL gate. Returns whether it applied.
+    /// A mapped proxy always carries `Owner`; a malformed one (no `Owner`) is a
+    /// no-op that never advances the rank (else a bare rank advance would silently
+    /// freeze the sender's state via the apply_state owner gate — auditor NIT).
+    fn apply_ranked_owner_change(
+        &mut self,
+        world: &mut World,
+        proxy: Entity,
+        new_owner: PeerId,
+        seq: OwnerSeq,
+    ) -> bool {
+        if world.get::<Owner>(proxy).is_none() {
+            return false;
+        }
+        let Some(rec_seq) = self.map.by_entity.get(&proxy).map(|r| r.owner_seq) else {
+            return false;
+        };
+        if seq <= rec_seq {
+            return false;
+        }
+        if let Some(mut owner) = world.get_mut::<Owner>(proxy) {
+            owner.0 = new_owner;
+        }
+        if let Some(rec) = self.map.by_entity.get_mut(&proxy) {
+            rec.last_owner = new_owner;
+            rec.owner_seq = seq;
+        }
+        if let Some(mut buf) = world.get_mut::<InterpBuffer>(proxy) {
+            buf.0.clear();
+        }
+        true
+    }
+
+    /// The current COORDINATOR (ADR-0025 A-handshake) as seen locally: the lowest
+    /// id among the tracked peers plus ourselves (`elect_owner`, reused). Every
+    /// peer with a consistent membership view computes the same coordinator, so no
+    /// election message is needed — the same derivation as host-migration.
+    fn coordinator(&self, local: PeerId) -> PeerId {
+        elect_owner(self.peers.iter().copied().chain(std::iter::once(local))).unwrap_or(local)
     }
 
     /// CLIENT → AUTHORITY inputs (ADR-0022 Stage B): for every entity WE control,
@@ -1402,6 +1456,12 @@ impl Replication {
         self.aoi.remove(&peer);
         self.resync_requests.remove(&peer);
         self.resync_wanted.remove(&peer);
+        // Drop the departed peer's pending ownership claims (ADR-0025 A-handshake)
+        // so it can't win an arbitration after leaving; prune now-empty entries.
+        for set in self.pending_claims.values_mut() {
+            set.remove(&peer);
+        }
+        self.pending_claims.retain(|_, set| !set.is_empty());
     }
 
     /// HOST-MIGRATION reassignment (ADR-0025): when `departed` drops, every
@@ -1537,6 +1597,135 @@ impl Replication {
         self.map.by_entity.get(&entity).map(|r| r.owner_seq)
     }
 
+    /// CLAIM ownership of an entity we do NOT own — the Mode-2 PULL (ADR-0025
+    /// A-handshake). Returns `(coordinator, ClaimOwnership bytes)` for the caller
+    /// to `send_event`; `None` if the entity is unmapped OR we ARE the coordinator
+    /// (then we record our own claim directly — no self-send). Crucially this
+    /// flips NO `Owner`: the claimant assumes NOTHING until it receives an
+    /// `OwnershipCommit` naming it (the no-pre-commit-authority guarantee).
+    pub fn claim_ownership(
+        &mut self,
+        world: &mut World,
+        entity: Entity,
+    ) -> Option<(PeerId, Box<[u8]>)> {
+        let local = world.resource::<LocalPeer>().0;
+        let id = self.map.by_entity.get(&entity).map(|r| r.id)?;
+        let coordinator = self.coordinator(local);
+        if coordinator == local {
+            // We are the coordinator — record our own claim (transports do not
+            // loop back to self, so there is nothing to send).
+            self.pending_claims.entry(id).or_default().insert(local);
+            return None;
+        }
+        match encode_event(&event(NetEvent::ClaimOwnership { id })) {
+            Ok(bytes) => Some((coordinator, bytes.into_boxed_slice())),
+            Err(err) => {
+                log::error!("claim encode for {id:?} failed: {err}");
+                None
+            }
+        }
+    }
+
+    /// COORDINATOR: arbitrate every pending claim (ADR-0025 A-handshake). For each
+    /// claimed entity WE track: the winner is the LOWEST-id claimant
+    /// (`elect_owner`); mint `{prev.seq + 1, coordinator: local}`, apply the commit
+    /// to our OWN proxy (same strict-rank gate), and return the directed messages —
+    /// `OwnershipCommit` to the claimants + the DEMOTING prior owner (so it stops
+    /// simulating — else double-authority), plus `ClaimRejected` to each losing
+    /// claimant. Any claim we CANNOT arbitrate (we are no longer the coordinator,
+    /// or we do not track the entity — e.g. it is outside our AOI) is REJECTED, not
+    /// silently dropped, so the claimant re-routes/retries instead of hanging
+    /// (auditor). Deterministic (id- then peer-sorted), no timers.
+    ///
+    /// The `known`-based recipient expansion only contributes peers when the
+    /// coordinator ITSELF owns the entity (`known` holds only entities we own);
+    /// for a third-party-owned entity, recipients collapse to `claimants ∪ prior
+    /// owner` and any other observer heals via resync — the designed backstop.
+    ///
+    /// CAVEAT (deferred cross-owner rules): this is safe only when an entity uses
+    /// EITHER owner-push (`transfer_ownership`) OR coordinator-pull (claim/commit),
+    /// not both concurrently — the two mint the rank independently and can collide
+    /// at equal `seq`. And exactly-one-coordinator relies on a CONSISTENT `peers`
+    /// view; a persistent split (two peers each believing they are the coordinator)
+    /// is NOT bounded by the equal-seq tiebreak. Both close with the deferred
+    /// `net_pump` Disconnected / membership-consensus wiring; see `DECISIONS.md`.
+    pub fn drain_commits(&mut self, world: &mut World) -> Vec<(PeerId, Box<[u8]>)> {
+        let local = world.resource::<LocalPeer>().0;
+        let am_coordinator = self.coordinator(local) == local;
+        let mut claims: Vec<(NetEntityId, Vec<PeerId>)> = std::mem::take(&mut self.pending_claims)
+            .into_iter()
+            .map(|(id, set)| {
+                let mut v: Vec<PeerId> = set.into_iter().collect();
+                v.sort();
+                (id, v)
+            })
+            .collect();
+        claims.sort_by_key(|(id, _)| *id);
+        let mut out = Vec::new();
+        for (id, claimants) in claims {
+            // Resolve what we need to arbitrate. If we are no longer the
+            // coordinator, or don't track the entity / can't read its owner+rank,
+            // it is unarbitrable → reject every claimant (never a silent drop).
+            let arbitrable = if am_coordinator {
+                self.map.by_id.get(&id).copied().and_then(|e| {
+                    let owner = world.get::<Owner>(e).map(|o| o.0)?;
+                    let seq = self.map.by_entity.get(&e).map(|r| r.owner_seq)?;
+                    Some((e, owner, seq))
+                })
+            } else {
+                None
+            };
+            let Some((entity, current_owner, current_seq)) = arbitrable else {
+                push_rejects(&mut out, id, &claimants);
+                continue;
+            };
+            let Some(winner) = elect_owner(claimants.iter().copied()) else {
+                continue; // claimants non-empty by construction (unreachable)
+            };
+            let new_seq = OwnerSeq {
+                seq: current_seq.seq + 1,
+                coordinator: local,
+            };
+            // Apply the commit to our own proxy (advances the record + demotes us
+            // if we were the owner). Same strict-rank gate as every owner change.
+            self.apply_ranked_owner_change(world, entity, winner, new_seq);
+            // Recipients that must re-tag: the claimants + the demoting prior owner,
+            // plus any peer we ourselves send this entity to — minus us (applied
+            // above). See the `known`-expansion caveat in the doc comment.
+            let mut recipients: HashSet<PeerId> = claimants.iter().copied().collect();
+            recipients.insert(current_owner);
+            for (peer, known_set) in &self.known {
+                if known_set.contains(&entity) {
+                    recipients.insert(*peer);
+                }
+            }
+            recipients.remove(&local);
+            let mut recipients: Vec<PeerId> = recipients.into_iter().collect();
+            recipients.sort();
+            for peer in recipients {
+                match encode_event(&event(NetEvent::OwnershipCommit {
+                    id,
+                    new_owner: winner,
+                    seq: new_seq,
+                })) {
+                    Ok(bytes) => out.push((peer, bytes.into_boxed_slice())),
+                    Err(err) => log::error!("commit encode to {peer:?} failed: {err}"),
+                }
+            }
+            // Explicit rejection to every LOSING claimant (the commit re-tags their
+            // proxy; this is the required explicit claim-failed signal).
+            let losers: Vec<PeerId> = claimants.iter().copied().filter(|&c| c != winner).collect();
+            push_rejects(&mut out, id, &losers);
+        }
+        out
+    }
+
+    /// Whether we (as coordinator) hold a pending claim for `id` — for white-box
+    /// tests of the claim-routing guard (a claim to a non-coordinator records none).
+    pub fn has_pending_claim(&self, id: NetEntityId) -> bool {
+        self.pending_claims.contains_key(&id)
+    }
+
     /// A peer connected: track it (ADR-0021). Its entities are announced by the
     /// next [`collect_all`] via AOI-ENTER — only the ones inside its AOI, so the
     /// read-cheat holds even at join time. There is deliberately NO blanket
@@ -1552,6 +1741,18 @@ fn event(event: NetEvent) -> EventMsg {
         version: WIRE_VERSION,
         sig: None, // reserved; nothing signs in the slice (Phase 6)
         event,
+    }
+}
+
+/// Push a directed `ClaimRejected{id}` for every peer in `peers` (ADR-0025
+/// A-handshake): the coordinator's definitive "your claim did not win / could not
+/// be arbitrated" reply, so a claimant re-routes/retries rather than hanging.
+fn push_rejects(out: &mut Vec<(PeerId, Box<[u8]>)>, id: NetEntityId, peers: &[PeerId]) {
+    for &peer in peers {
+        match encode_event(&event(NetEvent::ClaimRejected { id })) {
+            Ok(bytes) => out.push((peer, bytes.into_boxed_slice())),
+            Err(err) => log::error!("reject encode to {peer:?} failed: {err}"),
+        }
     }
 }
 
