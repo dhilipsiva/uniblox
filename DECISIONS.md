@@ -960,3 +960,43 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   existing invariant's consequence (ADR-0022 stands; the receiver still snap-applies + interpolates). The gap's
   commercial framing (precise play is the Mode-3 upsell) reinforces §5.
 - **Status:** Accepted (2026-07-13).
+
+## ADR-0027 — Deterministic single-authority rule for cross-owner interactions (rule R1)
+- **Context:** ADR-0026 accepted the remote-vs-remote LATENCY gap; this fills the rule it deferred — when two
+  DIFFERENTLY-owned entities interact, WHO decides the outcome, deterministically, without either peer
+  re-simulating the other (forbidden — reintroduces the rejected cross-platform float determinism). Greenfield:
+  the sim was pure `pos += vel*dt` with NO entity-vs-entity system. (Disambiguation: this is the
+  interaction-OUTCOME rule — distinct from ADR-0025's "cross-owner" = ownership arbitration and ADR-0026's
+  "cross-owner" = interpolation latency.)
+- **Decision (user, via AskUserQuestion — rule R1 + a standing system):** each interaction EFFECT is decided +
+  applied by the OWNER of the entity it MUTATES (= `authority_of` on the affected entity — which IS "the entity
+  being hit is authoritative"). This falls STRAIGHT OUT of single-ownership: only the target's owner may write
+  the target, so there is never a cross-owner write and the other entity is only READ (its replicated
+  `Position`), never re-simulated. A SHARED/symmetric outcome with no natural target breaks the tie to the LOWER
+  owner `PeerId` (`interaction_decider = min`, the lowest-peer-id pattern reused from host-migration / the
+  coordinator) so it is recorded exactly once. Built as a STANDING coarse system in `engine-core`:
+  `Interactable{radius}` (a circular contact volume) + `Contacts(u32)` (a per-entity, owner-authoritative tally)
+  + `overlaps` (coarse `dist² ≤ (ra+rb)²`, touching counts) + `resolve_interactions` (per overlapping pair,
+  `+1` on each entity the local peer owns), wired into the server `FixedUpdate` after `simulate`. Coarse =
+  positional overlap, NOT frame-perfect (precise/competitive → Mode 3).
+- **Consequences:** exactly ONE deciding authority per effect, structurally (the query's only writable binding is
+  `&mut Contacts`, mutated only behind `authority_of == Local`); no cross-owner write; no re-simulation of
+  others (the remote entity's `Position`/`Velocity` are read-only — proven bit-identical in
+  `interaction_never_resimulates_the_remote_entity`). Single-ownership / no CRDT preserved: each `Contacts` is
+  single-owned + LWW, so an interpolation-lag overlap DISAGREEMENT is benign coarse jank (one side counts a tick
+  the other misses — accepted per ADR-0026), never a divergence. **Mode 3 DISSOLVES the gap with no code fork:**
+  same-owner pairs are deliberately NOT skipped, so when the server owns all it applies every contact
+  frame-perfectly (the authority-swap, ADR-0014). `Contacts` is a per-tick LEVEL (per-tick contact damage, not
+  per-hit) and is LOCAL (not on the wire — only Position/Velocity replicate today; general component
+  replication is a separate item; peers must agree on authored `radius`). Deferred/transient (accepted, not
+  fixed): a shared-outcome PATH is not yet wired (`interaction_decider` is a provided primitive — a future
+  consumer must only write entities it owns or emit an event, never a cross-owner write); orphaned-entity
+  contacts freeze during the ADR-0025 reassignment window (nobody is `Local` for the departed owner) until
+  reassignment/resync; the `client` crate is still a render demo, so the Mode-2 "both apply their own" property
+  is proven in the two-World tests, not yet a running Mode-2 app. Evidence: engine-core 12 green (overlaps geom,
+  decider=min+exactly-one, contact-only-on-local-owner, Mode-3-owner-applies-all) + two_world 107 green
+  (cross-owner-decided-by-affected-owner, never-resimulates-remote); clippy `-D warnings` native + wasm32; fmt
+  clean; full workspace green (schedule change is a no-op without Interactable entities). netcode-audited →
+  MERGE (both cardinal properties hold structurally; single-ownership/no-CRDT preserved; Mode-3 dissolution
+  genuine).
+- **Status:** Accepted (2026-07-13).

@@ -42,6 +42,25 @@ pub struct Velocity {
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Owner(pub PeerId);
 
+/// A coarse circular interaction volume (ADR-0027): an entity carries one to
+/// participate in cross-owner interactions; `radius` is the contact reach. Coarse
+/// = positional overlap, NOT frame-perfect collision (that is a Mode-3 concern).
+/// Gameplay-authored (NOT attached by [`spawn_owned`]) and LOCAL — it is not on
+/// the wire (only `Position`/`Velocity` replicate today); a receiver attaches it
+/// to a proxy from content.
+#[derive(Component, Clone, Copy, Debug, PartialEq)]
+pub struct Interactable {
+    pub radius: f32,
+}
+
+/// The per-entity contact effect an interaction accrues (ADR-0027): a neutral
+/// tally a future game / Rhai maps to damage / score. Owner-AUTHORITATIVE — only
+/// the entity's OWNER writes it (rule R1: the affected entity's owner decides) —
+/// so it is single-owned state (no CRDT), replicated last-write-wins like any
+/// owned datum once general component replication lands.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Contacts(pub u32);
+
 /// Who "I" am in this running instance. In Mode 1 it matches every entity's
 /// owner; in Mode 2 each peer's instance differs; in Mode 3 the server's
 /// matches all entities and no client's does. Pure data — never a mode enum.
@@ -205,6 +224,88 @@ pub fn simulate(
             // empty arm is the documented apply-path placeholder — do NOT
             // remove it as dead code.
             Authority::Remote => {}
+        }
+    }
+}
+
+/// Coarse circle-overlap test (ADR-0027): true iff the two interaction circles
+/// touch or overlap (`dist² ≤ (ar+br)²` — touching counts). Positional overlap
+/// only, NOT frame-perfect collision. Reads positions; agreed on every peer that
+/// sees the same positions.
+pub fn overlaps(a: Position, ar: f32, b: Position, br: f32) -> bool {
+    let dx = a.x - b.x;
+    let dy = a.y - b.y;
+    let sum = ar + br;
+    dx * dx + dy * dy <= sum * sum
+}
+
+/// The deterministic decider for a SHARED cross-owner interaction outcome
+/// (ADR-0027): the LOWER owner [`PeerId`]. Every peer computes the same decider
+/// from the two owners, so a shared scalar result (a score, an exclusive pickup)
+/// is recorded exactly once — no double-count. A PER-ENTITY effect needs no
+/// tiebreak: it is decided by the affected entity's own owner via [`authority_of`],
+/// which falls straight out of single-ownership. Reuses the lowest-peer-id pattern
+/// shared with host-migration / the ownership coordinator.
+///
+/// CAUTION when wiring a real shared-outcome path (auditor): the decider peer does
+/// NOT necessarily OWN the entity the outcome must be written to. It may therefore
+/// only write entities IT owns, or EMIT the outcome (a reliable event) for the
+/// affected owner to apply — writing another peer's entity from the decider would
+/// violate single-ownership. This helper picks WHO decides, not who may write.
+pub fn interaction_decider(a: PeerId, b: PeerId) -> PeerId {
+    a.min(b)
+}
+
+/// The standing coarse cross-owner interaction system (ADR-0027). Each tick, for
+/// every pair of overlapping [`Interactable`] entities, the contact effect on EACH
+/// entity is applied by that entity's OWNER only (`authority_of == Local`) —
+/// rule R1: the affected entity's owner decides + writes, so there is never a
+/// cross-owner write and the OTHER entity is only READ (its replicated
+/// [`Position`]), never re-simulated. Because the gate is per-entity ownership,
+/// under Mode-3 ownership (the server owns all) the single authority applies EVERY
+/// contact frame-perfectly with no code fork — the cross-owner case dissolves.
+///
+/// Two-pass (snapshot the read set, then mutate owned entities): `bevy_ecs` cannot
+/// iterate entity PAIRS mutably. `Contacts` is a per-tick contact LEVEL, not an
+/// enter-edge event — a sustained overlap accrues +1/tick (content maps this to
+/// per-tick contact damage, not per-hit), and an entity overlapping N others in one
+/// tick accrues +N (per-pair). A repeated entity in the hit list is safe: each
+/// `get_mut` borrow is scoped to one `if let` and `+=` commutes. Skipping same-owner
+/// pairs is deliberately NOT done (a single owner legitimately decides both its
+/// entities' contacts — the Mode-3 path). Entities without both [`Interactable`] and
+/// [`Contacts`] never match. NOTE: overlap uses each entity's `radius` (authored
+/// LOCALLY, not on the wire), so peers must agree on content — a benign dependency
+/// under single-ownership (each writes only its own entity).
+pub fn resolve_interactions(
+    local: Res<LocalPeer>,
+    mut q: Query<(Entity, &Owner, &Position, &Interactable, &mut Contacts)>,
+) {
+    // Read set: (entity, owner, position, radius). The immutable borrow ends
+    // before we take the mutable `get_mut` borrows below.
+    let actors: Vec<(Entity, PeerId, Position, f32)> = q
+        .iter()
+        .map(|(e, owner, pos, it, _)| (e, owner.0, *pos, it.radius))
+        .collect();
+    // Accumulate a contact for each OWNED entity in an overlapping pair (R1). We
+    // touch only entities `authority_of == Local`, so we never write a foreign
+    // entity and never read+integrate another peer's entity.
+    let mut owned_hits: Vec<Entity> = Vec::new();
+    for (i, &(ea, oa, pa, ra)) in actors.iter().enumerate() {
+        for &(eb, ob, pb, rb) in &actors[i + 1..] {
+            if !overlaps(pa, ra, pb, rb) {
+                continue;
+            }
+            if authority_of(oa, local.0) == Authority::Local {
+                owned_hits.push(ea);
+            }
+            if authority_of(ob, local.0) == Authority::Local {
+                owned_hits.push(eb);
+            }
+        }
+    }
+    for e in owned_hits {
+        if let Ok((.., mut contacts)) = q.get_mut(e) {
+            contacts.0 += 1;
         }
     }
 }

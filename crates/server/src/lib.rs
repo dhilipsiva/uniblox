@@ -29,7 +29,7 @@ use bevy_ecs::prelude::*;
 use bevy_time::{Fixed, Time, TimePlugin, Virtual};
 use engine_core::{
     ControlledBy, LocalPeer, PendingInputs, Position, ProcessedInput, SimDt, Velocity,
-    advance_tick, apply_input, insert_sim, simulate, spawn_owned,
+    advance_tick, apply_input, insert_sim, resolve_interactions, simulate, spawn_owned,
 };
 use protocol::PeerId;
 use replication::Replication;
@@ -349,7 +349,18 @@ fn build_server_app_inner(
     // input (the alignment reconciliation depends on).
     app.add_systems(
         FixedUpdate,
-        (sync_sim_dt, count_tick, advance_tick, apply_input, simulate).chain(),
+        (
+            sync_sim_dt,
+            count_tick,
+            advance_tick,
+            apply_input,
+            simulate,
+            // Coarse cross-owner interactions (ADR-0027) run AFTER simulate, on the
+            // final positions. A no-op until entities carry Interactable+Contacts;
+            // in Mode 3 the server owns all, so it decides every interaction.
+            resolve_interactions,
+        )
+            .chain(),
     );
     app.add_systems(Update, net_pump);
     app
