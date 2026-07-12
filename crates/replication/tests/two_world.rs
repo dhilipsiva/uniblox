@@ -10,9 +10,10 @@
 
 use bevy_ecs::prelude::*;
 use engine_core::{
-    Controlled, ControlledBy, INTERP_DELAY_TICKS, InputHistory, Intent, InterpBuffer, Owner,
-    Position, RenderPos, RenderTick, Tick, Velocity, apply_input, copy_owned_render, insert_sim,
-    interpolate, predict, record_input, reset_render_role, simulate, spawn_owned,
+    Contacts, Controlled, ControlledBy, INTERP_DELAY_TICKS, InputHistory, Intent, Interactable,
+    InterpBuffer, Owner, Position, RenderPos, RenderTick, Tick, Velocity, apply_input,
+    copy_owned_render, insert_sim, interpolate, predict, record_input, reset_render_role,
+    resolve_interactions, simulate, spawn_owned,
 };
 use protocol::{
     EventMsg, NetEntityId, NetEvent, OwnerSeq, PeerId, StateEntry, WIRE_VERSION, decode_event,
@@ -4118,5 +4119,102 @@ fn unarbitrable_claim_is_rejected_not_blackholed() {
             NetEvent::ClaimRejected { .. }
         )),
         "and NO commit is emitted for an entity we can't arbitrate"
+    );
+}
+
+// ═════ Group INT — cross-owner interactions over real replication (ADR-0027) ═════
+
+/// Run `resolve_interactions` once on a peer's world.
+fn resolve_once(peer: &mut TestPeer) {
+    let mut s = Schedule::default();
+    s.add_systems(resolve_interactions);
+    s.run(&mut peer.world);
+}
+
+/// Make an entity a coarse interactor (radius) with a zeroed contact tally.
+fn make_interactable(peer: &mut TestPeer, e: Entity, radius: f32) {
+    peer.world
+        .entity_mut(e)
+        .insert((Interactable { radius }, Contacts::default()));
+}
+
+fn contacts(peer: &TestPeer, e: Entity) -> u32 {
+    peer.world.get::<Contacts>(e).map(|c| c.0).unwrap_or(0)
+}
+
+/// INT-cross-owner-decider — A(owner P) and B(owner Q) overlap over REAL
+/// replication (each holds the other as a snap-applied proxy). Exactly ONE peer
+/// decides each entity's contact: P applies A's (it owns A) and NOT B's proxy;
+/// Q applies B's and NOT A's proxy. The 145 acceptance: one deciding authority
+/// per effect, no cross-owner write.
+#[test]
+fn cross_owner_contact_decided_by_the_affected_owner() {
+    let mut p = TestPeer::new(1);
+    let mut q = TestPeer::new(2);
+    let a = p.spawn(0.0, 0.0, 0.0, 0.0); // P owns A at origin
+    let b = q.spawn(0.5, 0.0, 0.0, 0.0); // Q owns B, overlapping A
+
+    // Replicate positions both ways so each peer holds the other as a proxy.
+    q.deliver_all(p.id, &p.collect_for(q.id));
+    p.deliver_all(q.id, &q.collect_for(p.id));
+    let proxy_b = p.entity_owned_by(q.id); // B's proxy on P
+    let proxy_a = q.entity_owned_by(p.id); // A's proxy on Q
+
+    // Both peers mark both entities interactable (local gameplay state — Contacts
+    // is not on the wire; a receiver attaches it to the proxy).
+    make_interactable(&mut p, a, 1.0);
+    make_interactable(&mut p, proxy_b, 1.0);
+    make_interactable(&mut q, b, 1.0);
+    make_interactable(&mut q, proxy_a, 1.0);
+
+    resolve_once(&mut p);
+    resolve_once(&mut q);
+
+    assert_eq!(
+        contacts(&p, a),
+        1,
+        "P decides + applies A's contact (it owns A)"
+    );
+    assert_eq!(
+        contacts(&p, proxy_b),
+        0,
+        "P does NOT apply B's contact — B's owner Q does (no cross-owner write)"
+    );
+    assert_eq!(contacts(&q, b), 1, "Q decides + applies B's contact");
+    assert_eq!(contacts(&q, proxy_a), 0, "Q does NOT apply A's contact");
+}
+
+/// INT-no-resim — resolving an interaction only READS the other entity's
+/// replicated state: after `resolve_interactions` on P, B's proxy Position AND
+/// Velocity are BIT-IDENTICAL to before (never re-simulated / written).
+#[test]
+fn interaction_never_resimulates_the_remote_entity() {
+    let mut p = TestPeer::new(1);
+    let mut q = TestPeer::new(2);
+    let a = p.spawn(0.0, 0.0, 0.0, 0.0);
+    q.spawn(0.5, 0.0, 3.0, 7.0); // Q owns B with a distinctive velocity
+
+    q.deliver_all(p.id, &p.collect_for(q.id));
+    p.deliver_all(q.id, &q.collect_for(p.id));
+    let proxy_b = p.entity_owned_by(q.id);
+    make_interactable(&mut p, a, 1.0);
+    make_interactable(&mut p, proxy_b, 1.0);
+
+    let before_pos = p.pos(proxy_b);
+    let before_vel = *p.world.get::<Velocity>(proxy_b).unwrap();
+
+    resolve_once(&mut p);
+
+    let after_pos = p.pos(proxy_b);
+    let after_vel = *p.world.get::<Velocity>(proxy_b).unwrap();
+    assert_eq!(
+        (before_pos.x.to_bits(), before_pos.y.to_bits()),
+        (after_pos.x.to_bits(), after_pos.y.to_bits()),
+        "the remote proxy's Position is untouched by the interaction (read-only)"
+    );
+    assert_eq!(
+        (before_vel.x.to_bits(), before_vel.y.to_bits()),
+        (after_vel.x.to_bits(), after_vel.y.to_bits()),
+        "and its Velocity is never re-integrated"
     );
 }

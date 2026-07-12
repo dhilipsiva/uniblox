@@ -13,7 +13,8 @@
 
 use bevy_ecs::prelude::*;
 use engine_core::{
-    Authority, Owner, Position, Velocity, authority_of, insert_sim, simulate, spawn_owned,
+    Authority, Contacts, Interactable, Owner, Position, Velocity, authority_of, insert_sim,
+    interaction_decider, overlaps, resolve_interactions, simulate, spawn_owned,
 };
 use protocol::PeerId;
 
@@ -164,4 +165,111 @@ fn no_position_without_owner() {
         .iter(&world)
         .count();
     assert_eq!(orphans, 0);
+}
+
+// ── Cross-owner interactions (ADR-0027) ──────────────────────────────────────
+//
+// Rule R1: each contact effect is applied by the OWNER of the affected entity
+// (`authority_of == Local`) — "the entity being hit is authoritative", straight
+// out of single-ownership (only the owner may write it). The other entity is only
+// READ (its replicated Position), never re-simulated. Coarse = circle overlap.
+
+/// A world + schedule running ONLY `resolve_interactions`.
+fn interaction_world(local: PeerId) -> (World, Schedule) {
+    let mut world = World::new();
+    insert_sim(&mut world, local, DT);
+    let mut schedule = Schedule::default();
+    schedule.add_systems(resolve_interactions);
+    (world, schedule)
+}
+
+/// Spawn a stationary interactable entity (circle of `radius`) owned by `owner`.
+fn spawn_interactable(world: &mut World, owner: PeerId, p: Position, radius: f32) -> Entity {
+    let e = spawn_owned(world, owner, p, vel(0.0, 0.0));
+    world
+        .entity_mut(e)
+        .insert((Interactable { radius }, Contacts::default()));
+    e
+}
+
+/// INT-geom: `overlaps` is a coarse circle test — overlapping and exactly-touching
+/// count; strictly-apart does not.
+#[test]
+fn overlaps_is_a_coarse_circle_test() {
+    // Centers 1.0 apart, radii 0.6+0.6=1.2 > 1.0 → overlap.
+    assert!(overlaps(pos(0.0, 0.0), 0.6, pos(1.0, 0.0), 0.6));
+    // Centers exactly 2.0 apart, radii 1.0+1.0=2.0 → touching counts (≤).
+    assert!(overlaps(pos(0.0, 0.0), 1.0, pos(2.0, 0.0), 1.0));
+    // Centers 3.0 apart, radii 1.0+1.0=2.0 < 3.0 → apart.
+    assert!(!overlaps(pos(0.0, 0.0), 1.0, pos(3.0, 0.0), 1.0));
+}
+
+/// INT-decider: the shared-outcome tiebreak is the LOWER owner PeerId — symmetric,
+/// and picks EXACTLY ONE of the two peers (so a shared result is recorded once, no
+/// double-count).
+#[test]
+fn interaction_decider_is_the_lower_peer_and_exactly_one() {
+    assert_eq!(interaction_decider(PeerId(2), PeerId(5)), PeerId(2));
+    assert_eq!(interaction_decider(PeerId(5), PeerId(2)), PeerId(2)); // symmetric
+    // Exactly one of the two owners is the decider.
+    let (p, q) = (PeerId(3), PeerId(8));
+    let p_decides = interaction_decider(p, q) == p;
+    let q_decides = interaction_decider(p, q) == q;
+    assert!(
+        p_decides ^ q_decides,
+        "exactly one peer decides the shared outcome"
+    );
+    assert!(p_decides, "the lower owner PeerId decides");
+}
+
+/// INT-local: a contact accrues ONLY on an entity the local peer OWNS. My entity
+/// overlapping a REMOTE entity gets its contact (I own it); the remote entity is
+/// NOT applied by me (its owner does that); a non-overlapping entity gets nothing.
+#[test]
+fn contact_accrues_only_on_the_local_owner() {
+    let me = PeerId(1);
+    let (mut world, mut schedule) = interaction_world(me);
+    let a = spawn_interactable(&mut world, me, pos(0.0, 0.0), 1.0);
+    let r = spawn_interactable(&mut world, PeerId(2), pos(1.0, 0.0), 1.0); // overlaps A
+    let far = spawn_interactable(&mut world, me, pos(100.0, 0.0), 1.0); // overlaps nothing
+
+    schedule.run(&mut world);
+
+    assert_eq!(
+        world.get::<Contacts>(a).unwrap().0,
+        1,
+        "my entity accrues its own contact"
+    );
+    assert_eq!(
+        world.get::<Contacts>(r).unwrap().0,
+        0,
+        "the remote entity is NOT applied by me — its owner decides that (no cross-owner write)"
+    );
+    assert_eq!(
+        world.get::<Contacts>(far).unwrap().0,
+        0,
+        "no overlap, no contact"
+    );
+}
+
+/// INT-mode3-dissolves: under Mode-3 ownership (the server owns ALL entities), the
+/// single authority applies EVERY contact frame-perfectly — the cross-owner case
+/// dissolves, with NO code fork. A client (owns neither) applies none locally.
+#[test]
+fn mode3_owner_of_all_applies_every_contact() {
+    let server = PeerId(0);
+    let contacts_as = |local: PeerId| -> (u32, u32) {
+        let (mut world, mut schedule) = interaction_world(local);
+        let a = spawn_interactable(&mut world, server, pos(0.0, 0.0), 1.0);
+        let b = spawn_interactable(&mut world, server, pos(1.0, 0.0), 1.0); // overlaps A
+        schedule.run(&mut world);
+        (
+            world.get::<Contacts>(a).unwrap().0,
+            world.get::<Contacts>(b).unwrap().0,
+        )
+    };
+    // Server owns both → applies both contacts (single authority, frame-perfect).
+    assert_eq!(contacts_as(server), (1, 1));
+    // A client owns neither → applies none locally (it receives the server's result).
+    assert_eq!(contacts_as(PeerId(9)), (0, 0));
 }
