@@ -123,6 +123,18 @@ impl Client {
             }
         }
 
+        // Coordinator ownership arbitration (ADR-0025 A / ADR-0028): if WE are the
+        // coordinator, arbitrate queued claims into OwnershipCommit/ClaimRejected —
+        // mirroring net_pump's drain_commits so a Client can act as the coordinator.
+        for (target, bytes) in self.repl.drain_commits(&mut self.world) {
+            if let Some(peer) = connected
+                .iter()
+                .find(|p| PeerId::from_uuid_bytes(*p.0.as_bytes()) == target)
+            {
+                let _ = self.transport.send_event(*peer, bytes);
+            }
+        }
+
         // Send our OWNED entities' state (Mode-2-shaped) to each tracked peer.
         // A client that owns nothing yields empty outboxes — transparent to the
         // Mode-3 receive-only tests; drives the server's ack-routing in return.
@@ -170,6 +182,29 @@ impl Client {
             .collect();
         assert_eq!(found.len(), 1, "expected exactly one server-owned proxy");
         found[0]
+    }
+
+    /// CLAIM an entity via the coordinator (ADR-0025 A) — route the
+    /// `ClaimOwnership` to whoever is the coordinator (or record locally if we are).
+    fn claim(&mut self, entity: Entity) {
+        if let Some((target, bytes)) = self.repl.claim_ownership(&mut self.world, entity) {
+            let connected: Vec<_> = self.transport.connected_peers().collect();
+            if let Some(peer) = connected
+                .iter()
+                .find(|p| PeerId::from_uuid_bytes(*p.0.as_bytes()) == target)
+            {
+                let _ = self.transport.send_event(*peer, bytes);
+            }
+        }
+    }
+
+    fn owner_of(&self, entity: Entity) -> Option<PeerId> {
+        self.world.get::<Owner>(entity).map(|o| o.0)
+    }
+
+    /// Close the transport (simulate this peer leaving the session).
+    fn close(&mut self) {
+        self.transport.close();
     }
 }
 
@@ -655,6 +690,116 @@ async fn resync_heals_injected_desync_over_pump() {
         assert!(
             (client.server_proxies(server_id)[0].x - 5.0).abs() < 0.1,
             "the healed value must hold"
+        );
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+// ═══ ADR-0028 (Stage 1) — claim + reassignment driven by the real net_pump ═══
+
+/// WIRE-claim — the pump drives a CLAIM end-to-end. A client claims a
+/// server-owned entity; whichever peer is the coordinator arbitrates via the
+/// wired `drain_commits`, and (sole claimant) the entity converges to the CLIENT
+/// on BOTH sides — proving claim/commit flows through the real pump.
+#[tokio::test(flavor = "multi_thread")]
+async fn pump_drives_claim_end_to_end() {
+    let room = start_signaling();
+    let (mut app, server_id) = boot_server(&room, 1).await;
+    let mut client = Client::connect(&room).await;
+
+    // Converge: the client holds the server's one entity as a proxy.
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    loop {
+        app.update();
+        client.pump();
+        if client.server_proxies(server_id).len() == 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "client never got the server proxy"
+        );
+        tokio::time::sleep(POLL).await;
+    }
+
+    // The client claims the server's entity (routes to the coordinator).
+    let proxy = client.server_proxy_entity(server_id);
+    let client_id = client.local;
+    client.claim(proxy);
+
+    // Pump both sides until the claim COMMITS: the sole claimant (the client) wins,
+    // so the entity is client-owned on the client AND on the server.
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    loop {
+        app.update();
+        client.pump();
+        let client_owns = client.owner_of(proxy) == Some(client_id);
+        let world = app.world_mut();
+        let server_owners: Vec<PeerId> = world.query::<&Owner>().iter(world).map(|o| o.0).collect();
+        let server_agrees =
+            server_owners.len() == 1 && server_owners.iter().all(|o| *o == client_id);
+        if client_owns && server_agrees {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "claim never committed through the pump"
+        );
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// WIRE-reassign — a departed OWNER's entity is reassigned by the pump. A client
+/// owns a Mode-2-shaped entity (the server holds a proxy); the client leaves; the
+/// server's Disconnected arm calls `reassign_orphans`, so the orphan is re-tagged
+/// to the surviving owner (the server) — never frozen at the dead client.
+#[tokio::test(flavor = "multi_thread")]
+async fn pump_reassigns_departed_owners_entity() {
+    let room = start_signaling();
+    let (mut app, server_id) = boot_server(&room, 0).await; // server owns nothing
+    let mut client = Client::connect(&room).await;
+    let client_id = client.local;
+    client.spawn_owned_entity(Position { x: 5.0, y: 0.0 }, Velocity { x: 0.0, y: 0.0 });
+
+    // Converge: the server holds the client's entity as a proxy (owned by client).
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    loop {
+        app.update();
+        client.pump();
+        let world = app.world_mut();
+        let has_client_proxy = world
+            .query::<&Owner>()
+            .iter(world)
+            .any(|o| o.0 == client_id);
+        if has_client_proxy {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "server never got the client's proxy"
+        );
+        tokio::time::sleep(POLL).await;
+    }
+
+    // The client leaves the session.
+    client.close();
+    drop(client);
+
+    // Pump the server until it observes the disconnect and reassigns the orphan:
+    // the (formerly client-owned) entity is now server-owned, none left orphaned.
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    loop {
+        app.update();
+        let world = app.world_mut();
+        let owners: Vec<PeerId> = world.query::<&Owner>().iter(world).map(|o| o.0).collect();
+        let none_orphaned = !owners.contains(&client_id);
+        let reassigned = !owners.is_empty() && owners.iter().all(|o| *o == server_id);
+        if none_orphaned && reassigned {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "server never reassigned the departed owner's entity (owners={owners:?})"
         );
         tokio::time::sleep(POLL).await;
     }

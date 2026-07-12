@@ -4218,3 +4218,147 @@ fn interaction_never_resimulates_the_remote_entity() {
         "and its Velocity is never re-integrated"
     );
 }
+
+// ═════ Group SM — coordinator sole-minter push (ADR-0028 a) ═════
+
+/// Route an owner's PUSH handoff request to the coordinator (asserting it targets
+/// `coord`).
+fn route_transfer_request(owner: &mut TestPeer, entity: Entity, to: PeerId, coord: &mut TestPeer) {
+    if let Some((target, bytes)) = owner.repl.request_transfer(&mut owner.world, entity, to) {
+        assert_eq!(
+            target, coord.id,
+            "a transfer-request routes to the coordinator"
+        );
+        coord.repl.apply_events(&mut coord.world, owner.id, &bytes);
+    }
+}
+
+/// SM-converge — a concurrent PUSH (owner O requests →X) and PULL (Y claims) on
+/// ONE entity, both routed to the coordinator, resolve to a SINGLE committed owner
+/// with a SINGLE coordinator-minted rank — the push/pull double-mint collision
+/// cannot arise (the coordinator is the sole minter). The 148 acceptance.
+#[test]
+fn concurrent_push_and_pull_converge_to_one_owner() {
+    let (mut o, mut coord, mut x, mut y, e, proxy_coord, proxy_x, proxy_y) = coord_mesh();
+
+    // O (owner, NOT the coordinator) requests a push to X; concurrently Y pulls.
+    route_transfer_request(&mut o, e, x.id, &mut coord);
+    route_claim(&mut y, proxy_y, &mut coord);
+    assert_eq!(
+        o.owner(e),
+        o.id,
+        "the requesting owner assumes NOTHING pre-commit (no local flip/mint)"
+    );
+
+    // The coordinator mints exactly ONE commit; winner = elect({X=2, Y=3}) = X.
+    let msgs = coord.repl.drain_commits(&mut coord.world);
+    let commit_owners: Vec<PeerId> = msgs
+        .iter()
+        .filter_map(|(_, b)| match decode_event(b).unwrap().event {
+            NetEvent::OwnershipCommit { new_owner, .. } => Some(new_owner),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !commit_owners.is_empty() && commit_owners.iter().all(|w| *w == x.id),
+        "a single committed owner across the mesh: X"
+    );
+
+    route_all(&msgs, coord.id, &mut [&mut o, &mut x, &mut y]);
+
+    // Everyone converges to owner X (a single owner — no double-authority), and the
+    // rank is the SINGLE coordinator mint {1, coord} (not two colliding {1,·}).
+    assert_eq!(o.owner(e), x.id, "prior owner O converges to X");
+    assert_eq!(coord.owner(proxy_coord), x.id);
+    assert_eq!(x.owner(proxy_x), x.id, "X assumes authority");
+    assert_eq!(y.owner(proxy_y), x.id, "loser Y converges to X");
+    assert_eq!(
+        x.repl.owner_seq(proxy_x),
+        Some(OwnerSeq {
+            seq: 1,
+            coordinator: coord.id
+        }),
+        "a single coordinator-minted rank (no push/pull double-mint)"
+    );
+}
+
+/// SM-route — a NON-coordinator owner's `request_transfer` routes to the
+/// coordinator, flips NO `Owner`, and mints NO local rank (the sole-minter
+/// guarantee); the coordinator records it. A self-coordinator records directly.
+#[test]
+fn transfer_request_routes_and_never_mints_locally() {
+    let (mut o, mut coord, x, _y, e, _pc, _px, _py) = coord_mesh();
+    let id = net_id(o.id, e);
+    let seq_before = o.repl.owner_seq(e);
+
+    let routed = o.repl.request_transfer(&mut o.world, e, x.id);
+    assert_eq!(
+        routed.as_ref().map(|(t, _)| *t),
+        Some(coord.id),
+        "a non-coordinator owner routes the request to the coordinator"
+    );
+    assert_eq!(o.owner(e), o.id, "no Owner flip pre-commit");
+    assert_eq!(
+        o.repl.owner_seq(e),
+        seq_before,
+        "no LOCAL rank mint — only the coordinator mints (sole-minter)"
+    );
+    let (_, bytes) = routed.expect("routed");
+    coord.repl.apply_events(&mut coord.world, o.id, &bytes);
+    assert!(
+        coord.repl.has_pending_transfer_request(id),
+        "the coordinator recorded the transfer-request"
+    );
+
+    // Self-coordinator: coord owns its own entity and requests a transfer → records
+    // directly (no self-send), returns None.
+    let ce = coord.spawn(0.0, 0.0, 0.0, 0.0);
+    let _ = coord.collect_all(); // mint ce's id
+    let cid = net_id(coord.id, ce);
+    let self_routed = coord.repl.request_transfer(&mut coord.world, ce, x.id);
+    assert!(
+        self_routed.is_none(),
+        "the coordinator records its own request"
+    );
+    assert!(coord.repl.has_pending_transfer_request(cid));
+}
+
+// ═════ Group MC — membership reconciliation (ADR-0028 b) ═════
+
+/// MC-reconcile — a split view converges to ONE coordinator once membership
+/// reconciles via the AUTHORITATIVE `poll_peers` signal (modeled here by
+/// `track_peer`, as the pump calls on a Connected). B (id 3) knows only a
+/// HIGHER-id peer S=5, so it self-elects as coordinator; on partition-heal it
+/// tracks the lower-id A=2 and DEFERS to A (routes claims to it) — the
+/// deterministic `coordinator()` resolves the split with no consensus protocol.
+/// (No observed-traffic belt: `apply_events` must never resurrect a departed
+/// peer — untrack is one-shot; `poll_peers` is the sole membership authority.)
+#[test]
+fn membership_reconciles_to_the_lower_coordinator() {
+    let mut s = TestPeer::new(5); // a HIGHER-id peer B is connected to
+    let mut b = TestPeer::new(3);
+    s.spawn(0.0, 0.0, 0.0, 0.0);
+    b.deliver_all(s.id, &s.collect_for(b.id));
+    let proxy = b.entity_owned_by(s.id);
+    b.track(s.id); // B tracks S via poll_peers (S=5 > B=3, so B is still the lowest it knows)
+
+    // SPLIT (B partitioned from the lower-id A): B is the lowest peer it knows, so
+    // it self-elects → a claim records LOCALLY (returns None).
+    let first = b.repl.claim_ownership(&mut b.world, proxy);
+    assert!(
+        first.is_none(),
+        "split: B is the lowest peer it knows → its own coordinator"
+    );
+
+    // HEAL: poll_peers reports the lower-id A=2 Connected → B tracks it.
+    b.track(PeerId(2));
+
+    // RECONCILED: a fresh claim now ROUTES to the lower coordinator A instead of
+    // self-arbitrating — the split resolved to one coordinator.
+    let second = b.repl.claim_ownership(&mut b.world, proxy);
+    assert_eq!(
+        second.map(|(t, _)| t),
+        Some(PeerId(2)),
+        "reconciled: B defers claims to the lower-id coordinator A"
+    );
+}
