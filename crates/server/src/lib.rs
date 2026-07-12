@@ -80,16 +80,10 @@ pub fn net_pump(world: &mut World) {
                 match state {
                     PeerState::Connected => {
                         log::info!("[server] peer connected: {proto:?}");
-                        // on_peer_connected tracks the peer for delta baselining
-                        // (ADR-0020) and returns the late-join Spawn replay.
-                        let replay = net.repl.on_peer_connected(world, proto);
-                        for ev in replay {
-                            if net.transport.send_event(peer, ev).is_err() {
-                                // A lost replay Spawn is unhealable until the
-                                // anti-entropy resync item — make it observable.
-                                log::warn!("[server] late-join replay send to {proto:?} failed");
-                            }
-                        }
+                        // Track the peer (ADR-0020/0021). Its entities are
+                        // announced per-peer by the next collect_all via
+                        // AOI-ENTER — no blanket replay (existence is now gated).
+                        net.repl.on_peer_connected(proto);
                     }
                     PeerState::Disconnected => {
                         log::info!("[server] peer disconnected: {proto:?}");
@@ -141,14 +135,23 @@ pub fn net_pump(world: &mut World) {
         if net.acc >= NET_INTERVAL {
             net.acc = Duration::ZERO;
         }
-        let out = net.repl.collect(world);
+        // Per-peer collect (ADR-0021 interest management): each peer gets its
+        // own AOI-gated outbox. The server leaves AOI unset (every client sees
+        // all demo entities); a per-client gameplay focus is future client work.
+        // Map each protocol peer back to its transport peer for the send.
         let connected: Vec<_> = net.transport.connected_peers().collect();
-        for peer in &connected {
-            if let Some(state) = &out.state {
-                let _ = net.transport.send_state(*peer, state.clone());
+        for (target, out) in net.repl.collect_all(world) {
+            let Some(peer) = connected
+                .iter()
+                .find(|p| PeerId::from_uuid_bytes(*p.0.as_bytes()) == target)
+            else {
+                continue;
+            };
+            if let Some(state) = out.state {
+                let _ = net.transport.send_state(*peer, state);
             }
-            for ev in &out.events {
-                let _ = net.transport.send_event(*peer, ev.clone());
+            for ev in out.events {
+                let _ = net.transport.send_event(*peer, ev);
             }
         }
     }

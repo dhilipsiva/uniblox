@@ -6,20 +6,25 @@ delta/baseline, authority, ownership handoff, anti-entropy resync.
 `netcode-auditor` on every diff (never the session that wrote the code).
 
 ## Status
-Implemented (ADR-0013 slice + ADR-0020 delta baseline). Sender: cached-`SystemState` behind the
-`authority_of` gate (NO `Changed` filter anywhere — grep-auditable), **acked-baseline delta** — a
-component is sent while its QUANTIZED value differs from the per-entity baseline OR that value is not
-yet acked by every tracked peer (contiguous-run cumulative-ack; the fixed keyframe is GONE), decide/
-commit split so an empty tick consumes no seq, same-tick transfer+despawn purge (owned-ghost guard),
->1150B datagram warn. Receiver: newest-seq LWW (`last_seq` "seen"), SEPARATE `applied_seq` "fully
-applied" high-water that drives acks (F1: never ack a value we dropped), full-`NetEntityId` keying
-(stale generations inert), current-Owner sender validity, `authority_of == Remote` apply-gate,
-snap-apply, `drain_acks` → directed `NetEvent::Ack`. Handoff: local Owner flips when the reliable
-Transfer is queued (no double-authority window). 28-test two-World battery + codec + e2e-over-real-
-transport green; netcode-audited twice (F1 blocker fixed → MERGE). Phase 3 still owns: interpolation
-buffers, anti-entropy resync, message splitting, per-entry ack granularity, peer-departure cleanup,
-a client-acks-server integration test (pre-Mode-2), and the documented cross-sender handoff-reordering
-gaps (see lib.rs module docs).
+Implemented (ADR-0013 slice + ADR-0020 delta + **ADR-0021 interest management / per-peer**). The sender is
+now PER-PEER: `collect_all(world) -> Vec<(PeerId, Outbox)>` (was broadcast `collect`). Each tracked peer sees
+only entities in its AOI (`set_aoi`; unset ⇒ unbounded/sees-all — a FAIL-OPEN bandwidth default, not a
+security guarantee), with its OWN delta baseline (`send_state[peer][entity]`) + seq stream + `known` set.
+Out-of-AOI entities are withheld in BOTH state AND existence (spawn-on-enter / despawn-on-exit) — the
+read-cheat defense. Per-peer order is load-bearing: **dead → transfer → exit → enter → state** (dead wins
+over transfer; exit drops the baseline so re-enter re-baselines; enter Spawns only `spawner==local`, an
+adopted entity is stated no-Spawn; the id-map prunes only after all peers are told). Wire output is
+DETERMINISTIC (emissions sorted by `NetEntityId`, peers by `PeerId`). Still: cached-`SystemState` behind the
+`authority_of` gate (NO `Changed` filter — grep-auditable); acked-baseline delta (`decide_component`, `acked
+>= run_start`, decide/commit seq-consumption); >1150B datagram warn. Receiver UNCHANGED (newest-seq LWW +
+`applied_seq` F1 split; full-`NetEntityId` keying; current-Owner validity; `authority_of == Remote` gate;
+`drain_acks` → directed `NetEvent::Ack`). Handoff: local Owner flips immediately (no double-authority window).
+`interest` submodule = `SpatialGrid` (cell-bucketed, floor-celled, exact-dist² filter) + `Aoi`. **46-test
+two-World battery + 5 grid unit tests + codec + e2e-over-real-transport green; netcode-audited THREE times (F1
+orphan blocker + its over-broad fix, both closed → MERGE).** Phase 3 still owns: interpolation buffers,
+anti-entropy resync, message splitting, per-entry ack granularity, hysteresis for AOI flicker, a
+client-acks-server integration test (pre-Mode-2), and the documented cross-sender gaps (see lib.rs module
+docs) — including a chained handoff to a never-witnessed new owner of an adopted entity.
 
 ## Crate-local invariants
 - **Single-ownership per entity ⇒ last-write-wins, NO CRDT.** One authority per

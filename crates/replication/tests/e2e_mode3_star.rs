@@ -71,27 +71,29 @@ impl Peer {
         let peers: Vec<_> = self.transport.poll_peers().expect("transport open");
         for (peer, state) in peers {
             if matches!(state, PeerState::Connected) {
-                let replay = self.repl.on_peer_connected(
-                    &mut self.world,
-                    PeerId::from_uuid_bytes(*peer.0.as_bytes()),
-                );
-                for ev in replay {
-                    self.events_sent += 1;
-                    let _ = self.transport.send_event(peer, ev);
-                }
+                self.repl
+                    .on_peer_connected(PeerId::from_uuid_bytes(*peer.0.as_bytes()));
             }
         }
         self.schedule.run(&mut self.world);
-        let out = self.repl.collect(&mut self.world);
-        self.state_msgs_sent += usize::from(out.state.is_some());
-        self.events_sent += out.events.len();
+        // Per-peer collect (ADR-0021): sum the sent-message counters across every
+        // peer's AOI-gated outbox. A client owns nothing ⇒ collect_all is empty
+        // ⇒ it sends zero (the Mode-3 signature the test asserts).
         let connected: Vec<_> = self.transport.connected_peers().collect();
-        for peer in &connected {
-            if let Some(state) = &out.state {
-                let _ = self.transport.send_state(*peer, state.clone());
+        for (target, out) in self.repl.collect_all(&mut self.world) {
+            self.state_msgs_sent += usize::from(out.state.is_some());
+            self.events_sent += out.events.len();
+            let Some(peer) = connected
+                .iter()
+                .find(|p| PeerId::from_uuid_bytes(*p.0.as_bytes()) == target)
+            else {
+                continue;
+            };
+            if let Some(state) = out.state {
+                let _ = self.transport.send_state(*peer, state);
             }
-            for ev in &out.events {
-                let _ = self.transport.send_event(*peer, ev.clone());
+            for ev in out.events {
+                let _ = self.transport.send_event(*peer, ev);
             }
         }
         for (from, bytes) in self.transport.recv_events() {

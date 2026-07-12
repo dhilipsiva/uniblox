@@ -5,7 +5,9 @@
 
 ## Status
 The replication wire format lives here (ADR-0013): `PeerId` (+serde, `from_uuid_bytes` — a PURE
-function of the transport UUID; all peers must agree), spawner-stable `NetEntityId`, quantization
+function of the transport UUID; all peers must agree), spawner-stable `NetEntityId` (now also `Ord`,
+`(spawner,index,generation)` — the ADR-0021 sender emits Spawns/state/despawns in this order for
+DETERMINISTIC per-peer wire output; the ordering has no wire meaning), quantization
 (`QUANT_SCALE`=1024, tolerance ≤1/2048 for |v|≤16384, saturating), `StateMsg`/`StateEntry`
 (Options-only presence, derived mask, ABSOLUTE values — never arithmetic deltas), `EventMsg` with
 the reserved-but-None signature field (Phase 6), versioned postcard codecs (mismatch → clean Err).

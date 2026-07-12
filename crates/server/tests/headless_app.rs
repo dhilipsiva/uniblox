@@ -61,13 +61,10 @@ impl Client {
         let peers: Vec<_> = self.transport.poll_peers().expect("transport open");
         for (peer, state) in peers {
             if matches!(state, PeerState::Connected) {
-                let replay = self.repl.on_peer_connected(
-                    &mut self.world,
-                    PeerId::from_uuid_bytes(*peer.0.as_bytes()),
-                );
-                for ev in replay {
-                    let _ = self.transport.send_event(peer, ev);
-                }
+                // This client owns nothing (Mode 3) — it only receives. Tracking
+                // is inert here; kept for symmetry with the server-side pump.
+                self.repl
+                    .on_peer_connected(PeerId::from_uuid_bytes(*peer.0.as_bytes()));
             }
         }
         for (from, bytes) in self.transport.recv_events() {

@@ -22,6 +22,18 @@
 //!   Receivers ack their newest applied seq per sender (`drain_acks` →
 //!   `NetEvent::Ack`); the sender advances a per-peer baseline. Deeper desync
 //!   is the separate anti-entropy-resync item.
+//! - **Interest management: the sender is PER-PEER (ADR-0021).** `collect_all`
+//!   returns one AOI-gated `Outbox` per tracked peer — each with its OWN delta
+//!   baseline (`send_state[peer][entity]`), seq stream, and `known` set. A peer
+//!   sees only entities within its `Aoi` (`set_aoi`; unset ⇒ unbounded); an
+//!   out-of-AOI entity is withheld in BOTH state AND existence (spawn-on-enter /
+//!   despawn-on-exit) — the Mode-3 read-cheat defense. Per-peer order is
+//!   load-bearing: **dead → transfer → exit → enter → state** (dead wins over a
+//!   pending transfer; exit drops the baseline so a re-enter re-baselines at a
+//!   fresh seq; enter Spawns only `spawner==local`; the id-map prunes only after
+//!   every peer is told). Emissions are sorted by `NetEntityId` (peers by
+//!   `PeerId`) so the wire output is DETERMINISTIC. The RECEIVER is unchanged —
+//!   each receiver sees one continuous per-sender stream regardless of AOI.
 //! - **LWW = newest-seq wins**, not latest-arrival: the state channel is
 //!   unordered, so a whole message is dropped iff its seq ≤ the last seen
 //!   from that sender.
@@ -44,7 +56,11 @@
 //!     T1(A→B) at a fourth peer — T2 is dropped, the proxy records owner B
 //!     forever, and C's state is rejected until resync (frozen, wrong-owner
 //!     proxy; no packet loss required, just cross-sender skew);
-//!   - late-join replay of entities whose spawner no longer owns them.
+//!   - late-join replay of entities whose spawner no longer owns them;
+//!   - (ADR-0021) a chained handoff to a NEVER-witnessed new owner of an
+//!     ADOPTED entity (we cannot mint in another peer's namespace) is orphaned;
+//!     a dropped Outbox desyncs `known[peer]` from the receiver; an entity
+//!     oscillating across the AOI edge churns Spawn/Despawn (hysteresis later).
 
 use std::collections::{HashMap, HashSet};
 
@@ -55,6 +71,9 @@ use protocol::{
     EventMsg, NetEntityId, NetEvent, PeerId, QVec2, StateEntry, StateMsg, WIRE_VERSION,
     decode_event, decode_state, dequantize, encode_event, encode_state, quantize_vec2,
 };
+
+mod interest;
+use interest::{Aoi, DEFAULT_CELL, SpatialGrid};
 
 /// The safe single-datagram budget for the unreliable channel: beyond this,
 /// SCTP fragments the message and any one lost fragment loses ALL of it.
@@ -150,21 +169,22 @@ struct EntitySend {
 }
 
 /// Decide whether to include one component this tick and the `CompSend` to
-/// commit IF included (ADR-0020, contiguous-run cumulative-ack). Pure — the
-/// caller commits only when the overall message is actually sent.
+/// commit IF included (ADR-0020 contiguous-run cumulative-ack, now PER-PEER for
+/// ADR-0021 AOI). Pure — the caller commits only when the message is sent.
+/// `acked` is THIS peer's confirmed seq of our stream to it.
 ///
 /// - never sent / value changed ⇒ always include, starting a fresh run at `seq`.
-/// - unchanged ⇒ include only while UNCONFIRMED (some tracked peer's acked seq
-///   is < the run start). A gap since the last inclusion restarts the run so
-///   "acked ≥ run_start ⇒ the peer received a message carrying this value"
-///   stays sound. Empty peer set ⇒ treated as confirmed (nothing to re-send
-///   to) — degrades to plain changed-only sending.
+/// - unchanged ⇒ include only while UNCONFIRMED (`acked < run_start`). A gap
+///   since the last inclusion restarts the run so "acked ≥ run_start ⇒ the peer
+///   received a message carrying this value" stays sound. Under per-peer AOI
+///   streams an in-view unconfirmed component is in EVERY message ⇒ no gaps, so
+///   the gap-reset is dormant insurance (its coverage moved to the exit/re-enter
+///   re-baseline test); it re-earns its keep if a scheduler ever skips a tick.
 fn decide_component(
     current: Option<CompSend>,
     value: QVec2,
     seq: u64,
-    acked_seq: &HashMap<PeerId, u64>,
-    peers: &HashSet<PeerId>,
+    acked: u64,
 ) -> (bool, CompSend) {
     match current {
         None => (
@@ -184,11 +204,7 @@ fn decide_component(
             },
         ),
         Some(c) => {
-            let confirmed = peers.is_empty()
-                || peers
-                    .iter()
-                    .all(|p| acked_seq.get(p).copied().unwrap_or(0) >= c.run_start);
-            if confirmed {
+            if acked >= c.run_start {
                 (false, c)
             } else {
                 // Re-send; a gap since the last inclusion starts a new run.
@@ -214,23 +230,37 @@ fn decide_component(
 pub struct Replication {
     change_query: ChangeQuery,
     map: NetIdMap,
-    next_seq: u64,
+    /// SENDER, per-peer (ADR-0021 AOI): each peer gets a DIFFERENT per-tick
+    /// message (its AOI subset), so each has its own monotonic seq stream and
+    /// its own delta baseline. Absent for a peer ⇒ defaults (seq 1, empty).
+    next_seq: HashMap<PeerId, u64>,
+    /// RECEIVER, per sender: newest snapshot seq SEEN (LWW gate). Unrelated to
+    /// the sender-side `next_seq` above despite the peer-keyed shape.
     last_seq: HashMap<PeerId, u64>,
-    pending_events: Vec<EventMsg>,
-    /// Delta baseline (ADR-0020). Sender side: per owned entity, the confirm
-    /// state of each component; per peer, the highest seq of OUR stream they
-    /// have acked. Receiver side: per sender, the highest seq we have acked
-    /// back. `peers` is the broadcast set (tracked on connect / departure).
-    send_state: HashMap<Entity, EntitySend>,
+    /// SENDER delta baseline (ADR-0020/0021), now PER-PEER: per peer, per owned
+    /// entity, the confirm state of each component. A peer sees only its AOI, so
+    /// its baseline is independent of every other peer's.
+    send_state: HashMap<PeerId, HashMap<Entity, EntitySend>>,
+    /// SENDER, per peer: the entities that peer currently has spawned (its proxy
+    /// set) — drives spawn-on-AOI-enter / despawn-on-AOI-exit (existence gating).
+    known: HashMap<PeerId, HashSet<Entity>>,
+    /// SENDER, per peer: its area of interest. Absent ⇒ unbounded (sees all
+    /// owned entities) — the backward-compatible default.
+    aoi: HashMap<PeerId, Aoi>,
+    /// SENDER: one-shot ownership-transfer intents (entity → new owner), drained
+    /// by the next `collect_all` (announced to peers that know the entity + the
+    /// new owner regardless of AOI, then cleared).
+    pending_transfers: HashMap<Entity, PeerId>,
+    /// SENDER, per peer: the highest seq of OUR stream that peer has acked.
     acked_seq: HashMap<PeerId, u64>,
-    /// Per sender, the highest seq whose entries we FULLY applied (every entry
-    /// resolved to a proxy and passed the owner/authority gates). This — NOT
-    /// `last_seq` (which is the LWW "seen" high-water and advances even when
-    /// entries are dropped) — is what we ack, so we never confirm a value we
-    /// did not actually hold (auditor F1: a state msg racing its Spawn, or a
-    /// handoff owner-mismatch, must NOT falsely confirm and silence the sender).
+    /// RECEIVER, per sender: the highest seq whose entries we FULLY applied
+    /// (every entry resolved to a proxy and passed the owner/authority gates).
+    /// This — NOT `last_seq` (which advances even when entries drop) — is what
+    /// we ack, so we never confirm a value we did not hold (auditor F1).
     applied_seq: HashMap<PeerId, u64>,
+    /// RECEIVER, per sender: the highest seq we have acked back.
     ack_sent: HashMap<PeerId, u64>,
+    /// The tracked peer set (added on connect, dropped on departure).
     peers: HashSet<PeerId>,
 }
 
@@ -239,10 +269,12 @@ impl Replication {
         Replication {
             change_query: SystemState::new(world),
             map: NetIdMap::default(),
-            next_seq: 1,
+            next_seq: HashMap::new(),
             last_seq: HashMap::new(),
-            pending_events: Vec::new(),
             send_state: HashMap::new(),
+            known: HashMap::new(),
+            aoi: HashMap::new(),
+            pending_transfers: HashMap::new(),
             acked_seq: HashMap::new(),
             applied_seq: HashMap::new(),
             ack_sent: HashMap::new(),
@@ -250,98 +282,37 @@ impl Replication {
         }
     }
 
-    /// One network tick of the SENDER: lifecycle diff (spawn/despawn events),
-    /// then authority-gated state entries — a component is included while
-    /// changed OR not yet confirmed (acked) by all peers (ADR-0020 delta
-    /// baseline; the fixed keyframe is gone — its "recover a lost final value"
-    /// job is now continuous, driven by acks).
+    /// One network tick of the SENDER, PER PEER (ADR-0021 interest management).
+    /// Returns a per-peer outbox for every tracked peer that has something to
+    /// send. Each peer sees only entities in its AOI (set via [`set_aoi`];
+    /// unset ⇒ unbounded/sees-all), and gets its OWN delta baseline + seq
+    /// stream. Out-of-AOI entities are withheld in BOTH state AND existence
+    /// (spawn-on-enter / despawn-on-exit) — the structural read-cheat defense.
     ///
-    /// PRECONDITION (auditor F4): every peer this endpoint broadcasts to MUST be
-    /// registered via [`track_peer`]/[`on_peer_connected`]. With an EMPTY peer
-    /// set, `decide_component` treats unchanged values as already-confirmed and
-    /// sends changed-only with no re-send safety net — correct for a solo
-    /// endpoint, but a silent lost-final-value bug for a real multi-peer pump
-    /// that forgets to track. The keyframe that used to paper over that is gone.
-    pub fn collect(&mut self, world: &mut World) -> Outbox {
+    /// PRECONDITION: only TRACKED peers ([`track_peer`]/[`on_peer_connected`])
+    /// get outboxes; the pump must track every connected peer.
+    ///
+    /// One snapshot per call. Peer processing order is load-bearing:
+    /// **dead → transfer → exit → enter → state** (dead wins over a transfer so
+    /// a corpse is never handed off; the id-map is pruned only AFTER every peer
+    /// has been told, so a two-peer despawn reaches both).
+    pub fn collect_all(&mut self, world: &mut World) -> Vec<(PeerId, Outbox)> {
         let local = world.resource::<LocalPeer>().0;
 
-        let mut events: Vec<EventMsg> = std::mem::take(&mut self.pending_events);
-
-        // Lifecycle: announce despawns for dead mapped entities. An entity can
-        // die in the SAME tick as queued-but-unsent events about it (e.g.
-        // transfer-then-despawn): those events describe a corpse and must be
-        // purged, or the new owner would adopt an entity that no longer exists
-        // — an unhealable OWNED ghost (auditor finding F1). The wire never saw
-        // the queued transfer, so from the receivers' perspective WE are still
-        // the owner and may validly announce the Despawn; a queued-but-unsent
-        // Spawn means the wire never met the entity at all — announce nothing.
-        let dead: Vec<Entity> = self
-            .map
-            .by_entity
-            .keys()
-            .copied()
-            .filter(|e| !world.entities().contains(*e))
-            .collect();
-        for entity in dead {
-            // Presence in by_entity is guaranteed: `dead` was built from its keys.
-            if let Some(rec) = self.map.by_entity.get(&entity) {
-                let id = rec.id;
-                let mut purged_spawn = false;
-                let mut purged_transfer = false;
-                events.retain(|ev| {
-                    let (subject, is_spawn, is_transfer) = match &ev.event {
-                        NetEvent::Spawn { id, .. } => (*id, true, false),
-                        NetEvent::Despawn { id } => (*id, false, false),
-                        NetEvent::OwnershipTransfer { id, .. } => (*id, false, true),
-                        // Acks are directed (drain_acks), never queued in
-                        // pending_events — keep any (there should be none).
-                        NetEvent::Ack { .. } => return true,
-                    };
-                    if subject == id {
-                        purged_spawn |= is_spawn;
-                        purged_transfer |= is_transfer;
-                        false
-                    } else {
-                        true
-                    }
-                });
-
-                if purged_spawn {
-                    // Never introduced on the wire — nothing to announce.
-                } else if purged_transfer || authority_of(rec.last_owner, local) == Authority::Local
-                {
-                    // Either we are the wire-visible owner, or we queued (and
-                    // just purged) a transfer the wire never saw — in both
-                    // cases receivers still consider us the owner.
-                    events.push(event(NetEvent::Despawn { id }));
-                } else {
-                    log::warn!(
-                        "mapped remote proxy {id:?} died without a wire Despawn — divergence; Phase 3 resync heals"
-                    );
-                }
-            }
-            self.map.remove_by_entity(entity);
-            self.send_state.remove(&entity); // no baseline for a gone entity
-        }
-
-        // Snapshot the query results so the borrow on `world` ends before we
-        // mutate the map / push events.
+        // 1. Snapshot owned+alive rows; mint ids (map only — existence is
+        //    announced PER PEER on AOI-enter, never globally); build the grid +
+        //    an owned-entity lookup. The authority gate runs HERE (before any
+        //    baseline/AOI consultation), so remote-applied writes never echo.
         struct Row {
             entity: Entity,
             owner: PeerId,
             pos: Position,
             vel: Velocity,
         }
-        // 0.19: SystemState::get returns Result<Query, SystemParamValidationError>;
-        // a plain read-only Query cannot realistically fail validation, but per
-        // the no-unwrap rule we degrade to an empty tick. (ADR-0020: the send
-        // trigger is now a QUANTIZED-VALUE diff against the per-peer baseline,
-        // not `Ref::is_changed()` — so a write that leaves the quantized value
-        // unchanged is not re-sent, and the authority gate below still prevents
-        // any echo of remote-applied state.)
         let rows: Vec<Row> = match self.change_query.get(world) {
             Ok(query) => query
                 .iter()
+                .filter(|(_, owner, _, _)| authority_of(owner.0, local) == Authority::Local)
                 .map(|(entity, owner, pos, vel)| Row {
                     entity,
                     owner: owner.0,
@@ -354,122 +325,272 @@ impl Replication {
                 Vec::new()
             }
         };
-
-        // Decide each owned entity's entry at the PROVISIONAL seq. `commits`
-        // stages the per-component `CompSend` updates — applied only if the
-        // message is actually sent, so an empty tick consumes no seq and
-        // mutates no baseline (the seq-consumption invariant).
-        let seq = self.next_seq;
-        let mut entries: Vec<StateEntry> = Vec::new();
-        let mut commits: Vec<(Entity, Option<CompSend>, Option<CompSend>)> = Vec::new();
-        for row in rows {
-            // THE authority gate — before any change-mask consultation.
-            if authority_of(row.owner, local) != Authority::Local {
-                continue;
-            }
-
+        let mut grid = SpatialGrid::new(DEFAULT_CELL);
+        let mut owned: HashMap<Entity, (NetEntityId, Position, Velocity)> = HashMap::new();
+        for row in &rows {
             let id = match self.map.by_entity.get_mut(&row.entity) {
                 Some(rec) => {
                     rec.last_owner = row.owner;
                     rec.id
                 }
                 None => {
-                    // Mint: only ever reachable for entities WE spawned —
-                    // adopted (transferred-in) entities were mapped when their
-                    // Spawn event arrived, so they can never re-mint (which
-                    // would alias our id namespace).
                     let id = NetEntityId {
                         spawner: local,
                         index: row.entity.index_u32(),
                         generation: row.entity.generation().to_bits(),
                     };
                     self.map.insert(id, row.entity, local);
-                    events.push(event(NetEvent::Spawn {
-                        id,
-                        pos: qpos(&row.pos),
-                        vel: qvel(&row.vel),
-                    }));
                     id
                 }
             };
+            grid.insert(row.entity, (row.pos.x, row.pos.y));
+            owned.insert(row.entity, (id, row.pos, row.vel));
+        }
 
-            let prior = self
-                .send_state
-                .get(&row.entity)
+        // 2. Dead = mapped entities no longer alive. Dead WINS over a pending
+        //    transfer (a corpse is never handed off — the owned-ghost guard).
+        let dead: HashSet<Entity> = self
+            .map
+            .by_entity
+            .keys()
+            .copied()
+            .filter(|e| !world.entities().contains(*e))
+            .collect();
+        for e in &dead {
+            self.pending_transfers.remove(e);
+        }
+
+        // Deterministic emission order (by NetEntityId): the per-peer wire
+        // output must not depend on HashSet/HashMap iteration seed — reproducible
+        // captures and stable tests. Dead + transfers are shared across peers, so
+        // sort them once here; per-peer exits/enters/state are sorted below.
+        let mut dead_sorted: Vec<Entity> = dead.iter().copied().collect();
+        dead_sorted.sort_by_key(|e| self.map.by_entity.get(e).map(|r| r.id));
+        let mut transfers_sorted: Vec<(Entity, PeerId)> = self
+            .pending_transfers
+            .iter()
+            .map(|(&e, &q)| (e, q))
+            .collect();
+        transfers_sorted.sort_by_key(|(e, _)| self.map.by_entity.get(e).map(|r| r.id));
+
+        // 3. Per tracked peer, in order: dead → transfer → exit → enter → state.
+        let mut peers: Vec<PeerId> = self.peers.iter().copied().collect();
+        peers.sort();
+        let mut result = Vec::new();
+        for p in peers {
+            let mut known_p = self.known.remove(&p).unwrap_or_default();
+            let mut send_p = self.send_state.remove(&p).unwrap_or_default();
+            let mut seq = self.next_seq.get(&p).copied().unwrap_or(1);
+            let acked = self.acked_seq.get(&p).copied().unwrap_or(0);
+            let aoi_p = self.aoi.get(&p).copied();
+            let mut events: Vec<EventMsg> = Vec::new();
+
+            // DEAD — despawn to peers that knew the corpse; drop its baseline.
+            for &e in &dead_sorted {
+                if known_p.remove(&e) {
+                    if let Some(rec) = self.map.by_entity.get(&e) {
+                        events.push(event(NetEvent::Despawn { id: rec.id }));
+                    }
+                    send_p.remove(&e);
+                }
+            }
+
+            // TRANSFER — a peer that already KNOWS the entity gets an
+            // OwnershipTransfer (proxy kept under the new owner, NOT despawned).
+            // A NEW OWNER that doesn't yet know it is told the Transfer too, plus
+            // a Spawn — but the Spawn is emitted ONLY for entities in OUR
+            // namespace (spawner == local): we cannot introduce a foreign-
+            // namespace (adopted) entity, whose Spawn the receiver rejects. The
+            // bare Transfer is ALWAYS sent (auditor): harmless if the new owner
+            // has no proxy (dropped as unknown id), but load-bearing if it
+            // WITNESSED the entity via the original owner (its existing proxy
+            // flips) — so a chained handoff to a witnessing peer completes. Only
+            // a never-witnessed new owner of an adopted entity is orphaned until
+            // Phase-3 resync.
+            for &(e, q) in &transfers_sorted {
+                let Some(id) = self.map.by_entity.get(&e).map(|r| r.id) else {
+                    continue;
+                };
+                if known_p.remove(&e) {
+                    events.push(event(NetEvent::OwnershipTransfer { id, new_owner: q }));
+                    send_p.remove(&e);
+                } else if p == q {
+                    if id.spawner == local {
+                        let pos = world
+                            .get::<Position>(e)
+                            .copied()
+                            .unwrap_or(Position { x: 0.0, y: 0.0 });
+                        let vel = world
+                            .get::<Velocity>(e)
+                            .copied()
+                            .unwrap_or(Velocity { x: 0.0, y: 0.0 });
+                        events.push(event(NetEvent::Spawn {
+                            id,
+                            pos: qpos(&pos),
+                            vel: qvel(&vel),
+                        }));
+                    }
+                    events.push(event(NetEvent::OwnershipTransfer { id, new_owner: q }));
+                }
+            }
+
+            // This peer's visible set: its AOI circle, or all owned if unbounded.
+            let visible: HashSet<Entity> = match aoi_p {
+                Some(a) => grid.in_radius(a.center, a.radius).into_iter().collect(),
+                None => owned.keys().copied().collect(),
+            };
+
+            // AOI-EXIT — known but no longer visible (still owned): despawn the
+            // proxy and drop its baseline (so a re-enter re-baselines from
+            // scratch — the run-start soundness across the visibility gap).
+            let mut exits: Vec<Entity> = known_p
+                .iter()
                 .copied()
-                .unwrap_or_default();
-            let (send_pos, next_pos) =
-                decide_component(prior.pos, qpos(&row.pos), seq, &self.acked_seq, &self.peers);
-            let (send_vel, next_vel) =
-                decide_component(prior.vel, qvel(&row.vel), seq, &self.acked_seq, &self.peers);
-            if send_pos || send_vel {
-                entries.push(StateEntry {
-                    id,
-                    pos: send_pos.then(|| qpos(&row.pos)),
-                    vel: send_vel.then(|| qvel(&row.vel)),
-                });
-                commits.push((
-                    row.entity,
-                    send_pos.then_some(next_pos),
-                    send_vel.then_some(next_vel),
-                ));
+                .filter(|e| owned.contains_key(e) && !visible.contains(e))
+                .collect();
+            exits.sort_by_key(|e| owned.get(e).map(|t| t.0));
+            for e in exits {
+                known_p.remove(&e);
+                send_p.remove(&e);
+                if let Some((id, ..)) = owned.get(&e) {
+                    events.push(event(NetEvent::Despawn { id: *id }));
+                }
+            }
+
+            // AOI-ENTER — newly visible owned entities. We emit a Spawn only for
+            // entities in OUR namespace (spawner == local); an ADOPTED entity
+            // (transferred to us, spawner ≠ us) is instead stated to peers that
+            // already hold its proxy (from the original owner) — we cannot mint
+            // in another peer's namespace (the receiver rejects such a Spawn),
+            // so a peer that never saw the original Spawn drops our state until
+            // Phase-3 resync (the documented cross-sender late-join gap). Either
+            // way it enters `known` so the state pass below sends it (send_p
+            // None ⇒ fresh run).
+            let mut enters: Vec<Entity> = visible
+                .iter()
+                .copied()
+                .filter(|e| owned.contains_key(e) && !known_p.contains(e))
+                .collect();
+            enters.sort_by_key(|e| owned.get(e).map(|t| t.0));
+            for e in enters {
+                if let Some((id, pos, vel)) = owned.get(&e) {
+                    if id.spawner == local {
+                        events.push(event(NetEvent::Spawn {
+                            id: *id,
+                            pos: qpos(pos),
+                            vel: qvel(vel),
+                        }));
+                    }
+                    known_p.insert(e);
+                }
+            }
+
+            // STATE DELTA over what the peer now knows AND sees. Decide/commit
+            // split: the CompSend updates + seq bump happen only if a message is
+            // actually encoded (an events-only tick consumes no seq).
+            let mut entries: Vec<StateEntry> = Vec::new();
+            let mut commits: Vec<(Entity, Option<CompSend>, Option<CompSend>)> = Vec::new();
+            let mut visible_known: Vec<Entity> = known_p
+                .iter()
+                .copied()
+                .filter(|e| visible.contains(e))
+                .collect();
+            visible_known.sort_by_key(|e| owned.get(e).map(|t| t.0));
+            for &e in &visible_known {
+                let Some((id, pos, vel)) = owned.get(&e) else {
+                    continue;
+                };
+                let prior = send_p.get(&e).copied().unwrap_or_default();
+                let (send_pos, next_pos) = decide_component(prior.pos, qpos(pos), seq, acked);
+                let (send_vel, next_vel) = decide_component(prior.vel, qvel(vel), seq, acked);
+                if send_pos || send_vel {
+                    entries.push(StateEntry {
+                        id: *id,
+                        pos: send_pos.then(|| qpos(pos)),
+                        vel: send_vel.then(|| qvel(vel)),
+                    });
+                    commits.push((
+                        e,
+                        send_pos.then_some(next_pos),
+                        send_vel.then_some(next_vel),
+                    ));
+                }
+            }
+            let state = if entries.is_empty() {
+                None
+            } else {
+                let msg = StateMsg {
+                    version: WIRE_VERSION,
+                    seq,
+                    entries,
+                };
+                match encode_state(&msg) {
+                    Ok(bytes) => {
+                        if bytes.len() > SAFE_DATAGRAM_BYTES {
+                            log::warn!(
+                                "StateMsg to {p:?} is {}B (> {SAFE_DATAGRAM_BYTES}B safe datagram) \
+                                 — fragmentation loss amplification; split further in Phase 3",
+                                bytes.len()
+                            );
+                        }
+                        for (e, pos, vel) in commits {
+                            let slot = send_p.entry(e).or_default();
+                            if let Some(c) = pos {
+                                slot.pos = Some(c);
+                            }
+                            if let Some(c) = vel {
+                                slot.vel = Some(c);
+                            }
+                        }
+                        seq += 1;
+                        Some(bytes.into_boxed_slice())
+                    }
+                    Err(err) => {
+                        log::error!("state encode to {p:?} failed (dropping tick): {err}");
+                        None
+                    }
+                }
+            };
+
+            // Write this peer's state back.
+            self.known.insert(p, known_p);
+            self.send_state.insert(p, send_p);
+            self.next_seq.insert(p, seq);
+
+            let events: Vec<Box<[u8]>> = events
+                .iter()
+                .filter_map(|msg| match encode_event(msg) {
+                    Ok(bytes) => Some(bytes.into_boxed_slice()),
+                    Err(err) => {
+                        log::error!("event encode failed (dropping event): {err}");
+                        None
+                    }
+                })
+                .collect();
+            if state.is_some() || !events.is_empty() {
+                result.push((p, Outbox { state, events }));
             }
         }
 
-        let state = if entries.is_empty() {
-            None
-        } else {
-            let msg = StateMsg {
-                version: WIRE_VERSION,
-                seq,
-                entries,
-            };
-            match encode_state(&msg) {
-                Ok(bytes) => {
-                    // Instrument, don't assume: one lost SCTP fragment kills the
-                    // whole unreliable message, so an oversized StateMsg
-                    // multiplies the effective loss rate. Splitting is a later
-                    // Phase-3 item (interest management); until then, warn.
-                    if bytes.len() > SAFE_DATAGRAM_BYTES {
-                        log::warn!(
-                            "StateMsg is {}B (> {SAFE_DATAGRAM_BYTES}B safe datagram) — \
-                             fragmentation loss amplification; split in Phase 3",
-                            bytes.len()
-                        );
-                    }
-                    // Commit: the message is sent, so this seq is consumed and
-                    // every included component's baseline advances.
-                    for (entity, pos, vel) in commits {
-                        let slot = self.send_state.entry(entity).or_default();
-                        if let Some(c) = pos {
-                            slot.pos = Some(c);
-                        }
-                        if let Some(c) = vel {
-                            slot.vel = Some(c);
-                        }
-                    }
-                    self.next_seq += 1;
-                    Some(bytes.into_boxed_slice())
-                }
-                Err(err) => {
-                    log::error!("state encode failed (dropping tick): {err}");
-                    None
-                }
+        // 4. Every peer has now been told about the dead + transfers — retire
+        //    them from the shared id-map / intent queue. A dead entity we did
+        //    NOT own (a remote proxy despawned locally without a wire Despawn)
+        //    is a divergence signal — warn (it heals via Phase-3 resync).
+        for e in &dead {
+            if let Some(rec) = self.map.by_entity.get(e)
+                && authority_of(rec.last_owner, local) != Authority::Local
+            {
+                log::warn!(
+                    "mapped remote proxy {:?} died without a wire Despawn — divergence; \
+                     Phase 3 resync heals",
+                    rec.id
+                );
             }
-        };
+            self.map.remove_by_entity(*e);
+        }
+        self.pending_transfers.clear();
 
-        let events = events
-            .iter()
-            .filter_map(|msg| match encode_event(msg) {
-                Ok(bytes) => Some(bytes.into_boxed_slice()),
-                Err(err) => {
-                    log::error!("event encode failed (dropping event): {err}");
-                    None
-                }
-            })
-            .collect();
-
-        Outbox { state, events }
+        result
     }
 
     /// RECEIVER, state channel: whole-message newest-seq LWW gate, then
@@ -677,22 +798,43 @@ impl Replication {
         acks
     }
 
-    /// Add a peer to the broadcast/confirmation set (ADR-0020). The delta
-    /// baseline re-sends unconfirmed values ONLY to tracked peers, so the pump
-    /// MUST track every connected peer (else a lost value is never recovered —
-    /// the keyframe that used to recover it is gone). `on_peer_connected` calls
-    /// this; unit tests call it to declare who they broadcast to.
+    /// Add a peer to the tracked set (ADR-0020/0021). Only tracked peers get
+    /// outboxes from [`collect_all`], so the pump MUST track every connected
+    /// peer. Per-peer state (`known`/`send_state`/`next_seq`) defaults lazily on
+    /// the first collect; set the peer's AOI via [`set_aoi`] (unset ⇒ sees-all).
     pub fn track_peer(&mut self, peer: PeerId) {
         self.peers.insert(peer);
     }
 
-    /// Drop a departed peer from the confirmation set + its baseline/ack state.
+    /// Set (or update) a peer's area of interest — a circle in world space.
+    /// Entities outside it are withheld ENTIRELY (state AND existence); a peer
+    /// with no AOI set sees every owned entity (unbounded). The pump sets this
+    /// each tick from the peer's focus (e.g. its avatar / camera position).
+    ///
+    /// NOTE (auditor): the unbounded default is FAIL-OPEN — it is a bandwidth
+    /// convenience, NOT a security guarantee. A pump relying on AOI for the
+    /// Mode-3 read-cheat defense MUST `set_aoi` for every peer; a forgotten call
+    /// silently reveals all owned entities. (Mode 3's demo leaves it unset on
+    /// purpose — clients see everything until a real gameplay focus exists.)
+    pub fn set_aoi(&mut self, peer: PeerId, center: (f32, f32), radius: f32) {
+        self.aoi.insert(peer, Aoi { center, radius });
+    }
+
+    /// Drop a departed peer from the tracked set and ALL per-peer state. The
+    /// per-peer clears are load-bearing (ADR-0021): a same-id peer that
+    /// reconnects with a fresh world must NOT be seen as already-`known`, or its
+    /// AOI-enter Spawns would never fire (permanent invisibility) — and they
+    /// prevent an unbounded leak of `known`/`send_state`.
     pub fn untrack_peer(&mut self, peer: PeerId) {
         self.peers.remove(&peer);
         self.acked_seq.remove(&peer);
         self.ack_sent.remove(&peer);
         self.applied_seq.remove(&peer);
         self.last_seq.remove(&peer);
+        self.known.remove(&peer);
+        self.send_state.remove(&peer);
+        self.next_seq.remove(&peer);
+        self.aoi.remove(&peer);
     }
 
     /// Initiate an A→B ownership handoff for an entity WE currently own.
@@ -715,92 +857,46 @@ impl Replication {
         }
 
         // An entity transferred before it was ever collected has no id yet:
-        // mint + announce it first so receivers can resolve the transfer.
-        let id = match self.map.by_entity.get(&entity) {
-            Some(rec) => rec.id,
-            None => {
-                let id = NetEntityId {
-                    spawner: local,
-                    index: entity.index_u32(),
-                    generation: entity.generation().to_bits(),
-                };
-                self.map.insert(id, entity, local);
-                let (pos, vel) = (
-                    world
-                        .get::<Position>(entity)
-                        .copied()
-                        .unwrap_or(Position { x: 0.0, y: 0.0 }),
-                    world
-                        .get::<Velocity>(entity)
-                        .copied()
-                        .unwrap_or(Velocity { x: 0.0, y: 0.0 }),
-                );
-                self.pending_events.push(event(NetEvent::Spawn {
-                    id,
-                    pos: qpos(&pos),
-                    vel: qvel(&vel),
-                }));
-                id
-            }
-        };
-
-        self.pending_events
-            .push(event(NetEvent::OwnershipTransfer { id, new_owner: to }));
+        // mint it now so the transfer + the new owner's Spawn can resolve it.
+        // Existence is announced PER PEER by collect_all (no global Spawn here).
+        if !self.map.by_entity.contains_key(&entity) {
+            let id = NetEntityId {
+                spawner: local,
+                index: entity.index_u32(),
+                generation: entity.generation().to_bits(),
+            };
+            self.map.insert(id, entity, local);
+        }
+        // Record the one-shot intent; the next `collect_all` announces it — to
+        // every peer that knows the entity, plus the new owner regardless of AOI
+        // (Spawn+Transfer) so it can build+own the proxy — then clears it.
+        self.pending_transfers.insert(entity, to);
+        // Flip the local Owner NOW so no double-authority window exists: from
+        // this instant we stop computing and collecting it (the ≤½-RTT
+        // nobody-simulates freeze is the safe direction).
         if let Some(mut owner) = world.get_mut::<Owner>(entity) {
             owner.0 = to;
         }
         if let Some(rec) = self.map.by_entity.get_mut(&entity) {
             rec.last_owner = to;
         }
-        // We no longer author this entity's state — drop its delta baseline
-        // (ADR-0020); if it ever comes back to us it re-baselines from scratch.
+        // We no longer author this entity — drop its per-peer delta baselines
+        // (ADR-0021); if it ever comes back to us it re-baselines from scratch.
         if authority_of(to, local) != Authority::Local {
-            self.send_state.remove(&entity);
+            for m in self.send_state.values_mut() {
+                m.remove(&entity);
+            }
         }
         Ok(())
     }
 
-    /// Late-join replay: re-announce entities WE minted and still own, so a
-    /// newly-connected peer can build proxies. Send the returned events to
-    /// that peer only. (Entities we adopted via transfer cannot be replayed —
-    /// their spawner's namespace guard would reject us; documented gap, owned
-    /// by Phase 3/5 session sync.)
-    pub fn on_peer_connected(&mut self, world: &mut World, peer: PeerId) -> Vec<Box<[u8]>> {
-        // Track for delta baselining (ADR-0020) — a new peer has confirmed
-        // nothing, so everything it should have is re-sent until it acks.
+    /// A peer connected: track it (ADR-0021). Its entities are announced by the
+    /// next [`collect_all`] via AOI-ENTER — only the ones inside its AOI, so the
+    /// read-cheat holds even at join time. There is deliberately NO blanket
+    /// all-owned Spawn replay anymore (that would leak the existence of
+    /// out-of-AOI entities). Per-peer state defaults lazily on the first collect.
+    pub fn on_peer_connected(&mut self, peer: PeerId) {
         self.track_peer(peer);
-        let local = world.resource::<LocalPeer>().0;
-        let mut out = Vec::new();
-        for (&entity, rec) in &self.map.by_entity {
-            if rec.id.spawner != local {
-                continue;
-            }
-            let Some(owner) = world.get::<Owner>(entity) else {
-                continue;
-            };
-            if authority_of(owner.0, local) != Authority::Local {
-                log::warn!(
-                    "late-join replay skips {:?} (transferred away) — new peer relies on Phase 3 resync",
-                    rec.id
-                );
-                continue;
-            }
-            let (Some(pos), Some(vel)) =
-                (world.get::<Position>(entity), world.get::<Velocity>(entity))
-            else {
-                continue;
-            };
-            let msg = event(NetEvent::Spawn {
-                id: rec.id,
-                pos: qpos(pos),
-                vel: qvel(vel),
-            });
-            match encode_event(&msg) {
-                Ok(bytes) => out.push(bytes.into_boxed_slice()),
-                Err(err) => log::error!("late-join spawn encode failed: {err}"),
-            }
-        }
-        out
     }
 }
 

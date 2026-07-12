@@ -84,6 +84,10 @@ async fn measure_bandwidth(entities: usize) -> BandwidthMetrics {
     let mut sched_a = Schedule::default();
     sched_a.add_systems(simulate);
     let mut repl_a = Replication::new(&mut world_a);
+    // Per-peer collect (ADR-0021): track B (unbounded AOI ⇒ B sees all of A's
+    // entities) so collect_all produces B's outbox to measure.
+    let b_proto = PeerId::from_uuid_bytes(*peer_b.0.as_bytes());
+    repl_a.track_peer(b_proto);
     for i in 0..entities {
         spawn_owned(
             &mut world_a,
@@ -113,23 +117,24 @@ async fn measure_bandwidth(entities: usize) -> BandwidthMetrics {
     // First second is warm-up (spawn events, first snapshot); then measure.
     while started.elapsed() < BANDWIDTH_WINDOW + Duration::from_secs(1) {
         sched_a.run(&mut world_a);
-        let out = repl_a.collect(&mut world_a);
         if !measuring && started.elapsed() >= Duration::from_secs(1) {
             measuring = true;
             measure_start = Instant::now();
         }
-        if let Some(state) = &out.state {
-            if measuring {
-                state_bytes += state.len();
-                state_msgs += 1;
+        for (_target, out) in repl_a.collect_all(&mut world_a) {
+            if let Some(state) = out.state {
+                if measuring {
+                    state_bytes += state.len();
+                    state_msgs += 1;
+                }
+                let _ = ta.send_state(peer_b, state);
             }
-            let _ = ta.send_state(peer_b, state.clone());
-        }
-        for ev in &out.events {
-            if measuring {
-                events_bytes += ev.len();
+            for ev in out.events {
+                if measuring {
+                    events_bytes += ev.len();
+                }
+                let _ = ta.send_event(peer_b, ev);
             }
-            let _ = ta.send_event(peer_b, ev.clone());
         }
         for (from, bytes) in tb.recv_events() {
             let from = PeerId::from_uuid_bytes(*from.0.as_bytes());

@@ -10,9 +10,13 @@ ADR-0014) and **the Bevy client renders in-browser (ADR-0017)** with every slice
 two-build sizes 3.38/3.40 MB brotli, cold-load, in-browser ed25519; size-budget gate PASSES). **Phase 2 is
 done:** str0m native/server peer (ADR-0015), ICE policy tiers + hermetic TURN relay proof (ADR-0016),
 connection telemetry + fleet aggregation (ADR-0018), and reconnect / ICE-restart resilience (ADR-0019); the
-only open Phase-2 thread is the real-network telemetry NUMBERS (deploy-gated). **Phase 3 started** with the
-delta-vs-last-acked baseline + per-peer ack tracking (ADR-0020) — the fixed keyframe is gone. Next Phase-3
-threads: interpolation buffers, anti-entropy resync, interest management / message splitting.
+only open Phase-2 thread is the real-network telemetry NUMBERS (deploy-gated). **Phase 3 underway:** the
+delta-vs-last-acked baseline + per-peer ack tracking (ADR-0020, fixed keyframe gone), then **interest
+management / AOI (ADR-0021)** — the sender is now PER-PEER (`collect_all`) with a spatial-grid area-of-interest
+gating both state AND existence (the Mode-3 read-cheat defense), per-(peer,entity) delta baselines, and
+deterministic wire output. Next Phase-3 threads: interpolation/prediction buffers, anti-entropy resync,
+interest-management perf (a shared per-tick snapshot; AOI-flicker hysteresis), a client-acks-server
+integration test (pre-Mode-2).
 
 ## Done
 - **Cargo workspace** — virtual manifest, 9 crates under `crates/*` (glob members),
@@ -63,6 +67,20 @@ threads: interpolation buffers, anti-entropy resync, interest management / messa
   contiguous`); T35 proves the bandwidth win (0 steady-state bytes for a confirmed stationary scene).
   **netcode-audited twice** (F1 blocker → fixed → MERGE). Fast-follow: a client-acks-server integration test
   (the server ack-routing path is unit-covered but Mode-3-dead until Mode 2 lets a client own an entity).
+- **Interest management (AOI, spatial grid)** (ADR-0021, Phase 3, HIGH) — the sender UNIFIED to PER-PEER:
+  `collect(world) -> Outbox` became `collect_all(world) -> Vec<(PeerId, Outbox)>`. Each tracked peer sees only
+  entities within its AOI (`set_aoi` circle; unset ⇒ unbounded/fail-open), with its own delta baseline
+  (`send_state[peer][entity]`), seq stream, and `known` set. Out-of-AOI entities are withheld in BOTH state
+  AND existence (spawn-on-enter / despawn-on-exit) — the structural Mode-3 read-cheat defense. New `interest`
+  module = `SpatialGrid` (cell-bucketed, floor-celled, exact-dist² filter) + `Aoi`. Per-peer order
+  dead→transfer→exit→enter→state (dead wins over transfer; exit drops the baseline; enter Spawns only our
+  namespace); deterministic wire output (emissions sorted by `NetEntityId`, which gained `Ord`); `untrack_peer`
+  clears all per-peer maps; `on_peer_connected` = track (no blanket replay). The RECEIVER is unchanged (the
+  audited ADR-0020 F1 soundness is preserved). Server pump + e2e/mode_proof/slice_metrics/headless harnesses
+  migrated to per-peer routing. **46-test two-World battery (AOI groups A–H incl. the white-box exit/re-enter
+  re-baseline, read-cheat existence-withholding, both chained-handoff cases) + 5 grid unit tests green;
+  netcode-audited THREE times** (F1 adopted-entity orphan + its over-broad fix, both closed → MERGE). Perf
+  (shared per-tick snapshot) + AOI-flicker hysteresis are Phase-3 follow-ups.
 - **THE AUTHORITY-SWAP GATE: PASSED** (ADR-0014, HIGH) — `crates/server` is the Mode-3 headless runtime
   (standalone bevy_app+bevy_time, 64 Hz FixedUpdate, exclusive net pump at ~20 Hz virtual-clock cadence,
   Messages<AppExit>). The M1–M4 battery is the documented side-by-side run: same simulation, same

@@ -54,7 +54,12 @@ impl PeerId {
 /// `OwnershipTransfer` events. Receivers never reconstruct a foreign `Entity`
 /// — they map `NetEntityId` → local proxy. (Bevy's `Entity::to_bits` u64
 /// layout is opaque and never shipped.)
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// `Ord` is deliberate: the replication sender emits Spawns / state entries /
+/// despawns in `NetEntityId` order so the per-peer wire output is DETERMINISTIC
+/// (independent of HashSet/HashMap iteration seed) — reproducible captures and
+/// stable tests. Ordering is `(spawner, index, generation)`; it has no wire
+/// meaning (the format is unchanged).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NetEntityId {
     pub spawner: PeerId,
     pub index: u32,

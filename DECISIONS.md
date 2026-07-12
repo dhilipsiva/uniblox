@@ -534,3 +534,72 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   integration test is a pre-Mode-2 SHOULD-FIX. Deeper desync (a peer that never sees a Spawn / a frozen
   wrong-owner proxy) remains owned by the separate anti-entropy-resync item.
 - **Status:** Accepted (2026-07-11).
+
+## ADR-0021 — Interest management (AOI, spatial grid); the sender goes PER-PEER
+- **Context:** second Phase-3 replication-depth item. The ADR-0020 sender broadcast ONE `collect(world) ->
+  Outbox` identically to every peer. Interest management makes replication **per-peer and visibility-gated**:
+  each peer replicates only entities within its **area of interest** (a circle), computed by a **spatial
+  grid**. Out-of-range entities are NOT replicated at all — neither per-tick state NOR existence — the
+  structural **Mode-3 read-cheat defense** (a modified client can't read entities it never receives).
+- **Decisions (user, via AskUserQuestion):** (1) **UNIFY** — per-peer collect REPLACES broadcast; the delta
+  baseline becomes per-(peer,entity) with a per-peer seq stream. (2) **State + existence** — gate BOTH the
+  state stream and lifecycle (spawn-on-AOI-enter / despawn-on-AOI-exit). The RECEIVER is UNCHANGED — each
+  receiver still sees one continuous per-sender stream regardless of which entities enter/leave, so the
+  audited ADR-0020 F1 receive-side soundness is preserved; only the SENDER generalizes.
+- **The design:**
+  - New `interest` module: `SpatialGrid` (cell-bucketed, `DEFAULT_CELL`=16, rebuilt each tick from owned+alive
+    entities — remote proxies never enter it) + `Aoi{center,radius}`. `in_radius` scans the circle's cell
+    bbox then EXACT-dist² filters (boundary inclusive `<=`); cells by `.floor()` (not `as i32` — truncation
+    mis-cells negatives). A peer with NO `Aoi` set is UNBOUNDED (sees all owned) — a bandwidth default, and
+    (auditor NIT) FAIL-OPEN: not a security guarantee; a read-cheat pump MUST `set_aoi` for every peer.
+  - `collect_all(world) -> Vec<(PeerId, Outbox)>` replaces `collect`. Per-peer state: `send_state:
+    HashMap<PeerId, HashMap<Entity, EntitySend>>`, `next_seq: HashMap<PeerId,u64>`, `known: HashMap<PeerId,
+    HashSet<Entity>>` (each peer's proxy set), `aoi: HashMap<PeerId, Aoi>`, `pending_transfers:
+    HashMap<Entity,PeerId>`. `decide_component` simplifies to a single `acked: u64` (`confirmed = acked >=
+    run_start`).
+  - **Per-peer order is load-bearing: dead → transfer → exit → enter → state.** DEAD wins over a pending
+    transfer (dead is removed from `pending_transfers` first) so a corpse is never handed off (owned-ghost
+    guard). AOI-EXIT drops `send_state[P][E]` so a re-enter re-baselines at a fresh seq (a climbing
+    `acked_seq` can't false-confirm a re-entered entity). AOI-ENTER emits a Spawn only for entities in OUR
+    namespace (`spawner==local`); an ADOPTED entity is stated to peers that already hold its proxy (no Spawn —
+    we can't mint in another namespace). The id-map is pruned + `pending_transfers` cleared only AFTER the
+    peer loop, so a two-peer despawn reaches both.
+  - **Transfer:** a peer that KNOWS the entity gets a bare `OwnershipTransfer` (proxy kept under the new
+    owner). A never-witnessed NEW OWNER gets Spawn+Transfer, but the Spawn only if `spawner==local`; the bare
+    Transfer is ALWAYS emitted (harmless-if-no-proxy / load-bearing-if-witnessed), so a chained handoff
+    O→A→q where q witnessed e via O completes even though A can't mint in O's namespace.
+  - **Deterministic wire output:** every emitted collection (dead/transfer/exit/enter/state entries) is sorted
+    by `NetEntityId` (which gained `Ord`) and peers by `PeerId`, so the bytes don't depend on HashSet/HashMap
+    seed — reproducible captures, stable tests. (Found via a mode_proof M3 flake: the client's proxy-index
+    pairing assumed Spawn order == server order, which HashSet iteration broke.)
+  - `untrack_peer` clears ALL per-peer maps (`known`/`send_state`/`next_seq`/`aoi` + the receiver-side ones):
+    a same-id peer reconnecting with a fresh world must NOT be seen as already-`known` (that would suppress
+    Spawns forever) — and no leak. `on_peer_connected(peer)` is now just `track_peer` (no blanket Spawn
+    replay — existence is gated; AOI-enter announces on the next collect). `transfer_ownership` records the
+    intent, mints if uncollected, flips local Owner immediately (no double-authority window), drops
+    `send_state[*][E]`.
+- **Server pump + harnesses:** switched from one broadcast to per-peer routing (`for (target,out) in
+  collect_all` → map target→transport peer). The server leaves AOI unset (Mode-3 clients see all; a per-client
+  gameplay focus is future client work). e2e/mode_proof/slice_metrics/headless harnesses migrated with zero
+  lost assertions.
+- **Audit (mandatory, HIGH-risk; design also pre-validated by an independent Plan agent whose lifecycle-
+  ordering + leak findings were folded into the plan):** the FIRST `netcode-auditor` pass returned **FIX-
+  FIRST** — F1: the new-owner-notify branch emitted a foreign-namespace Spawn for adopted entities (receiver
+  rejects it → silent orphan) + two missing tests (corpse-guard dangerous branch; adopted handoff). Fixed;
+  the re-audit found my fix OVER-BROAD (it also dropped the load-bearing bare Transfer, orphaning a
+  witnessing-q chained handoff — a NEW regression). Corrected to emit the Transfer unconditionally; a third
+  pass returned **MERGE**. Everything else the auditor verified sound first time: exit/re-enter re-baseline,
+  dead-over-transfer ordering, per-peer seq/ack independence, map-prune timing, determinism, `untrack`
+  clearing, read-cheat completeness, and the grid math.
+- **Evidence:** `two_world.rs` 46 deterministic tests green (Groups A–H: AOI gate, enter/exit/re-enter incl.
+  the white-box `reenter_stale_ack_does_not_confirm`, per-peer independence, read-cheat existence-withholding,
+  transfer/dead under AOI, the corpse-guard + both chained-handoff cases) + 5 `interest::SpatialGrid` unit
+  tests; full workspace green; mode_proof M3 deterministic 8/8; clippy `-D warnings` native `--all-targets` +
+  wasm32 (protocol/replication); fmt clean.
+- **Documented accepted gaps:** boundary flicker (an entity oscillating across the AOI edge → Spawn/Despawn
+  churn — correct; hysteresis is a later phase); `known[P]` is mutated before the caller confirms the reliable
+  send (a dropped Outbox desyncs it — bounded by Phase-3 resync); the adopted-entity enter of a peer without
+  the proxy re-sends every tick until resync (per-peer/bandwidth-only, documented); a chained handoff to a
+  NEVER-witnessed new owner of an adopted entity is orphaned until resync (`in_radius` cost is O(bbox area) —
+  no clamp, low-risk since AOI is server-controlled).
+- **Status:** Accepted (2026-07-12).

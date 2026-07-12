@@ -28,7 +28,7 @@
 use bevy_ecs::prelude::*;
 use engine_core::{Owner, Position, Velocity, insert_sim, simulate, spawn_owned};
 use protocol::PeerId;
-use replication::Replication;
+use replication::{Outbox, Replication};
 
 const DT: f32 = 0.5;
 const TOL: f32 = 0.5 / 1024.0;
@@ -89,26 +89,42 @@ fn run_session(ids: &[u64], spawns: &[Vec<Spawn>]) -> Session {
         }
     }
 
-    // The identical tick loop: everyone simulates, everyone collects,
-    // everything is delivered to everyone else (events before state).
+    // Full mesh: each participant tracks every other (per-peer collect targets).
+    let all_ids: Vec<PeerId> = participants.iter().map(|p| p.id).collect();
+    for p in participants.iter_mut() {
+        for &other in &all_ids {
+            if other != p.id {
+                p.repl.track_peer(other);
+            }
+        }
+    }
+
+    // The identical tick loop: everyone simulates, everyone collects PER PEER
+    // (ADR-0021), and each sender's per-peer outbox is delivered to its target
+    // (events before state). Mode is data-only — nothing here branches on mode.
     for _ in 0..ROUNDS {
         for p in participants.iter_mut() {
             p.schedule.run(&mut p.world);
         }
-        let outboxes: Vec<_> = participants
+        let outboxes: Vec<(PeerId, Vec<(PeerId, Outbox)>)> = participants
             .iter_mut()
             .map(|p| {
-                let out = p.repl.collect(&mut p.world);
-                p.state_msgs_sent += usize::from(out.state.is_some());
-                p.events_sent += out.events.len();
-                (p.id, out)
+                let outs = p.repl.collect_all(&mut p.world);
+                for (_, out) in &outs {
+                    p.state_msgs_sent += usize::from(out.state.is_some());
+                    p.events_sent += out.events.len();
+                }
+                (p.id, outs)
             })
             .collect();
         for p in participants.iter_mut() {
-            for (from, out) in &outboxes {
+            for (from, outs) in &outboxes {
                 if *from == p.id {
                     continue;
                 }
+                let Some(out) = outs.iter().find(|(t, _)| *t == p.id).map(|(_, o)| o) else {
+                    continue;
+                };
                 for ev in &out.events {
                     p.repl.apply_events(&mut p.world, *from, ev);
                 }
