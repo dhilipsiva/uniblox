@@ -15,8 +15,8 @@ use engine_core::{
     interpolate, predict, record_input, reset_render_role, simulate, spawn_owned,
 };
 use protocol::{
-    EventMsg, NetEntityId, NetEvent, PeerId, StateEntry, WIRE_VERSION, decode_event, decode_state,
-    encode_event, quantize_vec2,
+    EventMsg, NetEntityId, NetEvent, OwnerSeq, PeerId, StateEntry, WIRE_VERSION, decode_event,
+    decode_state, encode_event, quantize_vec2,
 };
 use replication::{Outbox, Replication};
 
@@ -704,7 +704,7 @@ fn handoff_clean_authority_transfer() {
     let has_transfer = out_a.events.iter().any(|ev| {
         matches!(
             decode_event(ev).unwrap().event,
-            NetEvent::OwnershipTransfer { id, new_owner } if id == original_id && new_owner == PeerId(2)
+            NetEvent::OwnershipTransfer { id, new_owner, .. } if id == original_id && new_owner == PeerId(2)
         )
     });
     assert!(has_transfer, "transfer event on the reliable channel");
@@ -2977,11 +2977,23 @@ fn reordered_state_around_transfer_dropped() {
     );
 }
 
-/// Build the documented R6 frozen-observer state: an A→B→C chain with an
-/// observer D that received T2(B→C) before T1(A→B) (cross-sender reorder), so D's
-/// proxy is FROZEN at owner B while the real owner is C. Returns
-/// `(a, b, c, d, proxy_c, proxy_d)` with `d.owner(proxy_d) == b.id`.
-fn build_r6_frozen() -> (TestPeer, TestPeer, TestPeer, TestPeer, Entity, Entity) {
+/// Build the documented R6 chained-transfer scenario: an A→B→C chain with the two
+/// ownership events for observer D CAPTURED but not yet delivered, so each test
+/// chooses the delivery order. Under the ADR-0025 A OwnerSeq gate the withheld
+/// `t1_d` carries rank `{1,A}` (A→B) and `t2_d` carries `{2,B}` (B→C); C is the
+/// real current owner (rank `{2,B}`). Returns
+/// `(a, b, c, d, proxy_c, proxy_d, t1_d, t2_d)`.
+#[allow(clippy::type_complexity)]
+fn build_r6_chain() -> (
+    TestPeer,
+    TestPeer,
+    TestPeer,
+    TestPeer,
+    Entity,
+    Entity,
+    Vec<Box<[u8]>>,
+    Vec<Box<[u8]>>,
+) {
     let mut a = TestPeer::new(1);
     let mut b = TestPeer::new(2);
     let mut c = TestPeer::new(3);
@@ -3023,56 +3035,81 @@ fn build_r6_frozen() -> (TestPeer, TestPeer, TestPeer, TestPeer, Entity, Entity)
     c.deliver_events(b.id, &outbox_for(&outs, c.id).unwrap().events);
     let t2_d = outbox_for(&outs, d.id).unwrap().events.clone();
 
-    // Adverse cross-sender order at D: T2 (from B) first (dropped by owner
-    // mismatch), then T1 (from A) — flips D to owner B while the real owner is C.
-    d.deliver_events(b.id, &t2_d);
-    d.deliver_events(a.id, &t1_d);
-    (a, b, c, d, proxy_c, proxy_d)
+    // D's two ownership events are withheld — the caller delivers them (in an
+    // order that exercises the reorder resolution or a lost-transfer heal).
+    (a, b, c, d, proxy_c, proxy_d, t1_d, t2_d)
 }
 
-/// R6-1 — chained-transfer cross-sender REORDERING freezes an observer at the
-/// WRONG owner (the documented ADR-0013 R6 gap): T2 dropped (owner mismatch), T1
-/// flips D to owner B, and C's state is then rejected forever. Pinned
-/// deterministically (as E4 pins its orphan); R6-2 heals it via resync.
+/// R6-1 — the chained-transfer cross-sender REORDER now RESOLVES BY RANK
+/// (ADR-0025 A), closing the documented ADR-0013 R6 gap at the SOURCE — no
+/// freeze, no resync needed. D receives T2 `{2,B}` (owner→C) FIRST: it outranks
+/// the birth rank so it applies. T1 `{1,A}` (owner→B) arrives second and is
+/// dropped as stale (lower rank). D lands on the REAL owner C and C's state
+/// applies — the exact scenario that previously FROZE D at the wrong owner B.
 #[test]
-fn r6_chained_reorder_freezes_observer_at_wrong_owner() {
-    let (_a, b, mut c, mut d, proxy_c, proxy_d) = build_r6_frozen();
+fn r6_chained_reorder_resolves_by_seq() {
+    let (a, b, mut c, mut d, proxy_c, proxy_d, t1_d, t2_d) = build_r6_chain();
+
+    // Adverse cross-sender order at D: T2 (from B, rank {2,B}) FIRST, then T1
+    // (from A, rank {1,A}). The higher rank wins regardless of arrival order.
+    d.deliver_events(b.id, &t2_d);
+    d.deliver_events(a.id, &t1_d);
+
     assert_eq!(
         d.owner(proxy_d),
-        b.id,
-        "R6 gap: observer frozen at the WRONG owner (B), real owner is C"
+        c.id,
+        "R6 resolved by rank: D lands on the REAL owner C (not frozen at B)"
     );
     assert_eq!(c.owner(proxy_c), c.id, "C is the real current owner");
-    let before = d.pos(proxy_d);
+
+    // C's normal state APPLIES immediately — the freeze is gone entirely.
     c.sim_tick();
     let cstate = c.collect_for(d.id);
     assert!(
         cstate.state.is_some(),
-        "C genuinely emits state for e (so the rejection below is non-vacuous)"
+        "C genuinely emits state for e (so the assertion below is non-vacuous)"
     );
+    d.deliver_state(c.id, cstate.state.as_ref().unwrap());
+    assert!(
+        approx(d.pos(proxy_d).x, c.pos(proxy_c).x),
+        "the real owner C's state applies to D — no freeze"
+    );
+
+    // D acks C directly (nothing was ever withheld).
+    assert!(
+        d.repl.drain_acks().iter().any(|(t, _)| *t == c.id),
+        "D acks C's stream"
+    );
+}
+
+/// R6-2 — anti-entropy RESYNC heals a genuinely-stale wrong-owner proxy — the
+/// residual the reorder path can't fix because the event was LOST, not reordered
+/// (ADR-0024 + the ADR-0025 A owner-change heal). D receives ONLY T1 (owner→B)
+/// and misses T2 entirely, so it is stuck at owner B rank {1,A} while the real
+/// owner is C at {2,B}. One digest→request→ResyncSpawn round from C corrects D
+/// via the `seq >= rec.owner_seq` gate ({2,B} outranks {1,A}); idempotent after.
+#[test]
+fn resync_heals_lost_transfer_wrong_owner() {
+    let (a, b, mut c, mut d, proxy_c, proxy_d, t1_d, _t2_d) = build_r6_chain();
+
+    // D gets T1 only — T2 is LOST. D is stuck at owner B; C really owns it.
+    d.deliver_events(a.id, &t1_d);
+    assert_eq!(d.owner(proxy_d), b.id, "D stuck at owner B (missed T2)");
+    assert_eq!(c.owner(proxy_c), c.id, "C is the real current owner");
+
+    // Precondition: C's state is REJECTED by the wrong-owner proxy (the residual
+    // that the STATE owner gate produces — non-vacuous, and what resync heals).
+    let before = d.pos(proxy_d);
+    c.sim_tick();
+    let cstate = c.collect_for(d.id);
     d.deliver_state(c.id, cstate.state.as_ref().unwrap());
     assert_eq!(
         before.x.to_bits(),
         d.pos(proxy_d).x.to_bits(),
-        "R6 gap: the real owner C's state is rejected by the wrong-owner proxy"
+        "before heal: the real owner C's state is rejected by the wrong-owner proxy"
     );
-}
 
-/// R6-2 — anti-entropy RESYNC heals the frozen observer (ADR-0024). From the R6
-/// frozen state, one digest→request→ResyncSpawn round from the real owner C
-/// corrects D's proxy owner B→C, so C's state applies and its withheld ack stream
-/// unblocks. Idempotent thereafter.
-#[test]
-fn r6_resync_heals_frozen_observer() {
-    let (_a, b, mut c, mut d, proxy_c, proxy_d) = build_r6_frozen();
-    assert_eq!(d.owner(proxy_d), b.id, "precondition: D frozen at owner B");
-
-    // C (the real owner) must know D to digest e for it: one collect_for populates
-    // C.known[d] (the state itself is dropped by D's wrong-owner proxy).
-    c.sim_tick();
-    let _ = c.collect_for(d.id);
-
-    // One resync round heals D.
+    // One resync round heals D (owner-change gate {2,B} >= {1,A}).
     flush_resync(&mut c, &mut d);
     assert_eq!(
         d.owner(proxy_d),
@@ -3080,7 +3117,7 @@ fn r6_resync_heals_frozen_observer() {
         "resync corrects the proxy owner B→C"
     );
 
-    // C's normal state now APPLIES (the freeze is gone).
+    // C's normal state now APPLIES.
     c.sim_tick();
     let cstate = c.collect_for(d.id);
     d.deliver_state(c.id, cstate.state.as_ref().unwrap());
@@ -3089,14 +3126,13 @@ fn r6_resync_heals_frozen_observer() {
         "C's state now applies to D's corrected proxy"
     );
 
-    // The frozen ack stream unblocks: D now acks C.
+    // The withheld ack stream unblocks: D now acks C.
     assert!(
         d.repl.drain_acks().iter().any(|(t, _)| *t == c.id),
         "D now acks C's stream (the withheld ack unblocks)"
     );
 
-    // Idempotent: once converged, C's next digest produces NO request from D
-    // (owner matches, no hash) — the round genuinely quiesces, not just re-heals.
+    // Idempotent: once converged, a further digest produces NO request from D.
     for (target, bytes) in c.repl.collect_resync(&mut c.world) {
         if target == d.id {
             d.repl.apply_events(&mut d.world, c.id, &bytes);
@@ -3141,7 +3177,8 @@ fn resync_responder_only_answers_owned() {
 
 /// R6-4 — own-authority guard: a `ResyncSpawn` for an entity WE own is dropped —
 /// a stale/foreign owner-assertion can never steal our authority or clobber our
-/// authoritative state.
+/// authoritative state, EVEN at a forged-high rank (the guard precedes the seq
+/// gate; ADR-0025 A).
 #[test]
 fn resync_own_authority_guard_drops_foreign_assert() {
     let mut a = TestPeer::new(1);
@@ -3156,6 +3193,11 @@ fn resync_own_authority_guard_drops_foreign_assert() {
             id,
             pos: quantize_vec2(99.0, 99.0),
             vel: quantize_vec2(0.0, 0.0),
+            // A deliberately huge rank — the own-authority guard must still win.
+            seq: OwnerSeq {
+                seq: 999,
+                coordinator: PeerId(2),
+            },
         },
     };
     let bytes = encode_event(&ev).expect("encode");
@@ -3486,5 +3528,307 @@ fn reassign_of_e4_orphan_then_resync_heals_nonwitness() {
         d.owner(proxy_d),
         b.id,
         "D's proxy is owned by the elected owner B"
+    );
+}
+
+// ═══════════ Group AK — ownership arbitration by OwnerSeq (ADR-0025 A kernel) ═══════════
+
+/// AK-K1 — the OwnerSeq strictly INCREASES along a transfer chain and records the
+/// giver as its coordinator: A→B mints `{1,A}`, B→C mints `{2,B}` (white-box).
+#[test]
+fn transfer_seq_increments_along_chain() {
+    let mut a = TestPeer::new(1);
+    let mut b = TestPeer::new(2);
+    let c = TestPeer::new(3);
+    let e = a.spawn(0.0, 0.0, 0.0, 0.0);
+    let _ = a.collect_all(); // mint e's id into the map
+    assert_eq!(
+        a.repl.owner_seq(e),
+        Some(OwnerSeq {
+            seq: 0,
+            coordinator: a.id
+        }),
+        "birth rank is (0, spawner)"
+    );
+
+    // A→B mints {1, A}.
+    a.repl
+        .transfer_ownership(&mut a.world, e, b.id)
+        .expect("A→B");
+    assert_eq!(
+        a.repl.owner_seq(e),
+        Some(OwnerSeq {
+            seq: 1,
+            coordinator: a.id
+        }),
+        "A→B mints (1, A)"
+    );
+
+    // Deliver A→B so B builds + owns the proxy at rank {1, A}.
+    b.deliver_all(a.id, &a.collect_for(b.id));
+    let proxy_b = b.entity_owned_by(b.id);
+    assert_eq!(
+        b.repl.owner_seq(proxy_b),
+        Some(OwnerSeq {
+            seq: 1,
+            coordinator: a.id
+        }),
+        "B's proxy adopts rank (1, A)"
+    );
+
+    // B→C mints {2, B} — strictly higher, coordinator now B.
+    b.repl
+        .transfer_ownership(&mut b.world, proxy_b, c.id)
+        .expect("B→C");
+    assert_eq!(
+        b.repl.owner_seq(proxy_b),
+        Some(OwnerSeq {
+            seq: 2,
+            coordinator: b.id
+        }),
+        "B→C mints (2, B) — strictly higher rank, coordinator now B"
+    );
+}
+
+/// AK-K2 — highest rank wins irrespective of ARRIVAL ORDER and irrespective of the
+/// sending peer: a higher-rank transfer delivered FIRST applies, and a later
+/// lower-rank transfer is dropped. `from` is not consulted — the rank is the
+/// arbiter (the old `owner!=from` gate is gone).
+#[test]
+fn highest_seq_wins_on_reordered_transfer() {
+    let mut a = TestPeer::new(1); // spawner
+    let mut d = TestPeer::new(4); // observer
+    let e = a.spawn(0.0, 0.0, 0.0, 0.0);
+    d.deliver_all(a.id, &a.collect_for(d.id));
+    let proxy = d.entity_owned_by(a.id);
+    let id = net_id(a.id, e);
+    assert_eq!(
+        d.repl.owner_seq(proxy),
+        Some(OwnerSeq {
+            seq: 0,
+            coordinator: a.id
+        })
+    );
+
+    let mk = |new_owner: PeerId, seq: OwnerSeq| {
+        encode_event(&EventMsg {
+            version: WIRE_VERSION,
+            sig: None,
+            event: NetEvent::OwnershipTransfer { id, new_owner, seq },
+        })
+        .expect("encode")
+    };
+    let hi = mk(
+        PeerId(3),
+        OwnerSeq {
+            seq: 2,
+            coordinator: PeerId(2),
+        },
+    );
+    let lo = mk(
+        PeerId(2),
+        OwnerSeq {
+            seq: 1,
+            coordinator: PeerId(1),
+        },
+    );
+
+    // Higher rank FIRST (delivered from an arbitrary peer — `from` is irrelevant).
+    d.repl.apply_events(&mut d.world, PeerId(7), &hi);
+    assert_eq!(d.owner(proxy), PeerId(3), "higher-rank transfer applies");
+    assert_eq!(
+        d.repl.owner_seq(proxy),
+        Some(OwnerSeq {
+            seq: 2,
+            coordinator: PeerId(2)
+        })
+    );
+
+    // Lower rank SECOND — dropped despite arriving later.
+    d.repl.apply_events(&mut d.world, PeerId(8), &lo);
+    assert_eq!(
+        d.owner(proxy),
+        PeerId(3),
+        "the later lower-rank transfer is dropped"
+    );
+    assert_eq!(
+        d.repl.owner_seq(proxy),
+        Some(OwnerSeq {
+            seq: 2,
+            coordinator: PeerId(2)
+        }),
+        "rank unchanged by the stale transfer"
+    );
+}
+
+/// AK-K3 — the transfer gate is STRICT (`seq > proxy`): a conflicting transfer at
+/// the SAME rank the proxy already holds is dropped, so a same-rank assertion can
+/// never flip the owner (this is why transfer/commit use `>`, not `>=`).
+#[test]
+fn equal_rank_transfer_dropped_strict_gate() {
+    let mut a = TestPeer::new(1);
+    let mut d = TestPeer::new(4);
+    let e = a.spawn(0.0, 0.0, 0.0, 0.0);
+    d.deliver_all(a.id, &a.collect_for(d.id));
+    let proxy = d.entity_owned_by(a.id);
+    let id = net_id(a.id, e);
+
+    let mk = |new_owner: PeerId| {
+        encode_event(&EventMsg {
+            version: WIRE_VERSION,
+            sig: None,
+            event: NetEvent::OwnershipTransfer {
+                id,
+                new_owner,
+                seq: OwnerSeq {
+                    seq: 1,
+                    coordinator: a.id,
+                },
+            },
+        })
+        .expect("encode")
+    };
+
+    // Advance D to rank {1, A}, owner PeerId(2).
+    d.repl.apply_events(&mut d.world, a.id, &mk(PeerId(2)));
+    assert_eq!(d.owner(proxy), PeerId(2));
+
+    // A conflicting transfer at the SAME rank {1, A} to a DIFFERENT owner — dropped.
+    // If the gate were `>=` this would wrongly flip the owner to PeerId(3).
+    d.repl.apply_events(&mut d.world, a.id, &mk(PeerId(3)));
+    assert_eq!(
+        d.owner(proxy),
+        PeerId(2),
+        "equal-rank transfer dropped by the strict `>` gate"
+    );
+}
+
+/// AK-K4 — the ADR-0025 A resync BACKDOOR is closed: after an entity is committed
+/// to a new owner at a higher rank, a stale `ResyncSpawn` from a FORMER owner (a
+/// strictly-lower rank) must NOT revert the owner or clobber state — the
+/// owner-change heal is gated `seq >= rec.owner_seq`.
+#[test]
+fn resync_backdoor_stale_former_owner_dropped() {
+    let mut src = TestPeer::new(1); // spawns e so D can build a proxy
+    let mut d = TestPeer::new(4);
+    let e = src.spawn(1.0, 1.0, 0.0, 0.0);
+    d.deliver_all(src.id, &src.collect_for(d.id));
+    let proxy = d.entity_owned_by(src.id);
+    let id = net_id(src.id, e);
+
+    // Commit D's proxy to PeerId(3) at rank {5, coordinator 2}.
+    let commit = encode_event(&EventMsg {
+        version: WIRE_VERSION,
+        sig: None,
+        event: NetEvent::OwnershipTransfer {
+            id,
+            new_owner: PeerId(3),
+            seq: OwnerSeq {
+                seq: 5,
+                coordinator: PeerId(2),
+            },
+        },
+    })
+    .expect("encode");
+    d.repl.apply_events(&mut d.world, PeerId(2), &commit);
+    assert_eq!(
+        d.owner(proxy),
+        PeerId(3),
+        "committed to owner 3 at rank (5,2)"
+    );
+
+    // The FORMER owner (PeerId(1)) sends a stale ResyncSpawn at a LOWER rank {3,1}
+    // asserting itself — must be dropped by the `seq >= rec.owner_seq` gate.
+    let stale = encode_event(&EventMsg {
+        version: WIRE_VERSION,
+        sig: None,
+        event: NetEvent::ResyncSpawn {
+            id,
+            pos: quantize_vec2(99.0, 99.0),
+            vel: quantize_vec2(0.0, 0.0),
+            seq: OwnerSeq {
+                seq: 3,
+                coordinator: PeerId(1),
+            },
+        },
+    })
+    .expect("encode");
+    d.repl.apply_events(&mut d.world, PeerId(1), &stale);
+
+    assert_eq!(
+        d.owner(proxy),
+        PeerId(3),
+        "stale former-owner resync does NOT revert the committed owner"
+    );
+    assert!(
+        approx(d.pos(proxy).x, 1.0),
+        "and does not clobber the committed proxy's state"
+    );
+}
+
+/// AK-K5 — the same-owner value heal accepts REGARDLESS of rank: a `ResyncSpawn`
+/// from the CURRENT owner (`from == owner`) snaps state even at a LOWER rank than
+/// the proxy holds, and leaves owner + rank untouched (the stale-silent-value
+/// path — distinct from the rank-gated owner-change path).
+#[test]
+fn resync_value_heal_ignores_lower_rank() {
+    let mut src = TestPeer::new(1); // spawns e
+    let mut d = TestPeer::new(4);
+    let e = src.spawn(5.0, 5.0, 0.0, 0.0);
+    d.deliver_all(src.id, &src.collect_for(d.id));
+    let proxy = d.entity_owned_by(src.id);
+    let id = net_id(src.id, e);
+
+    // Move D's proxy to owner X=PeerId(9) at rank {3, 2}.
+    let x = PeerId(9);
+    let t = encode_event(&EventMsg {
+        version: WIRE_VERSION,
+        sig: None,
+        event: NetEvent::OwnershipTransfer {
+            id,
+            new_owner: x,
+            seq: OwnerSeq {
+                seq: 3,
+                coordinator: PeerId(2),
+            },
+        },
+    })
+    .expect("encode");
+    d.repl.apply_events(&mut d.world, PeerId(2), &t);
+    assert_eq!(d.owner(proxy), x);
+
+    // Corrupt the value (a silent divergence).
+    d.world.get_mut::<Position>(proxy).unwrap().x = 99.0;
+
+    // A resync from the CURRENT owner X at a LOWER rank {1, 9} — the same-owner
+    // value heal snaps regardless of rank; owner + rank are untouched.
+    let heal = encode_event(&EventMsg {
+        version: WIRE_VERSION,
+        sig: None,
+        event: NetEvent::ResyncSpawn {
+            id,
+            pos: quantize_vec2(5.0, 5.0),
+            vel: quantize_vec2(0.0, 0.0),
+            seq: OwnerSeq {
+                seq: 1,
+                coordinator: x,
+            },
+        },
+    })
+    .expect("encode");
+    d.repl.apply_events(&mut d.world, x, &heal);
+
+    assert!(
+        approx(d.pos(proxy).x, 5.0),
+        "same-owner value heal restores the value despite a lower rank"
+    );
+    assert_eq!(d.owner(proxy), x, "owner unchanged by a value heal");
+    assert_eq!(
+        d.repl.owner_seq(proxy),
+        Some(OwnerSeq {
+            seq: 3,
+            coordinator: PeerId(2)
+        }),
+        "rank unchanged by a value heal"
     );
 }

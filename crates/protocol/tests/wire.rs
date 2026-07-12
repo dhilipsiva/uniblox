@@ -148,6 +148,10 @@ fn event_round_trip_reserves_signature() {
         NetEvent::OwnershipTransfer {
             id: id(1, 7, 0),
             new_owner: PeerId(9),
+            seq: protocol::OwnerSeq {
+                seq: 3,
+                coordinator: PeerId(1),
+            },
         },
         NetEvent::Ack { seq: 42 },
         NetEvent::Input {
