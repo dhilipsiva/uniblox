@@ -716,3 +716,25 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
 - **Status:** Stages A + B + C ACCEPTED (2026-07-12) — the item is complete. Deferred fast-follows: a Mode-2
   sender advancing `Tick`; per-entity input markers for multi-avatar-per-peer; despawn-on-disconnect avatar
   cleanup; the actual in-browser render wiring (the separate Bevy client gameplay build).
+
+## ADR-0023 — Interest-management follow-ups (snapshot hoist, hysteresis, per-client focus)
+- **Context:** three ADR-0021 refinements, landed as audited stages a→b→c (TDD + a FRESH `netcode-auditor`
+  each): (a) a shared per-tick snapshot so `collect_all` quantizes ONCE per owned entity, not per
+  (peer,entity); (b) AOI-flicker hysteresis (two radii) so an entity oscillating across the boundary doesn't
+  churn Spawn/Despawn; (c) a real per-client AOI focus (Mode 3 leaves AOI unset ⇒ clients see all).
+- **Stage a — quantization hoist (Accepted 2026-07-12):** the grid + world query were already built once/tick;
+  the residual per-(peer,entity) redundancy was quantization. The once-built `owned` snapshot now carries a
+  precomputed `OwnedRow { id, qpos: QVec2, qvel: QVec2 }` (quantized once from the peer-invariant raw pos/vel);
+  the per-peer loop READS `row.qpos`/`row.qvel` at enter-Spawn, `decide_component`, and the `StateEntry`
+  entries. Raw pos/vel dropped from `owned` (the grid builds from `rows`; nothing else read them). The
+  transfer-Spawn path is untouched (a transferred entity's Owner is flipped ⇒ it fails the authority gate ⇒
+  it's never in `owned`; that path reads `world.get` directly). A PURE byte-identical refactor: no
+  wire/receiver change; quantization is pure over a shared snapshot. Evidence: two_world 70 green (T35
+  byte-exact 0 steady-state, A/B/C exact positions, SA/SB interp — the real regression proof) + a new
+  `hoist_quantized_value_is_peer_invariant` (identical `StateEntry` across two peers, values pinned to the
+  spawn coords); full workspace green; clippy `-D warnings` native + wasm32; fmt clean. netcode-audited →
+  MERGE (byte-identity + invariants intact: authority-gate-first, no `Changed`, deterministic `NetEntityId`
+  order, single per-tick quantization; the only delta is a release-invisible earlier `debug_assert` on a
+  documented sim bug — arguably an improvement).
+- **Stages b, c:** pending (b: two-radius hysteresis; c: opt-in per-client avatar + AOI focus hook).
+- **Status:** Stage a Accepted (2026-07-12); b + c in progress.

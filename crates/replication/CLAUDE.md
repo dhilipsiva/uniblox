@@ -6,8 +6,12 @@ delta/baseline, authority, ownership handoff, anti-entropy resync.
 `netcode-auditor` on every diff (never the session that wrote the code).
 
 ## Status
-Implemented (ADR-0013 slice + ADR-0020 delta + **ADR-0021 interest management / per-peer**). The sender is
-now PER-PEER: `collect_all(world) -> Vec<(PeerId, Outbox)>` (was broadcast `collect`). Each tracked peer sees
+Implemented (ADR-0013 slice + ADR-0020 delta + **ADR-0021 interest management / per-peer** + **ADR-0023
+stage a**). The sender is now PER-PEER: `collect_all(world) -> Vec<(PeerId, Outbox)>` (was broadcast
+`collect`). **ADR-0023 (a) quantization hoist:** the once-per-tick `owned` snapshot carries a precomputed
+`OwnedRow { id, qpos, qvel }` (quantized ONCE from the peer-invariant raw pos/vel); the per-peer loop reads
+`row.qpos`/`row.qvel` instead of re-quantizing per (peer,entity). Byte-identical; the transfer-Spawn path
+(entity absent from `owned` post-authority-gate) still reads `world.get` directly. Each tracked peer sees
 only entities in its AOI (`set_aoi`; unset ⇒ unbounded/sees-all — a FAIL-OPEN bandwidth default, not a
 security guarantee), with its OWN delta baseline (`send_state[peer][entity]`) + seq stream + `known` set.
 Out-of-AOI entities are withheld in BOTH state AND existence (spawn-on-enter / despawn-on-exit) — the

@@ -327,6 +327,16 @@ impl Replication {
             pos: Position,
             vel: Velocity,
         }
+        // Per-tick snapshot record (ADR-0021 (a)): the raw pos/vel are peer-
+        // invariant, so quantize ONCE here (not per (peer,entity)). The per-peer
+        // loop reads these `QVec2`s — turning O(peers·entities) quantize work
+        // into O(entities). Raw pos/vel are NOT retained: the grid is built from
+        // `rows` and every per-peer consumer wants the quantized value.
+        struct OwnedRow {
+            id: NetEntityId,
+            qpos: QVec2,
+            qvel: QVec2,
+        }
         let rows: Vec<Row> = match self.change_query.get(world) {
             Ok(query) => query
                 .iter()
@@ -344,7 +354,7 @@ impl Replication {
             }
         };
         let mut grid = SpatialGrid::new(DEFAULT_CELL);
-        let mut owned: HashMap<Entity, (NetEntityId, Position, Velocity)> = HashMap::new();
+        let mut owned: HashMap<Entity, OwnedRow> = HashMap::new();
         for row in &rows {
             let id = match self.map.by_entity.get_mut(&row.entity) {
                 Some(rec) => {
@@ -362,7 +372,14 @@ impl Replication {
                 }
             };
             grid.insert(row.entity, (row.pos.x, row.pos.y));
-            owned.insert(row.entity, (id, row.pos, row.vel));
+            owned.insert(
+                row.entity,
+                OwnedRow {
+                    id,
+                    qpos: qpos(&row.pos),
+                    qvel: qvel(&row.vel),
+                },
+            );
         }
 
         // 2. Dead = mapped entities no longer alive. Dead WINS over a pending
@@ -466,12 +483,12 @@ impl Replication {
                 .copied()
                 .filter(|e| owned.contains_key(e) && !visible.contains(e))
                 .collect();
-            exits.sort_by_key(|e| owned.get(e).map(|t| t.0));
+            exits.sort_by_key(|e| owned.get(e).map(|r| r.id));
             for e in exits {
                 known_p.remove(&e);
                 send_p.remove(&e);
-                if let Some((id, ..)) = owned.get(&e) {
-                    events.push(event(NetEvent::Despawn { id: *id }));
+                if let Some(row) = owned.get(&e) {
+                    events.push(event(NetEvent::Despawn { id: row.id }));
                 }
             }
 
@@ -489,14 +506,14 @@ impl Replication {
                 .copied()
                 .filter(|e| owned.contains_key(e) && !known_p.contains(e))
                 .collect();
-            enters.sort_by_key(|e| owned.get(e).map(|t| t.0));
+            enters.sort_by_key(|e| owned.get(e).map(|r| r.id));
             for e in enters {
-                if let Some((id, pos, vel)) = owned.get(&e) {
-                    if id.spawner == local {
+                if let Some(row) = owned.get(&e) {
+                    if row.id.spawner == local {
                         events.push(event(NetEvent::Spawn {
-                            id: *id,
-                            pos: qpos(pos),
-                            vel: qvel(vel),
+                            id: row.id,
+                            pos: row.qpos,
+                            vel: row.qvel,
                         }));
                     }
                     known_p.insert(e);
@@ -513,19 +530,19 @@ impl Replication {
                 .copied()
                 .filter(|e| visible.contains(e))
                 .collect();
-            visible_known.sort_by_key(|e| owned.get(e).map(|t| t.0));
+            visible_known.sort_by_key(|e| owned.get(e).map(|r| r.id));
             for &e in &visible_known {
-                let Some((id, pos, vel)) = owned.get(&e) else {
+                let Some(row) = owned.get(&e) else {
                     continue;
                 };
                 let prior = send_p.get(&e).copied().unwrap_or_default();
-                let (send_pos, next_pos) = decide_component(prior.pos, qpos(pos), seq, acked);
-                let (send_vel, next_vel) = decide_component(prior.vel, qvel(vel), seq, acked);
+                let (send_pos, next_pos) = decide_component(prior.pos, row.qpos, seq, acked);
+                let (send_vel, next_vel) = decide_component(prior.vel, row.qvel, seq, acked);
                 if send_pos || send_vel {
                     entries.push(StateEntry {
-                        id: *id,
-                        pos: send_pos.then(|| qpos(pos)),
-                        vel: send_vel.then(|| qvel(vel)),
+                        id: row.id,
+                        pos: send_pos.then_some(row.qpos),
+                        vel: send_vel.then_some(row.qvel),
                     });
                     commits.push((
                         e,

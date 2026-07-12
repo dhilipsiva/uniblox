@@ -18,8 +18,10 @@ deterministic wire output; then **prediction / reconciliation / interpolation (A
 `RenderPos` render layer with interpolate-others (snapshot buffer + lerp), predict-own + server reconciliation
 (input / `last_input`), and the handoff role reset. The ADR-0020 ack round-trip is now integration-covered
 over the real `net_pump` (`server/tests/headless_app.rs::ack_round_trip_confirms_and_goes_quiet` — both
-directions to quiescence; the fast-follow is closed). Next Phase-3 threads: anti-entropy resync, handoff depth,
-double-ownership coordination, interest-management perf (a shared per-tick snapshot; AOI-flicker hysteresis).
+directions to quiescence; the fast-follow is closed). **Interest-management follow-ups (ADR-0023) underway:**
+stage a (quantization hoisted into the once-per-tick snapshot — byte-identical) done; stages b (AOI-flicker
+hysteresis) + c (per-client avatar+focus hook) pending. Next Phase-3 threads: anti-entropy resync, handoff
+depth, double-ownership coordination.
 
 ## Done
 - **Cargo workspace** — virtual manifest, 9 crates under `crates/*` (glob members),
