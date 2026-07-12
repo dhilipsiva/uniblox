@@ -43,9 +43,16 @@ two-World battery + 5 grid unit tests + codec + e2e-over-real-transport green; n
 orphan blocker + its over-broad fix, both closed → MERGE).** The ack round-trip is now
 integration-covered over the real `net_pump` (both directions — `server/tests/headless_app.rs::
 ack_round_trip_confirms_and_goes_quiet`, a Mode-2-shaped client-owned entity drives the server's ack-routing).
-Phase 3 still owns: anti-entropy resync, message splitting, per-entry ack granularity, hysteresis for AOI
-flicker, and the documented cross-sender gaps (see lib.rs module docs) — including a chained handoff to a
-never-witnessed new owner of an adopted entity.
+**ADR-0024 handoff depth + anti-entropy RESYNC:** deep handoff is now covered (hand-back A→B→A, repeated/cycle
+transfers, packet-loss around a handoff — Group R in two_world), and the documented R6 cross-sender reordering
+gap (a frozen wrong-owner proxy) now HEALS via resync: `collect_resync` (per-peer `Digest` of owned+known
+ids + a confirmed-value hash) → receiver flags divergence (missing / wrong-owner / stale-hash) → directed
+`ResyncRequest` (`drain_resync_requests`) → the owner's privileged `ResyncSpawn` (`drain_resync_responses`,
+re-filtered by current-ownership + AOI) which create-or-corrects the proxy (own-authority guard; bypasses the
+`owner!=from` / `spawner!=from` gates as the current authority). Phase 3 still owns: message splitting,
+per-entry ack granularity, the production-pump resync cadence, and the remaining cross-sender gap NOT healable
+by digest/refetch — a chained handoff to a NEVER-witnessed new owner of an adopted entity (no peer holds a
+Local proxy → coordinator / host-migration item).
 
 ## Crate-local invariants
 - **Single-ownership per entity ⇒ last-write-wins, NO CRDT.** One authority per

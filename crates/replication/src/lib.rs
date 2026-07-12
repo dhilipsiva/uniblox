@@ -48,14 +48,16 @@
 //!   it committed to the baseline — so a same-value write is not re-sent, and
 //!   there is no dependency on Bevy change ticks (the earlier `Ref::is_changed`
 //!   / `check_change_ticks` hazard on a long-lived server is retired).
-//! - **Known accepted gaps** (documented, warn-logged, healed by Phase 3
-//!   anti-entropy resync — do NOT "fix" ad hoc):
+//! - **Known accepted gaps** (documented, warn-logged; the cross-sender
+//!   reordering ones are HEALED by ADR-0024 anti-entropy resync — do NOT "fix"
+//!   ad hoc, resync corrects them):
 //!   - cross-SENDER event reordering after a handoff: a third peer may see
 //!     the new owner's `Despawn` before the original `Spawn` (orphaned
 //!     proxy), and a CHAINED handoff A→B→C may deliver T2(B→C) before
 //!     T1(A→B) at a fourth peer — T2 is dropped, the proxy records owner B
-//!     forever, and C's state is rejected until resync (frozen, wrong-owner
-//!     proxy; no packet loss required, just cross-sender skew);
+//!     forever, and C's state is rejected (frozen, wrong-owner proxy; no packet
+//!     loss required, just cross-sender skew) UNTIL a resync round (ADR-0024
+//!     `collect_resync`/`ResyncSpawn`) corrects the owner and unblocks the stream;
 //!   - late-join replay of entities whose spawner no longer owns them;
 //!   - (ADR-0021) a chained handoff to a NEVER-witnessed new owner of an
 //!     ADOPTED entity (we cannot mint in another peer's namespace) is orphaned;
@@ -72,8 +74,9 @@ use engine_core::{
     push_pending_input, push_snapshot, spawn_owned,
 };
 use protocol::{
-    EventMsg, NetEntityId, NetEvent, PeerId, QVec2, StateEntry, StateMsg, WIRE_VERSION,
-    decode_event, decode_state, dequantize, encode_event, encode_state, quantize_vec2,
+    DigestEntry, EventMsg, NetEntityId, NetEvent, PeerId, QVec2, StateEntry, StateMsg,
+    WIRE_VERSION, decode_event, decode_state, dequantize, encode_event, encode_state,
+    quantize_vec2,
 };
 
 mod interest;
@@ -267,6 +270,13 @@ pub struct Replication {
     /// CLIENT, per controlled entity: the highest input seq we have SENT to its
     /// authority (ADR-0022 Stage B), so `drain_inputs` sends each input once.
     input_sent: HashMap<Entity, u64>,
+    /// SENDER (ADR-0024 resync): per requesting peer, the ids it asked us (its
+    /// current owner) to re-assert, drained by [`drain_resync_responses`].
+    resync_requests: HashMap<PeerId, HashSet<NetEntityId>>,
+    /// RECEIVER (ADR-0024 resync): per sender, the ids we found diverged from its
+    /// [`NetEvent::Digest`] (missing / wrong-owner / stale), drained by
+    /// [`drain_resync_requests`] into a directed `ResyncRequest`.
+    resync_wanted: HashMap<PeerId, HashSet<NetEntityId>>,
     /// The tracked peer set (added on connect, dropped on departure).
     peers: HashSet<PeerId>,
 }
@@ -286,6 +296,8 @@ impl Replication {
             applied_seq: HashMap::new(),
             ack_sent: HashMap::new(),
             input_sent: HashMap::new(),
+            resync_requests: HashMap::new(),
+            resync_wanted: HashMap::new(),
             peers: HashSet::new(),
         }
     }
@@ -910,6 +922,101 @@ impl Replication {
                     );
                 }
             }
+            NetEvent::Digest { entries } => {
+                // RECEIVER (ADR-0024 resync): `from` summarizes the entities it
+                // owns. Flag any we find diverged — missing (orphan), frozen at a
+                // WRONG owner after a cross-sender reorder (R6), or a stale SILENT
+                // value (hash mismatch) — for a targeted request. Never an entity
+                // WE own (our authority is not `from`'s to correct).
+                let local = world.resource::<LocalPeer>().0;
+                for entry in entries {
+                    let diverged = match self.map.by_id.get(&entry.id).copied() {
+                        None => true,
+                        Some(proxy) => match world.get::<Owner>(proxy).map(|o| o.0) {
+                            None => true,
+                            Some(owner) if owner == local => false,
+                            Some(owner) if owner != from => true,
+                            Some(_) => entry
+                                .state_hash
+                                .is_some_and(|h| proxy_state_hash(world, proxy) != Some(h)),
+                        },
+                    };
+                    if diverged {
+                        self.resync_wanted.entry(from).or_default().insert(entry.id);
+                    }
+                }
+            }
+            NetEvent::ResyncRequest { ids } => {
+                // SENDER (ADR-0024 resync): `from` asks us to re-assert these ids.
+                // Queue them; `drain_resync_responses` re-filters by CURRENT
+                // ownership + AOI before emitting any `ResyncSpawn`.
+                self.resync_requests.entry(from).or_default().extend(ids);
+            }
+            NetEvent::ResyncSpawn { id, pos, vel } => {
+                // RECEIVER (ADR-0024 resync): the current owner `from` PRIVILEGED-
+                // asserts existence + owner + state. Create-or-correct, bypassing
+                // the `spawner!=from` (create) and `owner!=from` (correct) gates —
+                // sound because `from` IS the current authority (the Mode-2
+                // coordinator / Mode-3 server arbitration envelope), and the id's
+                // `spawner` is unchanged (identity ≠ authority). Own-authority
+                // guard: a stale resync from a former owner must never steal an
+                // entity WE now own.
+                let local = world.resource::<LocalPeer>().0;
+                match self.map.by_id.get(&id).copied() {
+                    Some(proxy) => {
+                        if world.get::<Owner>(proxy).is_some_and(|o| o.0 == local) {
+                            return;
+                        }
+                        if let Some(mut owner) = world.get_mut::<Owner>(proxy) {
+                            owner.0 = from;
+                        }
+                        if let Some(rec) = self.map.by_entity.get_mut(&proxy) {
+                            rec.last_owner = from;
+                        }
+                        if let Some(mut p) = world.get_mut::<Position>(proxy) {
+                            p.x = dequantize(pos.x);
+                            p.y = dequantize(pos.y);
+                        }
+                        if let Some(mut v) = world.get_mut::<Velocity>(proxy) {
+                            v.x = dequantize(vel.x);
+                            v.y = dequantize(vel.y);
+                        }
+                        // Source discontinuity — drop snapshots from the old owner
+                        // (mirrors the OwnershipTransfer buffer flush).
+                        if let Some(mut buf) = world.get_mut::<InterpBuffer>(proxy) {
+                            buf.0.clear();
+                        }
+                    }
+                    None => {
+                        // Never let a remote peer MINT in OUR namespace (mirrors
+                        // the Spawn arm's spawner-gate): a ResyncSpawn for an id we
+                        // minted but hold no proxy for is a phantom (a forged /
+                        // stale-generation assertion — out of the honest flow,
+                        // which always heals a real proxy via the correct-branch
+                        // above). Only the correct-branch may touch our-namespace ids.
+                        if id.spawner == local {
+                            return;
+                        }
+                        // Orphan: create the proxy owned by `from` at the asserted
+                        // state. `spawn_owned(_, from, _)` sets Owner=from; the map
+                        // keeps the original `id` (id.spawner unchanged).
+                        let proxy = spawn_owned(
+                            world,
+                            from,
+                            Position {
+                                x: dequantize(pos.x),
+                                y: dequantize(pos.y),
+                            },
+                            Velocity {
+                                x: dequantize(vel.x),
+                                y: dequantize(vel.y),
+                            },
+                        );
+                        world.entity_mut(proxy).insert(InterpBuffer::default());
+                        self.map.insert(id, proxy, from);
+                    }
+                }
+            }
         }
     }
 
@@ -980,6 +1087,148 @@ impl Replication {
             }
         }
         acks
+    }
+
+    /// SENDER (ADR-0024 anti-entropy resync): a per-peer DIGEST — for every entity
+    /// this peer KNOWS that we still own, an id + optional confirmed-value hash.
+    /// The recipient compares it to its proxies and requests a resync for any it
+    /// finds diverged (missing / wrong-owner after a cross-sender reorder / stale
+    /// silent value). Cheap steady-state traffic (the heavy `ResyncSpawn` flows
+    /// only on a real mismatch). Call on a SLOWER cadence than `collect_all` (the
+    /// caller's, like the net tick). Returns `(peer, encoded Digest event)`.
+    pub fn collect_resync(&mut self, world: &mut World) -> Vec<(PeerId, Box<[u8]>)> {
+        let local = world.resource::<LocalPeer>().0;
+        // Snapshot the entities we currently OWN (authority-gated, like collect_all).
+        let rows: Vec<(Entity, QVec2, QVec2)> = match self.change_query.get(world) {
+            Ok(query) => query
+                .iter()
+                .filter(|(_, owner, _, _)| authority_of(owner.0, local) == Authority::Local)
+                .map(|(e, _, pos, vel)| (e, qpos(&pos), qvel(&vel)))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        let mut owned: HashMap<Entity, (NetEntityId, QVec2, QVec2)> = HashMap::new();
+        for (e, qp, qv) in rows {
+            if let Some(rec) = self.map.by_entity.get(&e) {
+                owned.insert(e, (rec.id, qp, qv));
+            }
+        }
+        let mut peers: Vec<PeerId> = self.peers.iter().copied().collect();
+        peers.sort();
+        let mut out = Vec::new();
+        for p in peers {
+            let Some(known_p) = self.known.get(&p) else {
+                continue;
+            };
+            let acked = self.acked_seq.get(&p).copied().unwrap_or(0);
+            let send_p = self.send_state.get(&p);
+            let mut entries: Vec<DigestEntry> = Vec::new();
+            for &e in known_p {
+                let Some(&(id, qp, qv)) = owned.get(&e) else {
+                    continue; // known but no longer owned (mid-handoff / dead)
+                };
+                // A hash is sent ONLY for a confirmed + UNCHANGED value (so a
+                // moving entity never triggers a false resync); an owner mismatch
+                // is caught without one.
+                let es = send_p.and_then(|m| m.get(&e));
+                let quiet = es.is_some_and(|es| {
+                    component_quiet(es.pos, qp, acked) && component_quiet(es.vel, qv, acked)
+                });
+                entries.push(DigestEntry {
+                    id,
+                    state_hash: quiet.then(|| fnv32(qp, qv)),
+                });
+            }
+            if entries.is_empty() {
+                continue;
+            }
+            entries.sort_by_key(|d| d.id);
+            match encode_event(&event(NetEvent::Digest { entries })) {
+                Ok(bytes) => out.push((p, bytes.into_boxed_slice())),
+                Err(err) => log::error!("digest encode to {p:?} failed: {err}"),
+            }
+        }
+        out
+    }
+
+    /// RECEIVER (ADR-0024 resync): emit a directed `ResyncRequest` to each sender
+    /// we found diverged from its digest, then clear the wanted set (the next
+    /// digest re-adds anything still diverged — at most one request per digest).
+    pub fn drain_resync_requests(&mut self) -> Vec<(PeerId, Box<[u8]>)> {
+        let mut wanted: Vec<(PeerId, HashSet<NetEntityId>)> =
+            std::mem::take(&mut self.resync_wanted)
+                .into_iter()
+                .collect();
+        wanted.sort_by_key(|(p, _)| *p); // deterministic per-peer order
+        let mut out = Vec::new();
+        for (peer, ids) in wanted {
+            if ids.is_empty() {
+                continue;
+            }
+            let mut ids: Vec<NetEntityId> = ids.into_iter().collect();
+            ids.sort();
+            match encode_event(&event(NetEvent::ResyncRequest { ids })) {
+                Ok(bytes) => out.push((peer, bytes.into_boxed_slice())),
+                Err(err) => log::error!("resync request encode to {peer:?} failed: {err}"),
+            }
+        }
+        out
+    }
+
+    /// SENDER (ADR-0024 resync): answer queued `ResyncRequest`s with a privileged
+    /// `ResyncSpawn` per id — but ONLY for ids we CURRENTLY own (authority Local)
+    /// that resolve to a live entity in the requester's AOI. The responder-owns +
+    /// AOI re-filter prevents ownership theft and out-of-AOI leaks, and is
+    /// self-correcting under a concurrent handoff (we simply stop answering for an
+    /// entity we no longer own).
+    pub fn drain_resync_responses(&mut self, world: &mut World) -> Vec<(PeerId, Box<[u8]>)> {
+        let local = world.resource::<LocalPeer>().0;
+        let mut requests: Vec<(PeerId, Vec<NetEntityId>)> =
+            std::mem::take(&mut self.resync_requests)
+                .into_iter()
+                .map(|(p, ids)| {
+                    let mut v: Vec<NetEntityId> = ids.into_iter().collect();
+                    v.sort();
+                    (p, v)
+                })
+                .collect();
+        requests.sort_by_key(|(p, _)| *p);
+        let mut out = Vec::new();
+        for (peer, ids) in requests {
+            let aoi = self.aoi.get(&peer).copied();
+            for id in ids {
+                let Some(&entity) = self.map.by_id.get(&id) else {
+                    continue;
+                };
+                let Some(owner) = world.get::<Owner>(entity).map(|o| o.0) else {
+                    continue;
+                };
+                if authority_of(owner, local) != Authority::Local {
+                    continue; // no longer ours — don't assert stale ownership
+                }
+                let Some(pos) = world.get::<Position>(entity).copied() else {
+                    continue;
+                };
+                let Some(vel) = world.get::<Velocity>(entity).copied() else {
+                    continue;
+                };
+                if let Some(a) = aoi {
+                    let (dx, dy) = (pos.x - a.center.0, pos.y - a.center.1);
+                    if dx * dx + dy * dy > a.radius_outer * a.radius_outer {
+                        continue; // out of the requester's AOI — no existence leak
+                    }
+                }
+                match encode_event(&event(NetEvent::ResyncSpawn {
+                    id,
+                    pos: qpos(&pos),
+                    vel: qvel(&vel),
+                })) {
+                    Ok(bytes) => out.push((peer, bytes.into_boxed_slice())),
+                    Err(err) => log::error!("resync spawn encode to {peer:?} failed: {err}"),
+                }
+            }
+        }
+        out
     }
 
     /// Add a peer to the tracked set (ADR-0020/0021). Only tracked peers get
@@ -1060,6 +1309,8 @@ impl Replication {
         self.send_state.remove(&peer);
         self.next_seq.remove(&peer);
         self.aoi.remove(&peer);
+        self.resync_requests.remove(&peer);
+        self.resync_wanted.remove(&peer);
     }
 
     /// Initiate an A→B ownership handoff for an entity WE currently own.
@@ -1139,4 +1390,33 @@ fn qpos(pos: &Position) -> QVec2 {
 
 fn qvel(vel: &Velocity) -> QVec2 {
     quantize_vec2(vel.x, vel.y)
+}
+
+/// FNV-1a over the QUANTIZED (i32) pos+vel — the resync digest hash (ADR-0024).
+/// Hashing the i32 `QVec2`, never floats, keeps it deterministic and matches the
+/// sender's `qpos`/`qvel` exactly (quantize∘dequantize is identity in-envelope).
+fn fnv32(pos: QVec2, vel: QVec2) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for v in [pos.x, pos.y, vel.x, vel.y] {
+        for b in v.to_le_bytes() {
+            h ^= u32::from(b);
+            h = h.wrapping_mul(0x0100_0193);
+        }
+    }
+    h
+}
+
+/// The digest hash of a receiver's proxy — its current quantized pos+vel — for
+/// comparison against a `DigestEntry.state_hash`. `None` if it lacks either.
+fn proxy_state_hash(world: &World, proxy: Entity) -> Option<u32> {
+    let pos = world.get::<Position>(proxy)?;
+    let vel = world.get::<Velocity>(proxy)?;
+    Some(fnv32(qpos(pos), qvel(vel)))
+}
+
+/// A component is "quiet" for a peer (digest-hashable) iff it is confirmed
+/// (`acked ≥ run_start`) AND unchanged from the acked value — so a moving entity
+/// never carries a hash and can't trigger a false resync.
+fn component_quiet(c: Option<CompSend>, current: QVec2, acked: u64) -> bool {
+    c.is_some_and(|c| c.value == current && acked >= c.run_start)
 }

@@ -23,8 +23,12 @@ stage a (quantization hoisted into the once-per-tick snapshot — byte-identical
 hysteresis — two-radius band `set_aoi_hysteresis`, enter at `r_inner` / exit at `r_outer`, band read-cheat
 preserved) + stage c (opt-in per-client avatar+focus hook — `build_server_app_focused`: a server-owned
 `ControlledBy` avatar per connection, AOI focused on it each net tick, disconnect despawns + prunes
-`PendingInputs`; a client sees only its focus radius over the real pump). Next Phase-3 threads: anti-entropy
-resync, handoff depth, double-ownership coordination.
+`PendingInputs`; a client sees only its focus radius over the real pump). **Handoff depth + anti-entropy
+resync (ADR-0024) DONE:** deep handoff is covered (hand-back, repeated/cycle, packet-loss) and the R6
+cross-sender reordering gap (frozen wrong-owner proxy) now HEALS via a digest→request→`ResyncSpawn` resync
+round (the owner privileged-corrects the proxy owner + state; own-authority + responder-owns + AOI re-guards).
+Next Phase-3 threads: double-ownership coordination / host-migration (also heals the E4 never-witnessed-owner
+orphan resync can't); the production-pump resync cadence.
 
 ## Done
 - **Cargo workspace** — virtual manifest, 9 crates under `crates/*` (glob members),

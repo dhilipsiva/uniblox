@@ -11,11 +11,13 @@
 use serde::{Deserialize, Serialize};
 
 /// Wire-format version, checked on decode. Bump on ANY message-shape change.
-/// v3 (ADR-0022 / Phase 3): `StateMsg` gains `tick` (the authoritative sim tick
-/// the snapshot was sampled at — the interpolation buffer's time axis) and
-/// `last_input` (the recipient's newest input reflected in these entries — the
-/// reconciliation marker). v2 added `NetEvent::Ack`. Pre-release hard cutover.
-pub const WIRE_VERSION: u8 = 3;
+/// v4 (ADR-0024 / Phase 3): anti-entropy resync — `NetEvent` gains `Digest`
+/// (a sender's per-peer summary of the entities it owns, for divergence
+/// detection), `ResyncRequest` (a receiver asks the owner to re-assert ids it
+/// diverged on), and `ResyncSpawn` (the owner's privileged create-or-correct
+/// that heals a frozen wrong-owner / orphaned proxy). v3 (ADR-0022): `StateMsg`
+/// gains `tick` + `last_input`. v2 added `NetEvent::Ack`. Pre-release hard cutover.
+pub const WIRE_VERSION: u8 = 4;
 
 /// Fixed-point quantization scale: world units × 1024.
 ///
@@ -137,6 +139,18 @@ impl StateEntry {
     }
 }
 
+/// One entry in an anti-entropy [`NetEvent::Digest`] (ADR-0024): a sender
+/// summarizing an entity it currently owns. The owner is IMPLICIT — the digest
+/// sender. `state_hash` is `Some(fnv32(qpos, qvel))` ONLY for an entity that is
+/// confirmed + quiet for the recipient (so a divergence on an otherwise-silent
+/// value is still detectable); `None` for an entity still active in the delta
+/// stream (an owner mismatch is caught without a hash).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DigestEntry {
+    pub id: NetEntityId,
+    pub state_hash: Option<u32>,
+}
+
 /// A durable event on the RELIABLE, ORDERED events channel. No seq field —
 /// SCTP ordering is the mechanism (adding one would invite misuse).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -173,6 +187,25 @@ pub enum NetEvent {
     /// advances contiguously). `seq` is per-controlled-entity monotonic;
     /// `intent` is the quantized desired velocity.
     Input { seq: u64, intent: QVec2 },
+    /// Anti-entropy DIGEST (ADR-0024): the sender summarizes the entities it
+    /// currently owns for ONE recipient, so the recipient can detect a diverged
+    /// proxy (missing, frozen at a wrong owner after a cross-sender reorder, or a
+    /// stale silent value) and request a resync. Directed, per-peer. Ephemeral.
+    Digest { entries: Vec<DigestEntry> },
+    /// Anti-entropy RESYNC REQUEST (ADR-0024): the recipient of a `Digest` asks
+    /// the sender (the current owner) to re-assert these ids it diverged on.
+    /// Directed (receiver → owner). Ephemeral.
+    ResyncRequest { ids: Vec<NetEntityId> },
+    /// Anti-entropy RESYNC SPAWN (ADR-0024): the current owner's PRIVILEGED
+    /// create-or-correct. Re-asserts an entity's existence, owner (the sender),
+    /// and state — healing a frozen wrong-owner proxy (owner override) or an
+    /// orphan (create). No owner field: the sender IS the asserted owner
+    /// (identity is not authority; `id.spawner` is unchanged). Reliable, directed.
+    ResyncSpawn {
+        id: NetEntityId,
+        pos: QVec2,
+        vel: QVec2,
+    },
 }
 
 /// Wire encode/decode errors. Decode failures are expected runtime events
@@ -254,6 +287,43 @@ mod tests {
         let bytes = encode_event(&msg).expect("encode");
         let back = decode_event(&bytes).expect("decode");
         assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn resync_events_round_trip() {
+        let id = NetEntityId {
+            spawner: PeerId(1),
+            index: 5,
+            generation: 0,
+        };
+        for event in [
+            NetEvent::Digest {
+                entries: vec![
+                    DigestEntry {
+                        id,
+                        state_hash: Some(0xdead_beef),
+                    },
+                    DigestEntry {
+                        id,
+                        state_hash: None,
+                    },
+                ],
+            },
+            NetEvent::ResyncRequest { ids: vec![id] },
+            NetEvent::ResyncSpawn {
+                id,
+                pos: quantize_vec2(1.5, -2.0),
+                vel: quantize_vec2(0.25, 0.0),
+            },
+        ] {
+            let msg = EventMsg {
+                version: WIRE_VERSION,
+                sig: None,
+                event,
+            };
+            let bytes = encode_event(&msg).expect("encode");
+            assert_eq!(decode_event(&bytes).expect("decode"), msg);
+        }
     }
 
     #[test]

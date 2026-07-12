@@ -190,12 +190,12 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
     **snap-apply** (interpolation buffers are Phase 3; smoothing is the render boundary's job).
   - **Handoff:** initiator flips local `Owner` the same tick it queues the reliable Transfer ⇒ no
     double-authority window (≤½-RTT nobody-simulates freeze is the safe direction).
-- **Accepted gaps (documented + warn-logged; healed by Phase-3 anti-entropy resync — do NOT fix ad hoc):**
-  cross-sender event reordering after handoffs (Despawn-before-Spawn orphan; chained A→B→C transfers can
-  leave a fourth peer with a frozen wrong-owner proxy); late-join replay excludes entities the spawner no
-  longer owns; no peer-departure cleanup yet (`last_seq`/proxy maps grow; departed peers' proxies freeze —
-  Phase 3's owner-drop reassignment + session lifecycle own this). Bevy-0.19 note: a long-lived
-  `SystemState` outside schedules is not tick-clamped — recreate periodically on the Mode-3 server.
+- **Accepted gaps (documented + warn-logged):** cross-sender event reordering after handoffs (Despawn-before-
+  Spawn orphan; chained A→B→C transfers can leave a fourth peer with a frozen wrong-owner proxy) — **now HEALED
+  by ADR-0024 anti-entropy resync (do NOT fix ad hoc — resync corrects it)**; late-join replay excludes
+  entities the spawner no longer owns; no peer-departure cleanup yet (`last_seq`/proxy maps grow; departed
+  peers' proxies freeze — Phase 3's owner-drop reassignment + session lifecycle own this). Bevy-0.19 note: a
+  long-lived `SystemState` outside schedules is not tick-clamped — recreate periodically on the Mode-3 server.
 - **Status:** Accepted (2026-07-10).
 
 ## ADR-0014 — The authority-swap gate: PASSED
@@ -774,3 +774,51 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   correct by A2/D1); the shared-per-tick snapshot's remaining perf (two `in_radius` scans + an unbounded-peer
   clone); AOI-focus for a REAL controllable client (this exercises the server hook with a stub client — a
   moving avatar's focus already follows it).
+
+## ADR-0024 — Handoff depth + anti-entropy resync (heals the R6 cross-sender reordering gap)
+- **Context:** the "handoff depth" item needed deterministic coverage for hand-back (A→B→A), repeated/cycle
+  transfers, and handoff under packet loss (all worked already — just untested), PLUS the chained-transfer
+  cross-sender **reordering** gap (R6): in A→B→C an observer D that receives T2(B→C) before T1(A→B) drops T2
+  (`owner!=from`), then T1 flips D to owner B, leaving D FROZEN at B while the real owner is C — C's state
+  rejected forever (F1 withholds C's whole ack stream). The ADRs reserved R6 for anti-entropy resync (no
+  ad-hoc fix); resync was entirely unbuilt. Per the user's decision, this item BUILDS resync so R6 heals,
+  absorbing most of the separate resync TODO item.
+- **Stage 1 — positive-depth tests (Accepted 2026-07-12, tests-only):** Group R in `two_world.rs` — hand-back
+  (A applies the new owner's state to its OWN original entity, then re-adopts via the persistent id-map and
+  re-baselines full-mask), repeated/cycle (identity stable on the wire across every hop; a white-box guard for
+  the previously-UNTESTED transfer-away re-baseline drop), packet-loss (a dropped/reordered state packet heals
+  via the fresh owner's delta; stale old-owner state dropped by the owner gate — verified discriminating), and
+  `r6_chained_reorder_freezes_observer_at_wrong_owner` which PINS the R6 gap. No production change; audited →
+  MERGE (fixed a vacuous-loss-test blocker: the fresh-owner value coincided with the stale one).
+- **Stage 2 — anti-entropy resync (Accepted 2026-07-12):** a **digest → request → ResyncSpawn** protocol, all
+  on the RELIABLE channel (`WIRE_VERSION` 3→4). Divergence detection: the owner periodically sends a per-peer
+  `NetEvent::Digest` (a `{id, state_hash: Option<u32>}` list over `known[peer] ∩ owned`; owner IMPLICIT =
+  sender; `state_hash = Some(fnv32(qpos,qvel))` ONLY for a confirmed+UNCHANGED value so a moving entity never
+  false-triggers, `None` otherwise). The receiver flags each id diverged (missing / `owner!=from` — the R6
+  case, caught with no hash / same-owner hash-mismatch — a stale silent value; skips `owner==local`) and pulls
+  with a directed `NetEvent::ResyncRequest{ids}`. The owner answers with a privileged
+  `NetEvent::ResyncSpawn{id,pos,vel}` per id it STILL owns (authority Local) in the requester's AOI — the
+  **responder-owns + AOI re-filter** (no ownership theft, no out-of-AOI leak, self-correcting under a
+  concurrent handoff). The receiver's `ResyncSpawn` handler is the **healing primitive**: an own-authority
+  guard (never overwrite an entity WE own), then create-or-correct — set `Owner:=from`, snap state, flush the
+  `InterpBuffer` (bypassing the `owner!=from` and, for orphans, `spawner!=from` gates; sound because `from` IS
+  the current authority in the Mode-2-coordinator / Mode-3-server envelope; identity ≠ authority, the id's
+  spawner is unchanged; a CREATE never mints in OUR namespace — auditor F1). No new ack path: after the owner
+  flip, C's next normal state passes the gate → `applied_seq` advances → the frozen ack unblocks. Test-drivable
+  (`collect_resync`/`drain_resync_requests`/`drain_resync_responses`, no timers). `collect_all` byte-identical.
+- **Boundary (honest, NOT healed here):** E4 — a never-witnessed adopted-owner orphan where NO peer holds a
+  `Local` proxy for `e` (nobody can digest or answer for it) — needs the coordinator / host-migration item.
+  The digest/refetch heals R6 (frozen wrong-owner) + the C-still-owns missing-proxy orphan + a stale silent
+  value; it cannot heal E4.
+- **Evidence:** two_world 86 green (R6-1 pins the gap, R6-2 heals it — one round corrects owner B→C, C's state
+  applies, the ack unblocks; R6-3/R6-4 the responder-owns + own-authority adversarial guards, both fail with
+  their guard removed; R6-5 the hash-mismatch path); protocol codec round-trip; full workspace green (the
+  `WIRE_VERSION` bump breaks nothing); clippy `-D warnings` native + wasm32; fmt clean. netcode-audited →
+  MERGE (sound within the trust envelope; the two bypassed gates correctly re-guarded; auditor F1 mint-guard +
+  F2 peer-sort + F3 hash-mismatch test + F4 idempotency assertion all actioned).
+- **Deviation from the design:** the `Digest` rides the RELIABLE channel (a `NetEvent` variant) rather than a
+  new unreliable state-channel message — simpler (no channel disambiguation), the reliability cost is small
+  (periodic, compact, on a slow cadence). **Deferred:** production-pump wiring of `collect_resync` on a slow
+  virtual-clock cadence; per-entry ack granularity; E4/coordinator healing.
+- **Status:** Stages 1 + 2 ACCEPTED (2026-07-12) — the handoff-depth item is complete; the separate
+  anti-entropy-resync TODO item is largely absorbed (only the pump cadence + E4/coordinator remain).
