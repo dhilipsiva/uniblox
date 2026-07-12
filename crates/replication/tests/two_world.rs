@@ -3832,3 +3832,291 @@ fn resync_value_heal_ignores_lower_rank() {
         "rank unchanged by a value heal"
     );
 }
+
+// ═════ Group AK-H — coordinator claim/commit/reject handshake (ADR-0025 A) ═════
+
+/// A coordinator-arbitration mesh: O=PeerId(4) owns e; coord=PeerId(1) is the
+/// LOWEST live peer (the coordinator); x=PeerId(2) and y=PeerId(3) are claimants.
+/// Every peer tracks the other three (so all agree coordinator == 1), and
+/// coord/x/y each hold a proxy for e. Returns
+/// (o, coord, x, y, e, proxy_coord, proxy_x, proxy_y).
+#[allow(clippy::type_complexity)]
+fn coord_mesh() -> (
+    TestPeer,
+    TestPeer,
+    TestPeer,
+    TestPeer,
+    Entity,
+    Entity,
+    Entity,
+    Entity,
+) {
+    let mut o = TestPeer::new(4);
+    let mut coord = TestPeer::new(1);
+    let mut x = TestPeer::new(2);
+    let mut y = TestPeer::new(3);
+    let e = o.spawn(1.0, 2.0, 0.0, 0.0);
+    o.track(coord.id);
+    o.track(x.id);
+    o.track(y.id);
+    let outs = o.collect_all();
+    coord.deliver_all(o.id, outbox_for(&outs, coord.id).unwrap());
+    x.deliver_all(o.id, outbox_for(&outs, x.id).unwrap());
+    y.deliver_all(o.id, outbox_for(&outs, y.id).unwrap());
+    let proxy_coord = coord.entity_owned_by(o.id);
+    let proxy_x = x.entity_owned_by(o.id);
+    let proxy_y = y.entity_owned_by(o.id);
+    // Membership: everyone tracks everyone (so all compute coordinator == 1).
+    coord.track(o.id);
+    coord.track(x.id);
+    coord.track(y.id);
+    x.track(o.id);
+    x.track(coord.id);
+    x.track(y.id);
+    y.track(o.id);
+    y.track(coord.id);
+    y.track(x.id);
+    (o, coord, x, y, e, proxy_coord, proxy_x, proxy_y)
+}
+
+/// Route a claim from `claimant` to the coordinator (asserting it targets `coord`).
+fn route_claim(claimant: &mut TestPeer, proxy: Entity, coord: &mut TestPeer) {
+    if let Some((target, bytes)) = claimant.repl.claim_ownership(&mut claimant.world, proxy) {
+        assert_eq!(target, coord.id, "a claim routes to the coordinator");
+        coord
+            .repl
+            .apply_events(&mut coord.world, claimant.id, &bytes);
+    }
+}
+
+/// Deliver each directed message from the coordinator to whichever peer it targets.
+fn route_all(msgs: &[(PeerId, Box<[u8]>)], from: PeerId, peers: &mut [&mut TestPeer]) {
+    for (target, bytes) in msgs {
+        if let Some(p) = peers.iter_mut().find(|p| p.id == *target) {
+            p.repl.apply_events(&mut p.world, from, bytes);
+        }
+    }
+}
+
+/// AK-H1 — two SIMULTANEOUS claims resolve to exactly ONE committed owner by
+/// coordinator sequence number, the loser is explicitly rejected, the prior owner
+/// demotes (no double authority). The 145/148 acceptance.
+#[test]
+fn two_claims_resolve_to_one_committed_owner() {
+    let (mut o, mut coord, mut x, mut y, e, proxy_coord, proxy_x, proxy_y) = coord_mesh();
+
+    // X and Y both claim e; each routes to the coordinator (peer 1).
+    route_claim(&mut x, proxy_x, &mut coord);
+    route_claim(&mut y, proxy_y, &mut coord);
+
+    // The coordinator arbitrates: winner = the lowest-id claimant = X(2).
+    let msgs = coord.repl.drain_commits(&mut coord.world);
+
+    // Inspect the directed output BEFORE routing it.
+    let mut commit_owners = Vec::new();
+    let mut rejects_to = Vec::new();
+    for (target, bytes) in &msgs {
+        match decode_event(bytes).unwrap().event {
+            NetEvent::OwnershipCommit { new_owner, .. } => commit_owners.push(new_owner),
+            NetEvent::ClaimRejected { .. } => rejects_to.push(*target),
+            _ => {}
+        }
+    }
+    assert!(
+        !commit_owners.is_empty() && commit_owners.iter().all(|w| *w == x.id),
+        "every commit names exactly the one winner X"
+    );
+    assert_eq!(rejects_to, vec![y.id], "exactly the loser Y is rejected");
+
+    route_all(&msgs, coord.id, &mut [&mut o, &mut x, &mut y]);
+
+    // Outcome: X wins (Local), Y re-tags to X, the coordinator's proxy re-tags,
+    // and the prior owner O demotes — no double authority anywhere.
+    assert_eq!(x.owner(proxy_x), x.id, "winner X assumes authority");
+    assert_eq!(y.owner(proxy_y), x.id, "loser Y re-tags to the winner X");
+    assert_eq!(
+        coord.owner(proxy_coord),
+        x.id,
+        "coordinator's proxy re-tags to X"
+    );
+    assert_eq!(
+        o.owner(e),
+        x.id,
+        "prior owner O demotes (no double authority)"
+    );
+    let _ = e;
+}
+
+/// AK-H2 — no authority is assumed PRE-COMMIT: a claim flips nothing locally; the
+/// claimant stays a remote proxy until it receives its own commit.
+#[test]
+fn claim_assumes_no_authority_pre_commit() {
+    let (o, _coord, mut x, _y, _e, _pc, proxy_x, _py) = coord_mesh();
+    assert_eq!(x.owner(proxy_x), o.id, "before: X's proxy is owned by O");
+
+    let routed = x.repl.claim_ownership(&mut x.world, proxy_x);
+    assert!(routed.is_some(), "X (not the coordinator) routes a claim");
+    assert_eq!(
+        x.owner(proxy_x),
+        o.id,
+        "X assumes NO authority pre-commit — its Owner is unchanged"
+    );
+}
+
+/// AK-H3 — a rejected loser can RE-CLAIM and win a later round: Y loses round 1,
+/// then re-claims as the sole claimant in round 2 and wins (its `{2,coord}`
+/// commit outranks X's `{1,coord}`), demoting the former winner X.
+#[test]
+fn rejected_claimant_can_reclaim_and_win() {
+    let (mut o, mut coord, mut x, mut y, _e, _pc, proxy_x, proxy_y) = coord_mesh();
+
+    // Round 1: X and Y claim; X (lower id) wins, Y is rejected.
+    route_claim(&mut x, proxy_x, &mut coord);
+    route_claim(&mut y, proxy_y, &mut coord);
+    let msgs = coord.repl.drain_commits(&mut coord.world);
+    route_all(&msgs, coord.id, &mut [&mut o, &mut x, &mut y]);
+    assert_eq!(x.owner(proxy_x), x.id, "round 1: X wins");
+    assert_eq!(y.owner(proxy_y), x.id, "round 1: Y re-tags to X");
+
+    // Round 2: the rejected Y re-claims — now the SOLE claimant — and wins.
+    route_claim(&mut y, proxy_y, &mut coord);
+    let msgs = coord.repl.drain_commits(&mut coord.world);
+    route_all(&msgs, coord.id, &mut [&mut o, &mut x, &mut y]);
+    assert_eq!(
+        y.owner(proxy_y),
+        y.id,
+        "round 2: the re-claiming Y now wins"
+    );
+    assert_eq!(
+        x.owner(proxy_x),
+        y.id,
+        "and the former winner X demotes to Y"
+    );
+}
+
+/// AK-H4 — a claim mis-routed to a NON-coordinator is ignored (records nothing,
+/// arbitrates nothing) — only the lowest live peer arbitrates.
+#[test]
+fn claim_to_non_coordinator_is_ignored() {
+    let (o, _coord, mut x, _y, e, _pc, _px, _py) = coord_mesh();
+    // X=PeerId(2) is not the coordinator (peer 1 is). Hand it a claim directly.
+    let id = net_id(o.id, e);
+    let claim = encode_event(&EventMsg {
+        version: WIRE_VERSION,
+        sig: None,
+        event: NetEvent::ClaimOwnership { id },
+    })
+    .expect("encode");
+    x.repl.apply_events(&mut x.world, PeerId(3), &claim);
+    assert!(
+        !x.repl.has_pending_claim(id),
+        "a claim to a non-coordinator records nothing"
+    );
+    assert!(
+        x.repl.drain_commits(&mut x.world).is_empty(),
+        "a non-coordinator arbitrates nothing"
+    );
+}
+
+/// AK-H5 — coordinator-migration robustness: equal-seq commits from an OLD
+/// (lower-id) and a NEW (higher-id) coordinator resolve toward the NEWER
+/// coordinator via the `OwnerSeq` tiebreak, regardless of arrival order.
+#[test]
+fn newer_coordinator_commit_wins_equal_seq_tie() {
+    let mut o = TestPeer::new(9); // spawner/owner (id irrelevant here)
+    let mut d = TestPeer::new(5); // observer
+    let e = o.spawn(0.0, 0.0, 0.0, 0.0);
+    d.deliver_all(o.id, &o.collect_for(d.id));
+    let proxy = d.entity_owned_by(o.id);
+    let id = net_id(o.id, e);
+
+    let commit = |new_owner: PeerId, coordinator: PeerId| {
+        encode_event(&EventMsg {
+            version: WIRE_VERSION,
+            sig: None,
+            event: NetEvent::OwnershipCommit {
+                id,
+                new_owner,
+                seq: OwnerSeq {
+                    seq: 5,
+                    coordinator,
+                },
+            },
+        })
+        .expect("encode")
+    };
+
+    // Old coordinator (id 1) commits {5,1} -> owner 7.
+    d.repl
+        .apply_events(&mut d.world, PeerId(1), &commit(PeerId(7), PeerId(1)));
+    assert_eq!(d.owner(proxy), PeerId(7));
+
+    // New coordinator (id 2) commits {5,2} at the SAME seq -> wins the tie -> 8.
+    d.repl
+        .apply_events(&mut d.world, PeerId(2), &commit(PeerId(8), PeerId(2)));
+    assert_eq!(
+        d.owner(proxy),
+        PeerId(8),
+        "the newer (higher-id) coordinator wins the equal-seq tie"
+    );
+
+    // Re-deliver the OLD coordinator's commit (reorder) — dropped (lower rank).
+    d.repl
+        .apply_events(&mut d.world, PeerId(1), &commit(PeerId(7), PeerId(1)));
+    assert_eq!(
+        d.owner(proxy),
+        PeerId(8),
+        "the stale old-coordinator commit is dropped"
+    );
+}
+
+/// AK-H6 — a claim the coordinator CANNOT arbitrate (an entity it does not track —
+/// e.g. outside its AOI) is REJECTED, not silently black-holed, so the claimant
+/// re-routes/retries instead of hanging (auditor MAJOR).
+#[test]
+fn unarbitrable_claim_is_rejected_not_blackholed() {
+    let mut coord = TestPeer::new(1); // lowest id → the coordinator
+    let claimant = PeerId(2);
+    coord.track(claimant); // membership: coordinator(1) == 1
+    // A claim for an id the coordinator has never seen (no proxy → un-arbitrable).
+    let id = NetEntityId {
+        spawner: PeerId(9),
+        index: 42,
+        generation: 0,
+    };
+    let claim = encode_event(&EventMsg {
+        version: WIRE_VERSION,
+        sig: None,
+        event: NetEvent::ClaimOwnership { id },
+    })
+    .expect("encode");
+    coord.repl.apply_events(&mut coord.world, claimant, &claim);
+    assert!(
+        coord.repl.has_pending_claim(id),
+        "the coordinator recorded the claim"
+    );
+
+    let msgs = coord.repl.drain_commits(&mut coord.world);
+    let rejected: Vec<PeerId> = msgs
+        .iter()
+        .filter(|(_, b)| {
+            matches!(
+                decode_event(b).unwrap().event,
+                NetEvent::ClaimRejected { .. }
+            )
+        })
+        .map(|(t, _)| *t)
+        .collect();
+    assert_eq!(
+        rejected,
+        vec![claimant],
+        "the un-arbitrable claim is explicitly rejected (no silent black-hole)"
+    );
+    assert!(
+        msgs.iter().all(|(_, b)| matches!(
+            decode_event(b).unwrap().event,
+            NetEvent::ClaimRejected { .. }
+        )),
+        "and NO commit is emitted for an entity we can't arbitrate"
+    );
+}
