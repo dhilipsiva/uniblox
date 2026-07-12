@@ -9,7 +9,10 @@
 //! is unchanged from the ADR-0020 delta slice.
 
 use bevy_ecs::prelude::*;
-use engine_core::{Owner, Position, Velocity, insert_sim, simulate, spawn_owned};
+use engine_core::{
+    INTERP_DELAY_TICKS, Owner, Position, RenderPos, RenderTick, Tick, Velocity, copy_owned_render,
+    insert_sim, interpolate, simulate, spawn_owned,
+};
 use protocol::{
     EventMsg, NetEntityId, NetEvent, PeerId, StateEntry, WIRE_VERSION, decode_event, decode_state,
     encode_event,
@@ -24,6 +27,7 @@ struct TestPeer {
     id: PeerId,
     world: World,
     schedule: Schedule,
+    render: Schedule,
     repl: Replication,
 }
 
@@ -33,11 +37,18 @@ impl TestPeer {
         insert_sim(&mut world, PeerId(id), DT);
         let mut schedule = Schedule::default();
         schedule.add_systems(simulate);
+        // The render step (ADR-0022): interpolated remotes lerp their snapshot
+        // buffer, then owned entities copy Position — both write only RenderPos,
+        // so copy_owned_render runs LAST (an adopted entity may still carry a
+        // stale InterpBuffer; Local authority must win). Chained for that order.
+        let mut render = Schedule::default();
+        render.add_systems((interpolate, copy_owned_render).chain());
         let repl = Replication::new(&mut world);
         TestPeer {
             id: PeerId(id),
             world,
             schedule,
+            render,
             repl,
         }
     }
@@ -53,6 +64,27 @@ impl TestPeer {
 
     fn sim_tick(&mut self) {
         self.schedule.run(&mut self.world);
+    }
+
+    /// Set the authoritative sim tick stamped into this peer's outgoing
+    /// snapshots (the interpolation time axis).
+    fn set_tick(&mut self, t: u64) {
+        self.world.insert_resource(Tick(t));
+    }
+
+    /// Set the interpolation render clock (sim-tick units; virtual — no wall
+    /// clock), then run the render step.
+    fn set_render_tick(&mut self, t: f64) {
+        self.world.insert_resource(RenderTick(t));
+    }
+
+    /// Run one render step (copy-owned + interpolate) — updates `RenderPos`.
+    fn run_render(&mut self) {
+        self.render.run(&mut self.world);
+    }
+
+    fn render_pos(&self, e: Entity) -> RenderPos {
+        *self.world.get::<RenderPos>(e).unwrap()
     }
 
     /// Track a destination peer so `collect_all` produces its outbox.
@@ -485,6 +517,8 @@ fn receiver_rejects_unowned_sender_state() {
     let forged = protocol::encode_state(&protocol::StateMsg {
         version: protocol::WIRE_VERSION,
         seq: 999,
+        tick: 0,
+        last_input: 0,
         entries: vec![StateEntry {
             id: a_entity_id,
             pos: Some(protocol::quantize_vec2(99.0, 99.0)),
@@ -502,6 +536,8 @@ fn receiver_rejects_unowned_sender_state() {
     let forged = protocol::encode_state(&protocol::StateMsg {
         version: protocol::WIRE_VERSION,
         seq: 1000,
+        tick: 0,
+        last_input: 0,
         entries: vec![StateEntry {
             id: b_entity_id,
             pos: Some(protocol::quantize_vec2(-50.0, -50.0)),
@@ -1594,4 +1630,164 @@ fn adopted_handoff_to_witnessing_peer_completes() {
         q.id,
         "the bare Transfer completes the handoff to the witnessing new owner"
     );
+}
+
+// ═══════════ Stage A — interpolate-others (ADR-0022) ═══════════
+
+/// Buffer two snapshots on B's proxy of A's entity `e`: (tick `t0` @ x=`x0`)
+/// then (tick `t1` @ x=`x1`), y=0. Returns B's proxy entity. Uses the real
+/// sender flow (A stamps its `Tick`, the delta ships the moved position).
+fn two_snapshots(
+    a: &mut TestPeer,
+    b: &mut TestPeer,
+    e: Entity,
+    t0: u64,
+    x0: f32,
+    t1: u64,
+    x1: f32,
+) -> Entity {
+    a.track(b.id);
+    a.world.get_mut::<Position>(e).unwrap().x = x0;
+    a.set_tick(t0);
+    b.deliver_all(a.id, &a.collect_for(b.id)); // Spawn + snapshot @ t0
+    a.world.get_mut::<Position>(e).unwrap().x = x1;
+    a.set_tick(t1);
+    b.deliver_all(a.id, &a.collect_for(b.id)); // snapshot @ t1
+    b.entity_owned_by(a.id)
+}
+
+/// SA1 — the render position lerps between the two snapshots bracketing
+/// `RenderTick − DELAY`.
+#[test]
+fn interp_lerps_between_two_snapshots() {
+    let mut a = TestPeer::new(1);
+    let mut b = TestPeer::new(2);
+    let e = a.spawn(0.0, 0.0, 0.0, 0.0);
+    let proxy = two_snapshots(&mut a, &mut b, e, 100, 0.0, 120, 20.0);
+    // Sample at tick 110 (midpoint of 100..120) ⇒ lerp 0.5 ⇒ x = 10.
+    b.set_render_tick(110.0 + INTERP_DELAY_TICKS);
+    b.run_render();
+    assert!(approx(b.render_pos(proxy).x, 10.0), "midpoint lerp");
+}
+
+/// SA1b — a 3+-snapshot buffer: the interior bracket search picks the correct
+/// segment (guards the loop that a 2-point buffer never exercises).
+#[test]
+fn interp_lerps_across_three_snapshots() {
+    let mut a = TestPeer::new(1);
+    let mut b = TestPeer::new(2);
+    let e = a.spawn(0.0, 0.0, 0.0, 0.0);
+    a.track(b.id);
+    for (t, x) in [(100u64, 0.0f32), (110, 10.0), (120, 20.0)] {
+        a.world.get_mut::<Position>(e).unwrap().x = x;
+        a.set_tick(t);
+        b.deliver_all(a.id, &a.collect_for(b.id));
+    }
+    let proxy = b.entity_owned_by(a.id);
+    // First interior segment (100..110): target 105 ⇒ x = 5.
+    b.set_render_tick(105.0 + INTERP_DELAY_TICKS);
+    b.run_render();
+    assert!(approx(b.render_pos(proxy).x, 5.0), "first-segment lerp");
+    // Second interior segment (110..120): target 115 ⇒ x = 15.
+    b.set_render_tick(115.0 + INTERP_DELAY_TICKS);
+    b.run_render();
+    assert!(approx(b.render_pos(proxy).x, 15.0), "second-segment lerp");
+}
+
+/// SA2 — with `RenderTick` at the newest snapshot's tick, the entity renders
+/// DELAY behind the newest, not at it.
+#[test]
+fn interp_renders_at_fixed_delay() {
+    let mut a = TestPeer::new(1);
+    let mut b = TestPeer::new(2);
+    let e = a.spawn(0.0, 0.0, 0.0, 0.0);
+    let proxy = two_snapshots(&mut a, &mut b, e, 100, 0.0, 120, 20.0);
+    b.set_render_tick(120.0); // target = 120 − 6.4 = 113.6 ⇒ x = 13.6
+    b.run_render();
+    let x = b.render_pos(proxy).x;
+    assert!(approx(x, 13.6), "renders at the delay (got {x})");
+    assert!(x < 20.0 - TOL, "must lag behind the newest snapshot");
+}
+
+/// SA3 — sampling PAST the newest snapshot clamps to the newest — never
+/// extrapolates (a receiver must not re-simulate others).
+#[test]
+fn interp_underrun_clamps_no_extrapolation() {
+    let mut a = TestPeer::new(1);
+    let mut b = TestPeer::new(2);
+    let e = a.spawn(0.0, 0.0, 0.0, 0.0);
+    let proxy = two_snapshots(&mut a, &mut b, e, 100, 0.0, 120, 20.0);
+    b.set_render_tick(1000.0); // target far past the newest tick
+    b.run_render();
+    assert!(
+        approx(b.render_pos(proxy).x, 20.0),
+        "clamp to the newest, never extrapolate"
+    );
+}
+
+/// SA4 — sampling BEFORE the oldest snapshot clamps to the oldest.
+#[test]
+fn interp_overrun_clamps_to_oldest() {
+    let mut a = TestPeer::new(1);
+    let mut b = TestPeer::new(2);
+    let e = a.spawn(0.0, 0.0, 0.0, 0.0);
+    let proxy = two_snapshots(&mut a, &mut b, e, 100, 0.0, 120, 20.0);
+    b.set_render_tick(0.0); // target = −6.4 < oldest tick 100
+    b.run_render();
+    assert!(approx(b.render_pos(proxy).x, 0.0), "clamp to the oldest");
+}
+
+/// SA5 ★ interpolation writes ONLY `RenderPos`; the authoritative `Position`
+/// stays the last snapped value (bit-identical) — the invariant that receivers
+/// never re-simulate others' entities.
+#[test]
+fn interp_does_not_touch_authoritative_position() {
+    let mut a = TestPeer::new(1);
+    let mut b = TestPeer::new(2);
+    let e = a.spawn(0.0, 0.0, 0.0, 0.0);
+    let proxy = two_snapshots(&mut a, &mut b, e, 100, 0.0, 120, 20.0);
+    let auth_before = b.pos(proxy); // last snapped = (20, 0)
+    b.set_render_tick(120.0); // renders behind (13.6)
+    b.run_render();
+    let auth_after = b.pos(proxy);
+    assert_eq!(
+        auth_before.x.to_bits(),
+        auth_after.x.to_bits(),
+        "interpolation must not touch the authoritative Position"
+    );
+    assert_eq!(auth_before.y.to_bits(), auth_after.y.to_bits());
+    assert!(
+        (b.render_pos(proxy).x - auth_after.x).abs() > TOL,
+        "RenderPos lags the authoritative Position"
+    );
+}
+
+/// SA6 — the sender stamps its authoritative `Tick` into the snapshot (the
+/// interpolation time axis).
+#[test]
+fn collect_all_stamps_tick() {
+    let mut a = TestPeer::new(1);
+    let b = PeerId(2);
+    a.spawn(1.0, 1.0, 0.0, 0.0);
+    a.set_tick(777);
+    let out = a.collect_for(b);
+    let msg = decode_state(out.state.as_ref().unwrap()).unwrap();
+    assert_eq!(msg.tick, 777, "the sender stamps its authoritative tick");
+}
+
+/// SA7 — an OWNED entity renders at its authoritative (locally-simulated)
+/// position: `RenderPos` tracks `Position`.
+#[test]
+fn owned_render_tracks_position() {
+    let mut a = TestPeer::new(1);
+    let e = a.spawn(3.0, 4.0, 2.0, 0.0);
+    a.sim_tick(); // owned: Local arm integrates Position
+    a.run_render(); // copy_owned_render: RenderPos = Position
+    let auth = a.pos(e);
+    let r = a.render_pos(e);
+    assert!(
+        approx(r.x, auth.x) && approx(r.y, auth.y),
+        "owned render tracks the authoritative Position"
+    );
+    assert!(auth.x > 3.0, "owned entity moved under the local sim");
 }

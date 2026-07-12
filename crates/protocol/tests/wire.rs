@@ -69,6 +69,8 @@ fn state_msg_round_trip_exact() {
     let msg = StateMsg {
         version: WIRE_VERSION,
         seq: 42,
+        tick: 9001,
+        last_input: 17,
         entries: vec![
             StateEntry {
                 id: id(1, 7, 0),
@@ -120,6 +122,8 @@ fn changed_only_entry_smaller_and_mask_matches() {
     let wrap = |e: StateEntry| StateMsg {
         version: WIRE_VERSION,
         seq: 1,
+        tick: 0,
+        last_input: 0,
         entries: vec![e],
     };
     let pos_only_len = encode_state(&wrap(pos_only)).unwrap().len();
@@ -174,6 +178,8 @@ fn decode_rejects_wrong_version() {
     let state = StateMsg {
         version: WIRE_VERSION + 1,
         seq: 1,
+        tick: 0,
+        last_input: 0,
         entries: vec![],
     };
     let bytes = postcard::to_stdvec(&state).unwrap();
@@ -201,6 +207,8 @@ fn decode_never_panics_on_garbage() {
     let valid = encode_state(&StateMsg {
         version: WIRE_VERSION,
         seq: u64::MAX,
+        tick: u64::MAX,
+        last_input: u64::MAX,
         entries: vec![StateEntry {
             id: id(u64::MAX, u32::MAX - 1, u32::MAX),
             pos: Some(QVec2 {
