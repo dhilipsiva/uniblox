@@ -9,8 +9,9 @@ function of the transport UUID; all peers must agree), spawner-stable `NetEntity
 `(spawner,index,generation)` — the ADR-0021 sender emits Spawns/state/despawns in this order for
 DETERMINISTIC per-peer wire output; the ordering has no wire meaning), quantization
 (`QUANT_SCALE`=1024, tolerance ≤1/2048 for |v|≤16384, saturating), `StateMsg`/`StateEntry`
-(Options-only presence, derived mask, ABSOLUTE values — never arithmetic deltas), `EventMsg` with
-the reserved-but-None signature field (Phase 6), versioned postcard codecs (mismatch → clean Err).
+(Options-only presence, derived mask, ABSOLUTE values — never arithmetic deltas; `StateMsg` also carries
+`tick` — the interpolation time axis — and `last_input` — the reconciliation marker, ADR-0022), `EventMsg` with
+the reserved-but-None signature field (Phase 6), versioned postcard codecs (mismatch → clean Err). **`WIRE_VERSION`=3.**
 The `{engine, content, schema}` version triple lands in Phase 5.
 
 ## Crate-local invariants

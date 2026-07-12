@@ -66,7 +66,10 @@ use std::collections::{HashMap, HashSet};
 
 use bevy_ecs::prelude::*;
 use bevy_ecs::system::SystemState;
-use engine_core::{Authority, LocalPeer, Owner, Position, Velocity, authority_of, spawn_owned};
+use engine_core::{
+    Authority, InterpBuffer, LocalPeer, Owner, Position, Snapshot, Tick, Velocity, authority_of,
+    push_snapshot, spawn_owned,
+};
 use protocol::{
     EventMsg, NetEntityId, NetEvent, PeerId, QVec2, StateEntry, StateMsg, WIRE_VERSION,
     decode_event, decode_state, dequantize, encode_event, encode_state, quantize_vec2,
@@ -298,6 +301,9 @@ impl Replication {
     /// has been told, so a two-peer despawn reaches both).
     pub fn collect_all(&mut self, world: &mut World) -> Vec<(PeerId, Outbox)> {
         let local = world.resource::<LocalPeer>().0;
+        // The authoritative sim tick stamped into every snapshot (ADR-0022), the
+        // interpolation time axis. Absent (a world without the resource) ⇒ 0.
+        let tick = world.get_resource::<Tick>().map_or(0, |t| t.0);
 
         // 1. Snapshot owned+alive rows; mint ids (map only — existence is
         //    announced PER PEER on AOI-enter, never globally); build the grid +
@@ -522,6 +528,10 @@ impl Replication {
                 let msg = StateMsg {
                     version: WIRE_VERSION,
                     seq,
+                    tick,
+                    // last_input is stamped per-peer in Stage B (server
+                    // reconciliation); 0 until then (no input processed).
+                    last_input: 0,
                     entries,
                 };
                 match encode_state(&msg) {
@@ -624,6 +634,7 @@ impl Replication {
         // Withholding the ack keeps the sender re-sending (the value is in every
         // message of its run) until a later message fully applies — bounded,
         // for the state-before-spawn race, by the reliable Spawn's arrival.
+        let msg_tick = msg.tick; // captured before the loop moves msg.entries
         let mut fully_applied = true;
         for entry in msg.entries {
             // Unknown id: state-before-spawn, post-despawn straggler, or
@@ -659,6 +670,24 @@ impl Replication {
             {
                 vel.x = dequantize(q.x);
                 vel.y = dequantize(q.y);
+            }
+            // ADR-0022: record this snapshot for interpolation IF this proxy is
+            // interpolated (carries an InterpBuffer). Uses the current
+            // authoritative Position (post-apply) at the message's tick — a
+            // vel-only entry records the unchanged position (the entity holds
+            // between snapshots). Owned/predicted entities have no buffer ⇒ skip.
+            let cur = world.get::<Position>(proxy).copied();
+            if let Some(pos) = cur
+                && let Some(mut buf) = world.get_mut::<InterpBuffer>(proxy)
+            {
+                push_snapshot(
+                    &mut buf,
+                    Snapshot {
+                        tick: msg_tick,
+                        x: pos.x,
+                        y: pos.y,
+                    },
+                );
             }
         }
         // Ack ONLY a message we fully held. Monotonic across increasing seqs
@@ -718,6 +747,10 @@ impl Replication {
                         y: dequantize(vel.y),
                     },
                 );
+                // ADR-0022: a remote proxy is interpolated — attach its snapshot
+                // buffer. (Stage C removes it if the proxy is later adopted to
+                // Local, or is the locally-controlled predicted avatar.)
+                world.entity_mut(proxy).insert(InterpBuffer::default());
                 self.map.insert(id, proxy, id.spawner);
             }
             NetEvent::Despawn { id } => {

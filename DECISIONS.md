@@ -603,3 +603,54 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   NEVER-witnessed new owner of an adopted entity is orphaned until resync (`in_radius` cost is O(bbox area) —
   no clamp, low-risk since AOI is server-controlled).
 - **Status:** Accepted (2026-07-12).
+
+## ADR-0022 — Prediction / reconciliation / interpolation buffers (predict-own, interpolate-others)
+- **Context:** third Phase-3 replication-depth item. The receiver SNAP-applied remote `Position` (no
+  smoothing) and owned entities had no input. This builds the client-prediction netcode stack:
+  interpolate-others (remotes render ~100 ms behind, lerping buffered snapshots), predict-own (the
+  locally-controlled avatar is simulated from local input immediately), and server reconciliation (the
+  authority's snapshot re-anchors the client's prediction, which replays un-acked inputs). User chose the FULL
+  input-prediction scope (AskUserQuestion). Landed in three audited stages (A→B→C) — the full stack is too
+  large for one HIGH-risk diff (ADR-0020/0021 set the precedent).
+- **The load-bearing idea — role = (authority × control), render is separate.** Two orthogonal axes plus a
+  render-only output that never collide: **authority** (`Owner`/`authority_of` — unchanged: who computes
+  authoritative `Position` and may put state on the wire; the `collect_all` gate is UNTOUCHED); **control**
+  (a `Controlled` marker — which entity THIS instance drives with input; in Mode 3 the client's avatar is
+  `Controlled` AND `authority==Remote`); **render** (a separate `RenderPos` component — the ONLY thing
+  interpolation/prediction write). Prediction NEVER writes authoritative `Position`/`Velocity`, so a
+  predicted avatar (`Remote`) is structurally excluded from `collect_all` (client emits inputs only, never
+  state) — no new gate. Render role is derived: Local⇒copy Position; Remote+not-controlled⇒interpolate;
+  Remote+controlled⇒predict.
+- **Settled-invariant REFINEMENT (recorded, not worked around).** The literal invariant is "receivers never
+  re-simulate others' entities; prediction only touches entities you own — so no two machines must agree on
+  a float" (`docs/CONTEXT.md §28`). Mode-3 client prediction re-simulates the avatar the SERVER owns. The
+  refinement: **prediction re-simulates ONLY the locally-CONTROLLED avatar, and re-anchors to the
+  authoritative snapshot every message**, so cross-machine divergence is bounded by the un-acked-input window
+  and self-corrects each snapshot — it is NOT a determinism *correctness requirement* (lockstep, which makes
+  determinism a correctness requirement, stays rejected). Authoritative `Position` is written ONLY by
+  `simulate`/`apply_state`; render output is the separate `RenderPos`. (The prediction/reconciliation half
+  lands in Stage B.)
+- **Stage A — interpolate-others (this commit).** New engine-core: `RenderPos` (render output — the only
+  thing the render path writes; `spawn_owned` attaches it, seeded to the spawn pos), `Snapshot{tick,x,y}`,
+  `InterpBuffer(VecDeque<Snapshot>)` (capped ring; its PRESENCE marks an entity interpolated), `RenderTick`
+  (interp clock in sim-tick units; app-advanced, tests set it) + `Tick` (authoritative sim tick, advanced by
+  `advance_tick`), `INTERP_DELAY_TICKS=6.4` (~100 ms @ 64 Hz = 2 net ticks); systems `interpolate` (lerp the
+  buffer at `RenderTick − DELAY`, CLAMP out of range — NEVER extrapolate), `copy_owned_render` (Local ⇒
+  `RenderPos=Position`; scheduled AFTER `interpolate` so a Local entity with a still-attached buffer wins),
+  `push_snapshot` (cap-evicting + tick-monotonic — drops an out-of-order/duplicate tick). Wire: `StateMsg`
+  gains `tick` (interp time axis — uniform, loss-immune, deterministic; not arrival time or the delta-warped
+  `seq`) and `last_input` (reserved 0 until Stage B); `WIRE_VERSION 2→3` (one bump for both fields). The
+  RECEIVER's snap-apply of authoritative `Position` is UNCHANGED — `apply_state` additionally pushes a
+  snapshot (the post-apply Position at `msg.tick`) into the proxy's `InterpBuffer` (a pure side-record; a
+  stationary entity goes delta-quiet ⇒ no snapshot ⇒ interpolation holds). The Spawn handler attaches an
+  `InterpBuffer` to each new proxy; the server chains `advance_tick`.
+- **Evidence (Stage A):** two_world 54 tests green (SA1–SA7 + the 3-snapshot interior-lerp: exact lerp,
+  render-at-delay, underrun/overrun clamp with NO extrapolation, `Position` bit-untouched by interp, tick
+  stamped, owned-render tracks Position) + protocol wire round-trips the new fields; full workspace green;
+  clippy `-D warnings` native `--all-targets` + wasm32 (protocol/replication/engine-core); fmt clean.
+  netcode-audited → **MERGE** (auditor NITs folded: the render-system order made explicit + documented, the
+  push-snapshot tick-monotonicity guard, the 3-snapshot test). Documented gaps for later stages: a Mode-2
+  sender must advance `Tick` to actually smooth (else tick=0 ⇒ clamp-to-latest); an entity adopted to/from
+  Local keeps/lacks a buffer until the Stage-C role reset (RenderPos can go stale) — closed in Stage C.
+- **Status:** Stage A accepted (2026-07-12). Stages B (predict + input + reconciliation) and C (handoff
+  interplay) remain — this item is complete when all three are landed.

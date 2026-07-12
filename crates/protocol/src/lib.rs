@@ -11,9 +11,11 @@
 use serde::{Deserialize, Serialize};
 
 /// Wire-format version, checked on decode. Bump on ANY message-shape change.
-/// v2 (ADR-0020 / Phase 3): added `NetEvent::Ack` for delta-vs-last-acked
-/// baseline tracking. Pre-release hard cutover — v1 peers cleanly reject v2.
-pub const WIRE_VERSION: u8 = 2;
+/// v3 (ADR-0022 / Phase 3): `StateMsg` gains `tick` (the authoritative sim tick
+/// the snapshot was sampled at — the interpolation buffer's time axis) and
+/// `last_input` (the recipient's newest input reflected in these entries — the
+/// reconciliation marker). v2 added `NetEvent::Ack`. Pre-release hard cutover.
+pub const WIRE_VERSION: u8 = 3;
 
 /// Fixed-point quantization scale: world units × 1024.
 ///
@@ -105,6 +107,14 @@ pub struct StateMsg {
     pub version: u8,
     /// Per-SENDER monotonic, starting at 1 (0 = receiver's "nothing seen").
     pub seq: u64,
+    /// The authoritative sim tick this snapshot was sampled at (ADR-0022). The
+    /// receiver's interpolation buffer keys on this — a uniform, loss-immune,
+    /// deterministic time axis (unlike arrival time or the delta-warped `seq`).
+    pub tick: u64,
+    /// The recipient's newest input seq reflected in these entries (ADR-0022
+    /// reconciliation marker). Per-peer, since `collect_all` is per-peer: "your
+    /// inputs through this seq are applied here." 0 = none / no input from them.
+    pub last_input: u64,
     pub entries: Vec<StateEntry>,
 }
 

@@ -27,7 +27,7 @@ use bevy_app::{App, AppExit, FixedUpdate, ScheduleRunnerPlugin, TaskPoolPlugin, 
 use bevy_ecs::message::Messages;
 use bevy_ecs::prelude::*;
 use bevy_time::{Fixed, Time, TimePlugin, Virtual};
-use engine_core::{Position, SimDt, Velocity, insert_sim, simulate, spawn_owned};
+use engine_core::{Position, SimDt, Velocity, advance_tick, insert_sim, simulate, spawn_owned};
 use protocol::PeerId;
 use replication::Replication;
 use transport::{PeerState, Transport};
@@ -199,7 +199,12 @@ pub fn build_server_app(transport: Transport, local: PeerId, entity_count: usize
         repl,
         acc: Duration::ZERO,
     });
-    app.add_systems(FixedUpdate, (sync_sim_dt, count_tick, simulate).chain());
+    // `advance_tick` bumps engine_core::Tick (the snapshot time axis, ADR-0022);
+    // `count_tick` keeps the server-local TickCount (the 64 Hz evidence test).
+    app.add_systems(
+        FixedUpdate,
+        (sync_sim_dt, count_tick, advance_tick, simulate).chain(),
+    );
     app.add_systems(Update, net_pump);
     app
 }

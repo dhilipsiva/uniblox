@@ -14,6 +14,17 @@ re-integrate velocity. `spawn_owned` is the sole sim-entity construction path.
 8 tests green incl. the Mode-2 two-perspective and Mode-3 shape proofs (the
 authority-swap demonstrated at the unit level, before transport exists).
 
+**Render/interpolation (ADR-0022 Stage A):** a SEPARATE `RenderPos` component is
+the render-boundary output — the ONLY thing the render path writes, so
+authoritative `Position` stays snap-applied (receivers never re-simulate others).
+`interpolate` lerps a remote's `InterpBuffer(VecDeque<Snapshot>)` at
+`RenderTick − INTERP_DELAY_TICKS` (clamps out of range — NEVER extrapolates);
+`copy_owned_render` sets `RenderPos=Position` for Local entities (schedule it
+AFTER `interpolate`). `Tick` (advanced by `advance_tick`) is the authoritative
+sim tick stamped into snapshots; `RenderTick` is the interp clock (app-advanced;
+tests set it). `push_snapshot` is cap-evicting + tick-monotonic. `spawn_owned`
+attaches `RenderPos`. Stages B (predict-own/reconcile) + C (handoff) to come.
+
 ## Crate-local invariants
 - **The SAME systems run in all three modes; only authority assignment differs.**
   There must be a single `authority_of(entity)` decision point and **no
