@@ -3218,3 +3218,273 @@ fn resync_heals_stale_silent_value() {
         "in sync — the matching hash triggers no further request"
     );
 }
+
+// ═══════════════ Group HM — host-migration reassignment (ADR-0025 B) ═══════════════
+
+/// A 3-peer mesh where A(1) owns e and B(2), C(3) hold proxies; every peer tracks
+/// the other two, so a survivor's `peers` set = the surviving membership that
+/// `reassign_orphans` elects over. Returns (a, b, c, proxy_b, proxy_c).
+fn mesh3_a_owns() -> (TestPeer, TestPeer, TestPeer, Entity, Entity) {
+    let mut a = TestPeer::new(1);
+    let mut b = TestPeer::new(2);
+    let mut c = TestPeer::new(3);
+    a.spawn(0.0, 0.0, 2.0, 0.0);
+    a.track(b.id);
+    a.track(c.id);
+    let outs = a.collect_all();
+    b.deliver_all(a.id, outbox_for(&outs, b.id).unwrap());
+    c.deliver_all(a.id, outbox_for(&outs, c.id).unwrap());
+    let proxy_b = b.entity_owned_by(a.id);
+    let proxy_c = c.entity_owned_by(a.id);
+    b.track(a.id);
+    b.track(c.id);
+    c.track(a.id);
+    c.track(b.id);
+    (a, b, c, proxy_b, proxy_c)
+}
+
+/// HM1 — owner-drop reassigns the orphan to the LOWEST surviving peer, exactly
+/// once: B(2) < C(3) adopts (Owner:=local, simulates); C re-tags its proxy to B.
+/// The "reassigned exactly once" acceptance.
+#[test]
+fn owner_drop_reassigns_to_lowest_survivor() {
+    let (a, mut b, mut c, proxy_b, proxy_c) = mesh3_a_owns();
+    assert_eq!(b.owner(proxy_b), a.id, "before: B's proxy owned by A");
+
+    b.repl.untrack_peer(a.id);
+    let rb = b.repl.reassign_orphans(&mut b.world, a.id);
+    c.repl.untrack_peer(a.id);
+    let rc = c.repl.reassign_orphans(&mut c.world, a.id);
+
+    assert_eq!(rb, vec![proxy_b], "B reassigned the one orphan");
+    assert_eq!(rc, vec![proxy_c], "C reassigned the one orphan");
+    assert_eq!(
+        b.owner(proxy_b),
+        b.id,
+        "lowest survivor B adopts (Owner:=local)"
+    );
+    assert_eq!(
+        c.owner(proxy_c),
+        b.id,
+        "C re-tags its proxy to the elected owner B"
+    );
+
+    let before = b.pos(proxy_b);
+    b.sim_tick();
+    assert!(
+        b.pos(proxy_b).x > before.x,
+        "B now simulates the reassigned entity (freeze lifted)"
+    );
+}
+
+/// HM2 — idempotent: a second `reassign_orphans` for the same departed peer finds
+/// nothing owned by it (already re-tagged) and is a no-op.
+#[test]
+fn reassign_idempotent_on_double_call() {
+    let (a, mut b, _c, proxy_b, _) = mesh3_a_owns();
+    b.repl.untrack_peer(a.id);
+    assert_eq!(b.repl.reassign_orphans(&mut b.world, a.id), vec![proxy_b]);
+    assert_eq!(b.owner(proxy_b), b.id);
+    assert!(
+        b.repl.reassign_orphans(&mut b.world, a.id).is_empty(),
+        "re-reassign finds no departed-owned entity — no-op"
+    );
+    assert_eq!(b.owner(proxy_b), b.id, "owner unchanged");
+    assert_eq!(b.entity_count(), 1, "no churn");
+}
+
+/// HM3 — after reassignment the elected owner's state applies to a survivor's
+/// proxy (the freeze lifts — the wrong-owner gate now passes since owner==elected).
+#[test]
+fn reassign_elected_owner_unfreezes_proxy() {
+    let (a, mut b, mut c, proxy_b, proxy_c) = mesh3_a_owns();
+    b.repl.untrack_peer(a.id);
+    b.repl.reassign_orphans(&mut b.world, a.id);
+    c.repl.untrack_peer(a.id);
+    c.repl.reassign_orphans(&mut c.world, a.id);
+
+    // C re-tagged its proxy to the REMOTE elected owner B, so C must NOT simulate
+    // it (the "never re-simulate others' entities" invariant — authority gate).
+    let c_before = c.pos(proxy_c);
+    c.sim_tick();
+    assert_eq!(
+        c.pos(proxy_c).x.to_bits(),
+        c_before.x.to_bits(),
+        "C does not simulate the entity it re-tagged to a remote owner"
+    );
+
+    b.sim_tick();
+    let out = b.collect_for(c.id);
+    c.deliver_all(b.id, &out);
+    assert!(
+        approx(c.pos(proxy_c).x, b.pos(proxy_b).x),
+        "C's proxy tracks the elected owner B's state (freeze lifted)"
+    );
+}
+
+/// HM4 (WHITE-BOX) — reassignment FLUSHES the proxy's InterpBuffer: the buffered
+/// snapshots came from the departed owner and must not lerp across the source
+/// discontinuity (mirrors the OwnershipTransfer/ResyncSpawn buffer flush).
+#[test]
+fn reassign_flushes_interp_buffer() {
+    let (a, _b, mut c, _proxy_b, proxy_c) = mesh3_a_owns();
+    assert!(
+        c.world
+            .get::<InterpBuffer>(proxy_c)
+            .is_some_and(|buf| !buf.0.is_empty()),
+        "precondition: C's proxy has buffered snapshots from the old owner"
+    );
+    c.repl.untrack_peer(a.id);
+    c.repl.reassign_orphans(&mut c.world, a.id);
+    assert!(
+        c.world
+            .get::<InterpBuffer>(proxy_c)
+            .is_none_or(|buf| buf.0.is_empty()),
+        "reassign flushes the buffer (old-owner snapshots must not lerp)"
+    );
+}
+
+/// HM5 — chained double-drop: A drops → B adopts; then B drops → C (the last
+/// survivor) adopts. Owned exactly once at each hop.
+#[test]
+fn reassign_chained_double_drop() {
+    let (a, mut b, mut c, proxy_b, proxy_c) = mesh3_a_owns();
+    b.repl.untrack_peer(a.id);
+    b.repl.reassign_orphans(&mut b.world, a.id);
+    c.repl.untrack_peer(a.id);
+    c.repl.reassign_orphans(&mut c.world, a.id);
+    assert_eq!(b.owner(proxy_b), b.id, "B adopts after A drops");
+
+    // B drops → C is the only survivor → C adopts.
+    c.repl.untrack_peer(b.id);
+    let rc = c.repl.reassign_orphans(&mut c.world, b.id);
+    assert_eq!(rc, vec![proxy_c], "C reassigns the now-B-owned orphan");
+    assert_eq!(c.owner(proxy_c), c.id, "C — the last survivor — adopts");
+}
+
+/// HM6 — reassigning a departed peer that owned nothing here is a no-op.
+#[test]
+fn reassign_no_orphans_is_noop() {
+    let mut a = TestPeer::new(1);
+    let b = TestPeer::new(2);
+    let own = a.spawn(0.0, 0.0, 0.0, 0.0);
+    a.track(b.id);
+    let r = a.repl.reassign_orphans(&mut a.world, PeerId(9));
+    assert!(r.is_empty(), "no entity owned by the departed peer — no-op");
+    assert_eq!(a.owner(own), a.id, "A's own entity untouched");
+}
+
+/// HM7 — every survivor independently elects the SAME owner (no coordination):
+/// A(1) drops; B(2),C(3),D(4) all elect B(2). B local, the rest remote-B.
+#[test]
+fn reassign_all_survivors_agree_on_elected() {
+    let mut a = TestPeer::new(1);
+    let mut b = TestPeer::new(2);
+    let mut c = TestPeer::new(3);
+    let mut d = TestPeer::new(4);
+    a.spawn(0.0, 0.0, 2.0, 0.0);
+    a.track(b.id);
+    a.track(c.id);
+    a.track(d.id);
+    let outs = a.collect_all();
+    b.deliver_all(a.id, outbox_for(&outs, b.id).unwrap());
+    c.deliver_all(a.id, outbox_for(&outs, c.id).unwrap());
+    d.deliver_all(a.id, outbox_for(&outs, d.id).unwrap());
+    let (pb, pc, pd) = (
+        b.entity_owned_by(a.id),
+        c.entity_owned_by(a.id),
+        d.entity_owned_by(a.id),
+    );
+    b.track(a.id);
+    b.track(c.id);
+    b.track(d.id);
+    c.track(a.id);
+    c.track(b.id);
+    c.track(d.id);
+    d.track(a.id);
+    d.track(b.id);
+    d.track(c.id);
+
+    b.repl.untrack_peer(a.id);
+    b.repl.reassign_orphans(&mut b.world, a.id);
+    c.repl.untrack_peer(a.id);
+    c.repl.reassign_orphans(&mut c.world, a.id);
+    d.repl.untrack_peer(a.id);
+    d.repl.reassign_orphans(&mut d.world, a.id);
+
+    assert_eq!(b.owner(pb), b.id, "B (min) adopts");
+    assert_eq!(c.owner(pc), b.id, "C agrees: elected = B");
+    assert_eq!(d.owner(pd), b.id, "D agrees: elected = B");
+}
+
+/// HM8 — reassignment CLOSES the ADR-0024 E4 orphan. O(3) spawns e and hands it
+/// to A(4) (adopted, spawner stays O); B(1) witnessed it, D(2) NEVER did. A drops:
+/// B (lowest survivor) adopts the FOREIGN-namespace orphan and so cannot mint a
+/// Spawn for D — but B now holds a LOCAL proxy (exactly what E4 lacked), so one
+/// resync round builds D's proxy. Reassignment + resync together heal the orphan.
+#[test]
+fn reassign_of_e4_orphan_then_resync_heals_nonwitness() {
+    let mut o = TestPeer::new(3); // spawner
+    let mut a = TestPeer::new(4); // adopter — will DROP
+    let mut b = TestPeer::new(1); // witness + lowest survivor ⇒ elected owner
+    let mut d = TestPeer::new(2); // NEVER witnesses e
+
+    let e = o.spawn(1.0, 1.0, 0.0, 0.0);
+    o.track(a.id);
+    o.track(b.id);
+    let outs = o.collect_all();
+    a.deliver_all(o.id, outbox_for(&outs, a.id).unwrap());
+    b.deliver_all(o.id, outbox_for(&outs, b.id).unwrap());
+    let proxy_b = b.entity_owned_by(o.id);
+
+    // O→A: A adopts (e.spawner stays O); B's proxy reads owner A.
+    o.repl
+        .transfer_ownership(&mut o.world, e, a.id)
+        .expect("O owns e");
+    let outs = o.collect_all();
+    a.deliver_events(o.id, &outbox_for(&outs, a.id).unwrap().events);
+    b.deliver_events(o.id, &outbox_for(&outs, b.id).unwrap().events);
+    assert_eq!(b.owner(proxy_b), a.id, "B's proxy reads owner A");
+    assert_eq!(d.entity_count(), 0, "D never witnessed e");
+
+    // Membership for the election: each survivor must have B in its candidate set.
+    b.track(o.id);
+    b.track(a.id);
+    b.track(d.id);
+    d.track(o.id);
+    d.track(a.id);
+    d.track(b.id);
+
+    // A drops. B (lowest survivor) adopts the foreign-namespace orphan; D (a
+    // non-witness) has nothing to reassign.
+    b.repl.untrack_peer(a.id);
+    let rb = b.repl.reassign_orphans(&mut b.world, a.id);
+    d.repl.untrack_peer(a.id);
+    let rd = d.repl.reassign_orphans(&mut d.world, a.id);
+    assert_eq!(rb, vec![proxy_b], "B adopts the orphan");
+    assert_eq!(
+        b.owner(proxy_b),
+        b.id,
+        "B is the elected owner (Local proxy — E4 lacked this)"
+    );
+    assert!(
+        rd.is_empty(),
+        "D never had the entity — nothing to reassign"
+    );
+
+    // B's collect AOI-enters e for D (no Spawn — foreign namespace); one resync
+    // round then builds D's proxy — the E4 orphan is finally healed.
+    let _ = b.collect_for(d.id);
+    flush_resync(&mut b, &mut d);
+    assert_eq!(
+        d.entity_count(),
+        1,
+        "resync builds D's proxy (E4 orphan closed)"
+    );
+    let proxy_d = d.entity_owned_by(b.id);
+    assert_eq!(
+        d.owner(proxy_d),
+        b.id,
+        "D's proxy is owned by the elected owner B"
+    );
+}
