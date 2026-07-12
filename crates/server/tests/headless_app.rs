@@ -3,6 +3,7 @@
 //! wall-clock cadence (network tick ≠ fixed tick). An external raw client
 //! converges against it over real transport. Locked FIRST (TDD). ADR-0014.
 
+use std::collections::HashSet;
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
@@ -11,7 +12,7 @@ use engine_core::{Owner, Position, Velocity};
 use matchbox_signaling::SignalingServer;
 use protocol::PeerId;
 use replication::Replication;
-use server::{NET_INTERVAL, TickCount, build_server_app};
+use server::{NET_INTERVAL, TickCount, build_server_app, build_server_app_focused};
 use transport::{PeerState, Transport};
 
 const DEADLINE: Duration = Duration::from_secs(120); // generous: bounds hangs, not CPU contention (full parallel suite runs several e2e binaries)
@@ -139,10 +140,9 @@ impl Client {
     }
 }
 
-/// Boot a real server App against in-process signaling and return it with its
-/// protocol id (the App is driven manually via `app.update()` — no blocking
-/// `run()` in tests).
-async fn boot_server(room: &str, entities: usize) -> (bevy_app::App, PeerId) {
+/// Connect a server transport to in-process signaling and wait for its
+/// signaling id (the protocol `PeerId`).
+async fn connect_server_transport(room: &str) -> (Transport, PeerId) {
     let (mut transport, loop_fut) = Transport::connect_hermetic(room);
     tokio::spawn(loop_fut);
     let deadline = tokio::time::Instant::now() + DEADLINE;
@@ -153,9 +153,26 @@ async fn boot_server(room: &str, entities: usize) -> (bevy_app::App, PeerId) {
         assert!(tokio::time::Instant::now() < deadline, "no signaling id");
         tokio::time::sleep(POLL).await;
     };
-    let server_id = PeerId::from_uuid_bytes(*uuid.0.as_bytes());
-    let app = build_server_app(transport, server_id, entities);
-    (app, server_id)
+    (transport, PeerId::from_uuid_bytes(*uuid.0.as_bytes()))
+}
+
+/// Boot a real server App against in-process signaling and return it with its
+/// protocol id (the App is driven manually via `app.update()` — no blocking
+/// `run()` in tests).
+async fn boot_server(room: &str, entities: usize) -> (bevy_app::App, PeerId) {
+    let (transport, server_id) = connect_server_transport(room).await;
+    (build_server_app(transport, server_id, entities), server_id)
+}
+
+/// Boot a FOCUSED server App (ADR-0023 c): each connecting client gets a
+/// server-owned avatar it controls and an AOI focused on that avatar with the
+/// given radius. Zero demo entities — spawn the scene manually.
+async fn boot_focused_server(room: &str, focus_radius: f32) -> (bevy_app::App, PeerId) {
+    let (transport, server_id) = connect_server_transport(room).await;
+    (
+        build_server_app_focused(transport, server_id, 0, focus_radius),
+        server_id,
+    )
 }
 
 /// M3 ★ the headless App: client converges to the server's entities; the
@@ -364,5 +381,150 @@ async fn ack_round_trip_confirms_and_goes_quiet() {
         (proxies[0].x - 5.0).abs() < 0.1 && (proxies[0].y - 5.0).abs() < 0.1,
         "server proxy must rest at its stationary position, got {:?}",
         proxies[0]
+    );
+}
+
+/// A real per-client AOI focus over the pump (ADR-0023 c): a FOCUSED server gives
+/// each client a server-owned avatar it controls and focuses that client's AOI on
+/// it. The client sees only entities within its focus radius — an entity far
+/// outside NEVER leaks (existence gating / read-cheat over the real pump).
+#[tokio::test(flavor = "multi_thread")]
+async fn focused_server_withholds_out_of_focus_entities() {
+    let room = start_signaling();
+    let (mut app, server_id) = boot_focused_server(&room, 10.0).await;
+    // Stationary demo entities: one NEAR a lane-0 avatar's focus (origin), one
+    // very FAR (outside every possible focus).
+    engine_core::spawn_owned(
+        app.world_mut(),
+        server_id,
+        Position { x: 2.0, y: 0.0 },
+        Velocity { x: 0.0, y: 0.0 },
+    );
+    engine_core::spawn_owned(
+        app.world_mut(),
+        server_id,
+        Position { x: 1.0e6, y: 0.0 },
+        Velocity { x: 0.0, y: 0.0 },
+    );
+    let mut client = Client::connect(&room).await;
+
+    // The single client → lane 0 → avatar at (0,0) → focus around the origin.
+    // Converge to exactly its avatar + the near entity (both within radius 10).
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    loop {
+        app.update();
+        client.pump();
+        if client.server_proxies(server_id).len() == 2 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "client never converged to its focus set (has {})",
+            client.server_proxies(server_id).len()
+        );
+        tokio::time::sleep(POLL).await;
+    }
+
+    // The far entity must NEVER leak across a settling window (existence gating).
+    let obs_end = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < obs_end {
+        app.update();
+        client.pump();
+        assert!(
+            client
+                .server_proxies(server_id)
+                .iter()
+                .all(|p| p.x < 1000.0),
+            "an out-of-focus entity must NEVER leak (existence gating): {:?}",
+            client.server_proxies(server_id)
+        );
+        tokio::time::sleep(POLL).await;
+    }
+    assert_eq!(
+        client.server_proxies(server_id).len(),
+        2,
+        "client holds exactly its avatar + the near entity"
+    );
+}
+
+/// Two focused clients see DISJOINT sets (ADR-0023 c): each has its own avatar in
+/// a disjoint focus, so the near entity reaches only the lane-0 client and the
+/// far entity reaches neither. Asserts disjointness (not exact per-client
+/// identity — lane assignment is nondeterministic and ControlledBy isn't on the
+/// wire).
+#[tokio::test(flavor = "multi_thread")]
+async fn two_focused_clients_see_disjoint_sets() {
+    let room = start_signaling();
+    let (mut app, server_id) = boot_focused_server(&room, 10.0).await;
+    engine_core::spawn_owned(
+        app.world_mut(),
+        server_id,
+        Position { x: 2.0, y: 0.0 },
+        Velocity { x: 0.0, y: 0.0 },
+    );
+    engine_core::spawn_owned(
+        app.world_mut(),
+        server_id,
+        Position { x: 1.0e6, y: 0.0 },
+        Velocity { x: 0.0, y: 0.0 },
+    );
+    let mut c1 = Client::connect(&room).await;
+    let mut c2 = Client::connect(&room).await;
+
+    // Converge: each client holds at least its avatar; the lane-0 client also
+    // holds the near entity (so the total across both is ≥ 3).
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    loop {
+        app.update();
+        c1.pump();
+        c2.pump();
+        let (n1, n2) = (
+            c1.server_proxies(server_id).len(),
+            c2.server_proxies(server_id).len(),
+        );
+        if n1 >= 1 && n2 >= 1 && n1 + n2 >= 3 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "clients never converged to their foci (c1={n1}, c2={n2})"
+        );
+        tokio::time::sleep(POLL).await;
+    }
+
+    // Settle.
+    let settle = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < settle {
+        app.update();
+        c1.pump();
+        c2.pump();
+        tokio::time::sleep(POLL).await;
+    }
+
+    let p1 = c1.server_proxies(server_id);
+    let p2 = c2.server_proxies(server_id);
+    // Neither client ever holds the far entity (read-cheat / existence gating).
+    assert!(
+        p1.iter().all(|p| p.x < 1000.0) && p2.iter().all(|p| p.x < 1000.0),
+        "no client may see the out-of-focus far entity: {p1:?} / {p2:?}"
+    );
+    // The two focus sets are DISJOINT (distinct avatars in disjoint foci; the
+    // near entity only in the lane-0 client's set). Compare by rounded position.
+    let round = |ps: &[Position]| -> HashSet<(i64, i64)> {
+        ps.iter()
+            .map(|p| (p.x.round() as i64, p.y.round() as i64))
+            .collect()
+    };
+    let (s1, s2) = (round(&p1), round(&p2));
+    // Non-vacuity: disjointness is trivially true for empty sets — assert both
+    // clients actually hold their (stationary, in-focus) avatars at assertion
+    // time, so the disjoint check is meaningful (auditor F2).
+    assert!(
+        !s1.is_empty() && !s2.is_empty(),
+        "both clients must hold their focus set: {s1:?} / {s2:?}"
+    );
+    assert!(
+        s1.is_disjoint(&s2),
+        "per-client foci must be disjoint: {s1:?} vs {s2:?}"
     );
 }
