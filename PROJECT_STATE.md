@@ -41,10 +41,18 @@ the R6 cross-sender reorder now RESOLVES BY RANK at the source (no freeze — re
 retired; its residual role is the stale-value / lost-transfer / orphan / E4 heals). `ResyncSpawn` is seq-gated
 too (own-authority guard → same-owner value-heal → owner-change `>=` heal → orphan adopts the rank), closing the
 stale-former-owner backdoor; the `>=`(resync)/`>`(transfer) asymmetry is deliberate + auditor-verified. two_world
-99 green (Group AK + reworked R6); netcode-audited → MERGE. Remaining: the **A-handshake** claim/commit/reject
-PULL path (`ClaimOwnership` → coordinator = lowest-peer-ID → `OwnershipCommit`/`ClaimRejected`). Next Phase-3
-threads: that A-handshake; the deferred consistent-membership (`net_pump` Disconnected) wiring; cross-owner
-interaction rules.
+99 green (Group AK + reworked R6); netcode-audited → MERGE. **Stage A-handshake — claim/commit/reject DONE
+(WIRE 5→6):** `claim_ownership` routes a `ClaimOwnership` to the coordinator = lowest live peer (flips NO owner);
+`drain_commits` arbitrates — winner = lowest claimant, mints `{prev.seq+1, coordinator:local}`, emits
+`OwnershipCommit` to claimants + the DEMOTING prior owner (no double authority) + `ClaimRejected` to losers (and
+to any un-arbitrable claim — no silent black-hole). All owner changes share one strict-`>` gate
+(`apply_ranked_owner_change`); the commit arm has no own-authority guard (a commit is meant to demote). two_world
+105 green (Group AK-H); netcode-audited → MERGE-with-follow-ups. **The ADR-0025 ownership-arbitration item is
+COMPLETE.** Deferred (auditor MAJOR carry-forwards): push/pull MUTUAL EXCLUSION per entity (push + coordinator-
+pull mint the rank independently, colliding at equal seq) and CONSISTENT-MEMBERSHIP consensus (a persistent
+dual-coordinator split isn't bounded by the seq tiebreak) — both close with the `net_pump` Disconnected /
+cross-owner-interaction thread. Next Phase-3 threads: that hardening + the pump wiring; message splitting;
+per-entry ack granularity.
 
 ## Done
 - **Cargo workspace** — virtual manifest, 9 crates under `crates/*` (glob members),

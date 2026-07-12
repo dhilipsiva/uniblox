@@ -61,10 +61,20 @@ stale-silent-value heal, a LOST-transfer wrong-owner proxy, orphan refetch, and 
 seq-gated too (own-authority guard → same-owner value-heal accept-regardless → owner-change `>=` heal →
 orphan-create adopts the rank), which CLOSES the stale-former-owner backdoor. The `>=`(resync)/`>`(transfer)
 asymmetry is deliberate + auditor-verified. `owner_seq(entity)` is a white-box test accessor. The STATE owner
-gate (`apply_state`, `owner!=from`) is UNCHANGED. Phase 3 still owns: message splitting, per-entry ack
-granularity, the **A-handshake** claim/commit/reject PULL path (`ClaimOwnership` → coordinator-arbitrated
-`OwnershipCommit`/`ClaimRejected`), and the deferred consistent-membership (`net_pump` Disconnected) wiring that
-Stage B's exactly-once reassignment relies on.
+gate (`apply_state`, `owner!=from`) is UNCHANGED. **Stage A-handshake** — the Mode-2 PULL path (WIRE 5→6):
+`claim_ownership(world, entity)` routes a `ClaimOwnership` to the coordinator = `coordinator(local)` =
+`elect_owner(peers ∪ local)` (flips NO `Owner`); the coordinator records claims (guarded) and `drain_commits`
+arbitrates — `winner = elect_owner(claimants)` (lowest id), mints `{prev.seq+1, coordinator:local}`, applies to
+its own proxy + emits `OwnershipCommit` to `claimants ∪ {prior owner}` (prior owner DEMOTES → no double
+authority) + `ClaimRejected` to losers (AND to any un-arbitrable claim — never a silent black-hole). All owner
+changes (transfer, commit, coordinator self-apply) share ONE strict-`>` gate `apply_ranked_owner_change`; the
+commit arm has NO own-authority guard (a commit is meant to demote the current owner). `has_pending_claim` is a
+white-box accessor. Phase 3 still owns: message splitting, per-entry ack granularity, and the DEFERRED
+cross-owner hardening the arbitration left open (auditor carry-forwards): **push/pull mutual exclusion** (an
+entity must use `transfer_ownership` OR the coordinator pull, not both concurrently — they mint the rank
+independently and collide at equal seq) and **consistent-membership consensus** (the `net_pump` Disconnected
+wiring — exactly-one-coordinator + Stage B's exactly-once reassignment need an agreed `peers` view; the seq
+tiebreak converges a one-shot migration but not a persistent split).
 
 ## Crate-local invariants
 - **Single-ownership per entity ⇒ last-write-wins, NO CRDT.** One authority per

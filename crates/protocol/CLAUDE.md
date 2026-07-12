@@ -16,8 +16,10 @@ the reserved-but-None signature field (Phase 6) + the `NetEvent::Input{seq,inten
 Vec<DigestEntry>}, ResyncRequest{ids}, ResyncSpawn{id,pos,vel,seq}}` (`DigestEntry{id, state_hash: Option<u32>}`;
 all reliable, directed) + the **ADR-0025 A ownership-arbitration rank** `OwnerSeq{seq:u64, coordinator:PeerId}`
 (lexicographic `Ord` — `seq` dominant, `coordinator` breaks equal-seq ties toward the higher id) which now rides
-`OwnershipTransfer{id,new_owner,seq}` AND `ResyncSpawn`, versioned postcard codecs (mismatch → clean Err).
-**`WIRE_VERSION`=5.** The `{engine, content, schema}` version triple lands in Phase 5.
+`OwnershipTransfer{id,new_owner,seq}` AND `ResyncSpawn` (A-kernel) + the **coordinator PULL handshake**
+`NetEvent::{ClaimOwnership{id}, OwnershipCommit{id,new_owner,seq}, ClaimRejected{id}}` (A-handshake), versioned
+postcard codecs (mismatch → clean Err). **`WIRE_VERSION`=6.** The `{engine, content, schema}` version triple
+lands in Phase 5.
 
 ## Crate-local invariants
 - The `{engine, content, schema}` version triple lives here; it is the desync
