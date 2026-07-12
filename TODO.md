@@ -140,18 +140,6 @@ Unknowns to **measure, not assume** — build instrumentation into Phase 1 and r
 
 ## Phased build sequence
 
-### PHASE 1 — THE VERTICAL SLICE: COMPLETE
-
-The slice proved the authority-swap (gate PASSED, ADR-0014; full trail ADR-0011…ADR-0017 in
-`DECISIONS.md`, live status in `PROJECT_STATE.md`) and the Bevy client renders in-browser with every
-slice measurement taken (ADR-0017: real two-build sizes, cold-load, size-budget gate PASS). The one
-measurement the slice could never take — the STUN-only connection success rate — needs real-network
-peers and lives in Phase 2's telemetry bullet.
-
-### PHASE 2 — Transport hardening [MIXED]
-**Goal:** production-grade transport across browser and native/server.
-- STUN-only failure rate + real-network RTT/jitter — the telemetry INSTRUMENT + AGGREGATION are DONE (ADR-0018: `Str0mPeer::telemetry()` records per-peer ICE outcome, winning-candidate kind, and RTT/jitter from str0m's ICE keepalive stats; `FleetMetrics::aggregate` turns many records into the STUN-only success fraction + candidate-kind breakdown + RTT/jitter distribution; hermetic + unit tested; live-demoed). Remaining is purely deploy-gated: the real-network NUMBERS need a fleet behind diverse NATs, and the collect→aggregate→export wiring lands with Phase-14 observability; browser-side candidate-pair classification via `getStats()` is a follow-up (matchbox-wasm doesn't surface it). [LOW] *Acceptance:* a fleet aggregates the telemetry into the STUN-only success fraction + RTT/jitter distributions once real sessions run.
-
 ### PHASE 3 — Replication depth [HIGH]
 **Goal:** turn the slice's replication into a robust layer. Every task: plan-mode + netcode-auditor + TDD + deterministic replay tests.
 - Client→server ack integration coverage (fast-follow to the ADR-0020 delta baseline). The sender-side delta + the `applied_seq`/`last_seq` ack basis are unit-proven (28-test two-World battery), but the server's ack-ROUTING wiring (`server::net_pump` `drain_acks` → protocol-id→transport-peer → `send_event`) is Mode-3-dead (the server receives no client state) and untested in integration — it becomes load-bearing the moment Mode 2 lets a client own an entity. *Acceptance:* an integration test where a client acks the server's stream drives the server's delta baseline (a confirmed value goes quiet) over the real pump. **[HIGH — plan-mode + netcode-auditor; pre-Mode-2.]**
@@ -248,6 +236,20 @@ peers and lives in Phase 2's telemetry bullet.
 - Native parity: same Bevy binary, native winit + native wgpu; native can host the Mode 3 headless authoritative server. *Acceptance:* native client + native-hosted server run the slice.
 - Scaling: fleet autoscale; session registry under load. [LOW]
 - Observability: metrics/tracing/logging across services; keep reporting the instrumentation metrics in prod. [LOW] *Acceptance:* dashboards for bandwidth, session cold-start, connection success, and cold-load.
+
+
+### PHASE 1 — THE VERTICAL SLICE: COMPLETE
+
+The slice proved the authority-swap (gate PASSED, ADR-0014; full trail ADR-0011…ADR-0017 in
+`DECISIONS.md`, live status in `PROJECT_STATE.md`) and the Bevy client renders in-browser with every
+slice measurement taken (ADR-0017: real two-build sizes, cold-load, size-budget gate PASS). The one
+measurement the slice could never take — the STUN-only connection success rate — needs real-network
+peers and lives in Phase 2's telemetry bullet.
+
+### PHASE 2 — Transport hardening [MIXED]
+**Goal:** production-grade transport across browser and native/server.
+- STUN-only failure rate + real-network RTT/jitter — the telemetry INSTRUMENT + AGGREGATION are DONE (ADR-0018: `Str0mPeer::telemetry()` records per-peer ICE outcome, winning-candidate kind, and RTT/jitter from str0m's ICE keepalive stats; `FleetMetrics::aggregate` turns many records into the STUN-only success fraction + candidate-kind breakdown + RTT/jitter distribution; hermetic + unit tested; live-demoed). Remaining is purely deploy-gated: the real-network NUMBERS need a fleet behind diverse NATs, and the collect→aggregate→export wiring lands with Phase-14 observability; browser-side candidate-pair classification via `getStats()` is a follow-up (matchbox-wasm doesn't surface it). [LOW] *Acceptance:* a fleet aggregates the telemetry into the STUN-only success fraction + RTT/jitter distributions once real sessions run.
+
 
 ## Risk register
 
