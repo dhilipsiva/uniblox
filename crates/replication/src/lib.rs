@@ -74,7 +74,7 @@ use engine_core::{
     push_pending_input, push_snapshot, spawn_owned,
 };
 use protocol::{
-    DigestEntry, EventMsg, NetEntityId, NetEvent, PeerId, QVec2, StateEntry, StateMsg,
+    DigestEntry, EventMsg, NetEntityId, NetEvent, OwnerSeq, PeerId, QVec2, StateEntry, StateMsg,
     WIRE_VERSION, decode_event, decode_state, dequantize, encode_event, encode_state,
     quantize_vec2,
 };
@@ -112,6 +112,11 @@ struct NetIdRecord {
     /// Last known owner — kept so a despawn can still be announced after the
     /// entity (and its `Owner` component) is gone from the world.
     last_owner: PeerId,
+    /// The entity's current ownership rank (ADR-0025 A): the arbiter for every
+    /// owner change. Seeded `{0, spawner}` at insert (a pure function of the id,
+    /// so every peer agrees), bumped by each accepted transfer/commit. An
+    /// incoming owner change is applied only if its `seq` outranks this.
+    owner_seq: OwnerSeq,
 }
 
 /// Bidirectional identity registry. Keyed by the FULL `NetEntityId` (not
@@ -127,8 +132,21 @@ struct NetIdMap {
 impl NetIdMap {
     fn insert(&mut self, id: NetEntityId, entity: Entity, last_owner: PeerId) {
         self.by_id.insert(id, entity);
-        self.by_entity
-            .insert(entity, NetIdRecord { id, last_owner });
+        // Seed the ownership rank to the birth baseline `{0, spawner}` — a pure
+        // function of the id, so every peer's record starts at the same rank.
+        // Callers that adopt an entity at a KNOWN rank (an orphan created by a
+        // `ResyncSpawn`) overwrite `owner_seq` right after insert.
+        self.by_entity.insert(
+            entity,
+            NetIdRecord {
+                id,
+                last_owner,
+                owner_seq: OwnerSeq {
+                    seq: 0,
+                    coordinator: id.spawner,
+                },
+            },
+        );
     }
 
     fn remove_by_entity(&mut self, entity: Entity) {
@@ -254,10 +272,11 @@ pub struct Replication {
     /// SENDER, per peer: its area of interest. Absent ⇒ unbounded (sees all
     /// owned entities) — the backward-compatible default.
     aoi: HashMap<PeerId, Aoi>,
-    /// SENDER: one-shot ownership-transfer intents (entity → new owner), drained
-    /// by the next `collect_all` (announced to peers that know the entity + the
-    /// new owner regardless of AOI, then cleared).
-    pending_transfers: HashMap<Entity, PeerId>,
+    /// SENDER: one-shot ownership-transfer intents (entity → (new owner, the
+    /// fresh `OwnerSeq` this push established)), drained by the next `collect_all`
+    /// (announced to peers that know the entity + the new owner regardless of
+    /// AOI, then cleared). The seq rides the wire so receivers gate by rank.
+    pending_transfers: HashMap<Entity, (PeerId, OwnerSeq)>,
     /// SENDER, per peer: the highest seq of OUR stream that peer has acked.
     acked_seq: HashMap<PeerId, u64>,
     /// RECEIVER, per sender: the highest seq whose entries we FULLY applied
@@ -413,12 +432,12 @@ impl Replication {
         // sort them once here; per-peer exits/enters/state are sorted below.
         let mut dead_sorted: Vec<Entity> = dead.iter().copied().collect();
         dead_sorted.sort_by_key(|e| self.map.by_entity.get(e).map(|r| r.id));
-        let mut transfers_sorted: Vec<(Entity, PeerId)> = self
+        let mut transfers_sorted: Vec<(Entity, PeerId, OwnerSeq)> = self
             .pending_transfers
             .iter()
-            .map(|(&e, &q)| (e, q))
+            .map(|(&e, &(q, s))| (e, q, s))
             .collect();
-        transfers_sorted.sort_by_key(|(e, _)| self.map.by_entity.get(e).map(|r| r.id));
+        transfers_sorted.sort_by_key(|(e, _, _)| self.map.by_entity.get(e).map(|r| r.id));
 
         // 3. Per tracked peer, in order: dead → transfer → exit → enter → state.
         let mut peers: Vec<PeerId> = self.peers.iter().copied().collect();
@@ -454,12 +473,16 @@ impl Replication {
             // flips) — so a chained handoff to a witnessing peer completes. Only
             // a never-witnessed new owner of an adopted entity is orphaned until
             // Phase-3 resync.
-            for &(e, q) in &transfers_sorted {
+            for &(e, q, s) in &transfers_sorted {
                 let Some(id) = self.map.by_entity.get(&e).map(|r| r.id) else {
                     continue;
                 };
                 if known_p.remove(&e) {
-                    events.push(event(NetEvent::OwnershipTransfer { id, new_owner: q }));
+                    events.push(event(NetEvent::OwnershipTransfer {
+                        id,
+                        new_owner: q,
+                        seq: s,
+                    }));
                     send_p.remove(&e);
                 } else if p == q {
                     if id.spawner == local {
@@ -477,7 +500,11 @@ impl Replication {
                             vel: qvel(&vel),
                         }));
                     }
-                    events.push(event(NetEvent::OwnershipTransfer { id, new_owner: q }));
+                    events.push(event(NetEvent::OwnershipTransfer {
+                        id,
+                        new_owner: q,
+                        seq: s,
+                    }));
                 }
             }
 
@@ -857,17 +884,33 @@ impl Replication {
                 world.despawn(proxy);
                 self.map.remove_by_id(&id);
             }
-            NetEvent::OwnershipTransfer { id, new_owner } => {
+            NetEvent::OwnershipTransfer { id, new_owner, seq } => {
                 let Some(&proxy) = self.map.by_id.get(&id) else {
                     log::warn!("transfer for unknown {id:?} from {from:?} — dropped");
                     return;
                 };
-                let Some(owner) = world.get::<Owner>(proxy) else {
+                // A mapped proxy always carries `Owner` (spawn_owned adds it,
+                // despawn prunes the map) — but guard defensively so a malformed
+                // proxy never advances its rank without a matching owner flip
+                // (auditor NIT: a bare rank advance would then silently freeze the
+                // sender's state via the apply_state owner gate).
+                if world.get::<Owner>(proxy).is_none() {
+                    return;
+                }
+                // The OwnerSeq is the arbiter now (ADR-0025 A): accept only a
+                // STRICTLY higher rank. This REPLACES the old `owner!=from` gate —
+                // a cross-sender-reordered stale transfer carries a lower seq and
+                // is dropped here WITHOUT freezing the proxy (R6 resolves by rank).
+                // `from` is not consulted: a transfer's authority is proven by its
+                // seq (only the true current owner mints `prev.seq + 1`); a former
+                // owner's replay is strictly lower. (Forging a higher seq is a
+                // modified-client concern — the same trust envelope as the
+                // privileged `ResyncSpawn`.)
+                let Some(rec_seq) = self.map.by_entity.get(&proxy).map(|r| r.owner_seq) else {
                     return;
                 };
-                // Only the current authority may give an entity away.
-                if owner.0 != from {
-                    log::warn!("transfer for {id:?} from non-owner {from:?} — dropped");
+                if seq <= rec_seq {
+                    log::warn!("stale transfer for {id:?} (rank {seq:?} <= {rec_seq:?}) — dropped");
                     return;
                 }
                 if let Some(mut owner) = world.get_mut::<Owner>(proxy) {
@@ -875,6 +918,7 @@ impl Replication {
                 }
                 if let Some(rec) = self.map.by_entity.get_mut(&proxy) {
                     rec.last_owner = new_owner;
+                    rec.owner_seq = seq;
                 }
                 // Flush the interpolation buffer on ANY authority change
                 // (ADR-0022 Stage C): its snapshots came from the OLD owner;
@@ -952,27 +996,56 @@ impl Replication {
                 // ownership + AOI before emitting any `ResyncSpawn`.
                 self.resync_requests.entry(from).or_default().extend(ids);
             }
-            NetEvent::ResyncSpawn { id, pos, vel } => {
-                // RECEIVER (ADR-0024 resync): the current owner `from` PRIVILEGED-
-                // asserts existence + owner + state. Create-or-correct, bypassing
-                // the `spawner!=from` (create) and `owner!=from` (correct) gates —
-                // sound because `from` IS the current authority (the Mode-2
-                // coordinator / Mode-3 server arbitration envelope), and the id's
-                // `spawner` is unchanged (identity ≠ authority). Own-authority
-                // guard: a stale resync from a former owner must never steal an
-                // entity WE now own.
+            NetEvent::ResyncSpawn { id, pos, vel, seq } => {
+                // RECEIVER (ADR-0024 resync + ADR-0025 A seq gate): the current
+                // owner `from` PRIVILEGED-asserts existence + owner + state.
+                // Create-or-correct, bypassing the `spawner!=from` (create) and
+                // `owner!=from` (correct) gates — sound because `from` IS the
+                // current authority (the Mode-2 coordinator / Mode-3 server
+                // envelope), and the id's `spawner` is unchanged (identity ≠
+                // authority). Now ALSO rank-gated so a stale former-owner resync
+                // cannot revert a committed owner (the ADR-0025 A backdoor):
+                //   - own-authority guard: never override an entity WE own.
+                //   - same-owner (`from == owner`): value-only heal — snap state,
+                //     leave owner/rank alone; accept regardless of seq (the
+                //     stale-silent-value case, where the rank is unchanged).
+                //   - owner-change (`from != owner`): gate `seq >= rec.owner_seq`
+                //     — a strictly-lower stale former-owner assert is dropped;
+                //     equal-or-higher re-anchors owner + rank. The `>=` (vs the
+                //     transfer's `>`) lets a resync re-affirm the CURRENT rank
+                //     truth to a diverged proxy without minting a new rank.
                 let local = world.resource::<LocalPeer>().0;
                 match self.map.by_id.get(&id).copied() {
                     Some(proxy) => {
-                        if world.get::<Owner>(proxy).is_some_and(|o| o.0 == local) {
+                        // A mapped proxy always carries `Owner`; guard defensively
+                        // (a malformed proxy must not advance its rank — auditor NIT).
+                        let Some(current) = world.get::<Owner>(proxy).map(|o| o.0) else {
                             return;
+                        };
+                        if current == local {
+                            return; // own-authority guard
                         }
-                        if let Some(mut owner) = world.get_mut::<Owner>(proxy) {
-                            owner.0 = from;
+                        if current != from {
+                            // Owner-change heal — rank-gated.
+                            let rec_seq = self.map.by_entity.get(&proxy).map(|r| r.owner_seq);
+                            if !matches!(rec_seq, Some(rs) if seq >= rs) {
+                                log::warn!(
+                                    "stale resync for {id:?} (rank {seq:?} < {rec_seq:?}) — dropped"
+                                );
+                                return;
+                            }
+                            if let Some(mut owner) = world.get_mut::<Owner>(proxy) {
+                                owner.0 = from;
+                            }
+                            if let Some(rec) = self.map.by_entity.get_mut(&proxy) {
+                                rec.last_owner = from;
+                                rec.owner_seq = seq;
+                            }
                         }
-                        if let Some(rec) = self.map.by_entity.get_mut(&proxy) {
-                            rec.last_owner = from;
-                        }
+                        // Snap state (both heal kinds). Flush the interp buffer:
+                        // an owner change is a source discontinuity (mirrors the
+                        // OwnershipTransfer flush); a same-owner refresh drops the
+                        // stale snapshots that diverged.
                         if let Some(mut p) = world.get_mut::<Position>(proxy) {
                             p.x = dequantize(pos.x);
                             p.y = dequantize(pos.y);
@@ -981,8 +1054,6 @@ impl Replication {
                             v.x = dequantize(vel.x);
                             v.y = dequantize(vel.y);
                         }
-                        // Source discontinuity — drop snapshots from the old owner
-                        // (mirrors the OwnershipTransfer buffer flush).
                         if let Some(mut buf) = world.get_mut::<InterpBuffer>(proxy) {
                             buf.0.clear();
                         }
@@ -1014,6 +1085,12 @@ impl Replication {
                         );
                         world.entity_mut(proxy).insert(InterpBuffer::default());
                         self.map.insert(id, proxy, from);
+                        // Adopt at the asserted rank (not the birth `{0,spawner}`
+                        // seed) so a later stale transfer/resync is ranked against
+                        // the truth this orphan was healed to.
+                        if let Some(rec) = self.map.by_entity.get_mut(&proxy) {
+                            rec.owner_seq = seq;
+                        }
                     }
                 }
             }
@@ -1218,10 +1295,24 @@ impl Replication {
                         continue; // out of the requester's AOI — no existence leak
                     }
                 }
+                // Carry OUR current rank for this entity so the receiver can gate
+                // the heal (ADR-0025 A). We own it (checked above), so our record's
+                // `owner_seq` is the authoritative rank; default to the birth seed
+                // only if the record vanished mid-loop (unreachable — id resolved).
+                let seq = self
+                    .map
+                    .by_entity
+                    .get(&entity)
+                    .map(|r| r.owner_seq)
+                    .unwrap_or(OwnerSeq {
+                        seq: 0,
+                        coordinator: id.spawner,
+                    });
                 match encode_event(&event(NetEvent::ResyncSpawn {
                     id,
                     pos: qpos(&pos),
                     vel: qvel(&vel),
+                    seq,
                 })) {
                     Ok(bytes) => out.push((peer, bytes.into_boxed_slice())),
                     Err(err) => log::error!("resync spawn encode to {peer:?} failed: {err}"),
@@ -1395,10 +1486,30 @@ impl Replication {
             };
             self.map.insert(id, entity, local);
         }
-        // Record the one-shot intent; the next `collect_all` announces it — to
-        // every peer that knows the entity, plus the new owner regardless of AOI
-        // (Spawn+Transfer) so it can build+own the proxy — then clears it.
-        self.pending_transfers.insert(entity, to);
+        // Mint the fresh rank this push establishes (ADR-0025 A): `{prev.seq + 1,
+        // coordinator: local}`. Reading OUR record's current rank is sound — we
+        // are the true current owner (checked above), so our rank is the highest
+        // any honest peer holds; `prev.seq + 1` therefore strictly outranks every
+        // proxy and every stale in-flight transfer, so the receiver's `seq > proxy`
+        // gate accepts this and rejects reorderings. (The record exists — minted
+        // just above if it was absent.)
+        let next = self
+            .map
+            .by_entity
+            .get(&entity)
+            .map(|r| OwnerSeq {
+                seq: r.owner_seq.seq + 1,
+                coordinator: local,
+            })
+            .unwrap_or(OwnerSeq {
+                seq: 1,
+                coordinator: local,
+            });
+        // Record the one-shot intent (with its rank); the next `collect_all`
+        // announces it — to every peer that knows the entity, plus the new owner
+        // regardless of AOI (Spawn+Transfer) so it can build+own the proxy — then
+        // clears it.
+        self.pending_transfers.insert(entity, (to, next));
         // Flip the local Owner NOW so no double-authority window exists: from
         // this instant we stop computing and collecting it (the ≤½-RTT
         // nobody-simulates freeze is the safe direction).
@@ -1407,6 +1518,7 @@ impl Replication {
         }
         if let Some(rec) = self.map.by_entity.get_mut(&entity) {
             rec.last_owner = to;
+            rec.owner_seq = next;
         }
         // We no longer author this entity — drop its per-peer delta baselines
         // (ADR-0021); if it ever comes back to us it re-baselines from scratch.
@@ -1416,6 +1528,13 @@ impl Replication {
             }
         }
         Ok(())
+    }
+
+    /// The current ownership rank of a mapped entity (ADR-0025 A) — the arbiter
+    /// the transfer/commit/resync gates compare against. `None` if the entity is
+    /// not (yet) in the id map. Exposed for white-box tests of the seq gate.
+    pub fn owner_seq(&self, entity: Entity) -> Option<OwnerSeq> {
+        self.map.by_entity.get(&entity).map(|r| r.owner_seq)
     }
 
     /// A peer connected: track it (ADR-0021). Its entities are announced by the

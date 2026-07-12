@@ -810,6 +810,12 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   `Local` proxy for `e` (nobody can digest or answer for it) — needs the coordinator / host-migration item.
   The digest/refetch heals R6 (frozen wrong-owner) + the C-still-owns missing-proxy orphan + a stale silent
   value; it cannot heal E4.
+- **SUPERSEDED for R6 by ADR-0025 A (2026-07-12):** the R6 cross-sender reorder is now resolved AT THE SOURCE by
+  the per-entity `OwnerSeq` gate (the reorder lands on the true owner immediately — no freeze), so the resync's
+  R6-freeze-heal role is retired. Resync's residual role is the STALE-SILENT-VALUE heal (unchanged), a LOST
+  (not merely reordered) transfer's wrong-owner proxy (`resync_heals_lost_transfer_wrong_owner`), the orphan
+  create/refetch, and E4. The R6 tests were reworked accordingly (`r6_chained_reorder_freezes_observer_at_wrong
+  _owner` → `..._resolves_by_seq`; `r6_resync_heals_frozen_observer` → `resync_heals_lost_transfer_wrong_owner`).
 - **Evidence:** two_world 86 green (R6-1 pins the gap, R6-2 heals it — one round corrects owner B→C, C's state
   applies, the ack unblocks; R6-3/R6-4 the responder-owns + own-authority adversarial guards, both fail with
   their guard removed; R6-5 the hash-mismatch path); protocol codec round-trip; full workspace green (the
@@ -865,5 +871,34 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   survivor doesn't simulate" guard). **Carry-forward (Stage A):** exactly-once relies on a CONSISTENT
   membership view — an inconsistent view could let two survivors self-elect; the deferred `net_pump`
   Disconnected wiring must guarantee consistent `track/untrack` or gate adoption on Stage A's ownership seq.
-- **Stages A-kernel (ownership seq tiebreak) + A-handshake (claim/commit/reject):** pending.
-- **Status:** Stage B Accepted (2026-07-12); A-kernel + A-handshake in progress.
+- **Stage A-kernel — the `OwnerSeq` gate (Accepted 2026-07-12):** a per-entity monotonic
+  `OwnerSeq { seq: u64, coordinator: PeerId }` (lexicographic `Ord`: `seq` dominant, `coordinator` breaks
+  equal-seq ties toward the higher id) is the arbiter for EVERY owner change. `WIRE_VERSION` 4→5; `seq` rides
+  `OwnershipTransfer` AND `ResyncSpawn`. `NetIdRecord.owner_seq` is seeded `{0, id.spawner}` (a pure function of
+  the id — every peer agrees on the baseline) and advanced only by an accepted change. `transfer_ownership`
+  mints `{prev.seq + 1, coordinator: local}` (the current owner holds the system-max rank, so this strictly
+  outranks every honest proxy). The **`OwnershipTransfer` apply gate REPLACES the old `owner!=from` check with a
+  strict `seq > rec.owner_seq`** — authority is now proven by rank, not sender identity, so a cross-sender
+  reordered transfer (lower rank) is dropped WITHOUT freezing: **the ADR-0024 R6 gap is now resolved AT THE
+  SOURCE** (no freeze, no resync needed — the reorder lands on the true owner). Gate asymmetry (auditor-verified
+  as exactly right): transfer/commit use strict `>` (a fresh mint always outranks); the `ResyncSpawn`
+  owner-change heal uses `>=` (a resync re-affirms the CURRENT rank truth — e.g. an elected survivor at the
+  rank-preserving migration rank correcting a non-witness — and a strictly-lower stale former-owner is still
+  dropped). `ResyncSpawn` is a three-way apply: own-authority guard (owner==local → drop) FIRST; same-owner
+  (`from==owner`) value-only heal (snap, no rank change); else owner-change `>=` heal; orphan-create adopts the
+  asserted rank. **This closes the resync BACKDOOR** — a stale former-owner `ResyncSpawn` can no longer revert a
+  committed owner (its rank is strictly lower). The STATE owner gate (`apply_state`, `owner!=from`) is
+  UNCHANGED and independent. **Trust-envelope note (auditor MINOR):** dropping the `from` check on transfers
+  widens the modified-client surface — any peer can now *seize* an entity by asserting `observed_max_seq + 1`
+  (previously only its owner could give it away). This is within the documented free-tier anti-cheat envelope
+  (a modified client is already out of scope; the Rhai sandbox is not anti-cheat); the handshake's
+  coordinator-arbitrated commit is the stronger check for the pull path. Evidence: two_world 99 green (Group AK:
+  seq-increments-along-chain, highest-rank-wins-on-reorder, equal-rank-dropped-strict-gate, resync-backdoor-
+  dropped, value-heal-ignores-lower-rank; reworked R6: `r6_chained_reorder_resolves_by_seq` +
+  `resync_heals_lost_transfer_wrong_owner`); protocol codec + `OwnerSeq` Ord pinned; full workspace green at
+  WIRE 5. netcode-audited → MERGE (the seq gate is a sound total order along the single-ownership chain; the
+  `>=`/`>` asymmetry, the pure seed, the backdoor closure, and single-ownership all verified; +the two
+  defensive missing-`Owner` guards it recommended).
+- **Stage A-handshake (claim/commit/reject):** pending — the Mode-2 PULL path (`ClaimOwnership` →
+  coordinator-arbitrated `OwnershipCommit`/`ClaimRejected`), coordinator = `elect_owner(peers ∪ local)`.
+- **Status:** Stage B + Stage A-kernel Accepted (2026-07-12); A-handshake pending.

@@ -11,13 +11,18 @@
 use serde::{Deserialize, Serialize};
 
 /// Wire-format version, checked on decode. Bump on ANY message-shape change.
-/// v4 (ADR-0024 / Phase 3): anti-entropy resync — `NetEvent` gains `Digest`
-/// (a sender's per-peer summary of the entities it owns, for divergence
-/// detection), `ResyncRequest` (a receiver asks the owner to re-assert ids it
-/// diverged on), and `ResyncSpawn` (the owner's privileged create-or-correct
-/// that heals a frozen wrong-owner / orphaned proxy). v3 (ADR-0022): `StateMsg`
-/// gains `tick` + `last_input`. v2 added `NetEvent::Ack`. Pre-release hard cutover.
-pub const WIRE_VERSION: u8 = 4;
+/// v5 (ADR-0025 A / Phase 3): double-ownership arbitration by coordinator
+/// sequence number — a per-entity monotonic [`OwnerSeq`] rides every
+/// owner-mutating event: `OwnershipTransfer` and `ResyncSpawn` gain a `seq`
+/// field, and `NetEvent` gains the coordinator claim/commit/reject handshake
+/// (`ClaimOwnership`, `OwnershipCommit`, `ClaimRejected`). v4 (ADR-0024):
+/// anti-entropy resync — `NetEvent` gains `Digest` (a sender's per-peer summary
+/// of the entities it owns, for divergence detection), `ResyncRequest` (a
+/// receiver asks the owner to re-assert ids it diverged on), and `ResyncSpawn`
+/// (the owner's privileged create-or-correct that heals a frozen wrong-owner /
+/// orphaned proxy). v3 (ADR-0022): `StateMsg` gains `tick` + `last_input`. v2
+/// added `NetEvent::Ack`. Pre-release hard cutover.
+pub const WIRE_VERSION: u8 = 5;
 
 /// Fixed-point quantization scale: world units × 1024.
 ///
@@ -68,6 +73,33 @@ pub struct NetEntityId {
     pub spawner: PeerId,
     pub index: u32,
     pub generation: u32,
+}
+
+/// Monotonic ownership sequence — the arbiter for concurrent / reordered
+/// ownership changes (ADR-0025 A). Anchored PER ENTITY: every owner-mutating
+/// event ([`NetEvent::OwnershipTransfer`], [`NetEvent::OwnershipCommit`],
+/// [`NetEvent::ResyncSpawn`]) carries the `OwnerSeq` it establishes, and a
+/// receiver accepts an owner change only when it OUTRANKS the entity's current
+/// one — so a cross-sender-reordered stale assertion is dropped by rank, never
+/// by freezing (this is what resolves the ADR-0024 R6 gap at the source).
+///
+/// `Ord` is LEXICOGRAPHIC by field order: `seq` first (higher wins), then
+/// `coordinator` (higher peer id wins) to break equal-`seq` ties DETERMINISTICALLY.
+/// The tiebreak is load-bearing for the CLAIM COORDINATOR (the lowest-live-peer
+/// arbiter of ownership claims, Stage A-handshake): when that coordinator departs,
+/// the next lowest — a HIGHER peer id — takes over, and if a partial commit
+/// delivery leaves peers split between the old and new coordinator's equal-`seq`
+/// commits, higher-wins routes convergence to the NEWER coordinator's decision.
+/// (Host-migration REASSIGNMENT of a dropped owner's entities is a separate,
+/// rank-PRESERVING, pure-local operation — see `replication::reassign_orphans`;
+/// it deliberately does not mint a new rank, so a real transfer/commit always
+/// outranks it and the `>=` resync gate can re-affirm the reassignment to a
+/// non-witness.) Seeded `{0, spawner}` at birth: a PURE function of the id, so
+/// every peer agrees on the baseline rank.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct OwnerSeq {
+    pub seq: u64,
+    pub coordinator: PeerId,
 }
 
 /// A quantized 2D vector (position or velocity): i32 fixed-point at
@@ -172,9 +204,16 @@ pub enum NetEvent {
     },
     /// Remove an entity. Only the entity's CURRENT owner may send this.
     Despawn { id: NetEntityId },
-    /// Transfer authority. Only the CURRENT owner may send this; identity
-    /// (`id`) never changes — only the proxy's `Owner` component does.
-    OwnershipTransfer { id: NetEntityId, new_owner: PeerId },
+    /// Transfer authority (a PUSH — the current owner hands the entity off).
+    /// Identity (`id`) never changes — only the proxy's `Owner` does. `seq` is
+    /// the fresh [`OwnerSeq`] this transfer establishes (`{prev.seq + 1,
+    /// coordinator: giver}`); a receiver accepts only if it OUTRANKS the proxy's
+    /// current seq, so the `owner!=from` check is no longer the gate (ADR-0025 A).
+    OwnershipTransfer {
+        id: NetEntityId,
+        new_owner: PeerId,
+        seq: OwnerSeq,
+    },
     /// Delta-baseline acknowledgement (ADR-0020, Phase 3): "I have applied up
     /// to state `seq` of YOUR stream." Sent DIRECTED (receiver → the acked
     /// sender), on the reliable channel, so the sender can advance its
@@ -200,11 +239,16 @@ pub enum NetEvent {
     /// create-or-correct. Re-asserts an entity's existence, owner (the sender),
     /// and state — healing a frozen wrong-owner proxy (owner override) or an
     /// orphan (create). No owner field: the sender IS the asserted owner
-    /// (identity is not authority; `id.spawner` is unchanged). Reliable, directed.
+    /// (identity is not authority; `id.spawner` is unchanged). `seq` is the
+    /// entity's CURRENT [`OwnerSeq`] as the owner holds it (ADR-0025 A) — an
+    /// owner-change heal is gated `seq >= proxy.seq` (a strictly-lower stale
+    /// former-owner assert is dropped); a same-owner value heal ignores it.
+    /// Reliable, directed.
     ResyncSpawn {
         id: NetEntityId,
         pos: QVec2,
         vel: QVec2,
+        seq: OwnerSeq,
     },
 }
 
@@ -278,6 +322,41 @@ mod tests {
     }
 
     #[test]
+    fn owner_seq_orders_lexicographically() {
+        // The whole ADR-0025 A arbitration rests on this order: `seq` dominates,
+        // and `coordinator` breaks equal-seq ties toward the HIGHER id (the newer,
+        // post-migration coordinator). A higher seq always outranks a lower one
+        // regardless of coordinator.
+        let lo_seq_hi_coord = OwnerSeq {
+            seq: 4,
+            coordinator: PeerId(9),
+        };
+        let hi_seq_lo_coord = OwnerSeq {
+            seq: 5,
+            coordinator: PeerId(1),
+        };
+        assert!(
+            hi_seq_lo_coord > lo_seq_hi_coord,
+            "seq dominates coordinator"
+        );
+
+        // Equal seq: the higher coordinator wins (newer coordinator after a
+        // migration is a higher peer id).
+        let old_coord = OwnerSeq {
+            seq: 5,
+            coordinator: PeerId(1),
+        };
+        let new_coord = OwnerSeq {
+            seq: 5,
+            coordinator: PeerId(2),
+        };
+        assert!(
+            new_coord > old_coord,
+            "equal seq breaks toward higher coordinator"
+        );
+    }
+
+    #[test]
     fn ack_event_round_trips() {
         let msg = EventMsg {
             version: WIRE_VERSION,
@@ -314,6 +393,18 @@ mod tests {
                 id,
                 pos: quantize_vec2(1.5, -2.0),
                 vel: quantize_vec2(0.25, 0.0),
+                seq: OwnerSeq {
+                    seq: 3,
+                    coordinator: PeerId(2),
+                },
+            },
+            NetEvent::OwnershipTransfer {
+                id,
+                new_owner: PeerId(7),
+                seq: OwnerSeq {
+                    seq: 9,
+                    coordinator: PeerId(1),
+                },
             },
         ] {
             let msg = EventMsg {
