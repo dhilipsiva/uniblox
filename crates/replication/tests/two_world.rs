@@ -216,6 +216,33 @@ fn flush_acks(receiver: &mut TestPeer, sender: &mut TestPeer) {
     }
 }
 
+/// Drive one full anti-entropy resync round (ADR-0024) from `owner` (the current
+/// authority) to `receiver` (a diverged peer): owner digest → receiver request →
+/// owner `ResyncSpawn`. Delivers only the messages addressed to the other party.
+fn flush_resync(owner: &mut TestPeer, receiver: &mut TestPeer) {
+    for (target, bytes) in owner.repl.collect_resync(&mut owner.world) {
+        if target == receiver.id {
+            receiver
+                .repl
+                .apply_events(&mut receiver.world, owner.id, &bytes);
+        }
+    }
+    for (target, bytes) in receiver.repl.drain_resync_requests() {
+        if target == owner.id {
+            owner
+                .repl
+                .apply_events(&mut owner.world, receiver.id, &bytes);
+        }
+    }
+    for (target, bytes) in owner.repl.drain_resync_responses(&mut owner.world) {
+        if target == receiver.id {
+            receiver
+                .repl
+                .apply_events(&mut receiver.world, owner.id, &bytes);
+        }
+    }
+}
+
 /// The outbox `collect_all` produced for peer `p`, if any.
 fn outbox_for(outs: &[(PeerId, Outbox)], p: PeerId) -> Option<&Outbox> {
     outs.iter().find(|(peer, _)| *peer == p).map(|(_, o)| o)
@@ -2950,13 +2977,11 @@ fn reordered_state_around_transfer_dropped() {
     );
 }
 
-/// R6-1 — chained-transfer cross-sender REORDERING freezes an observer at the
-/// WRONG owner (the documented ADR-0013 R6 gap). A→B→C with observer D; D
-/// receives T2(B→C) before T1(A→B). T2 is dropped (owner mismatch), T1 flips D to
-/// owner B, and C's state is then rejected forever. Stage 2 (resync) heals this;
-/// here we PIN the gap deterministically (as E4 pins its orphan).
-#[test]
-fn r6_chained_reorder_freezes_observer_at_wrong_owner() {
+/// Build the documented R6 frozen-observer state: an A→B→C chain with an
+/// observer D that received T2(B→C) before T1(A→B) (cross-sender reorder), so D's
+/// proxy is FROZEN at owner B while the real owner is C. Returns
+/// `(a, b, c, d, proxy_c, proxy_d)` with `d.owner(proxy_d) == b.id`.
+fn build_r6_frozen() -> (TestPeer, TestPeer, TestPeer, TestPeer, Entity, Entity) {
     let mut a = TestPeer::new(1);
     let mut b = TestPeer::new(2);
     let mut c = TestPeer::new(3);
@@ -2972,15 +2997,14 @@ fn r6_chained_reorder_freezes_observer_at_wrong_owner() {
     let proxy_c = c.entity_owned_by(a.id);
     let proxy_d = d.entity_owned_by(a.id);
 
-    // A→B: deliver to B and C in order; CAPTURE T1 for D and withhold it.
+    // A→B: deliver to B and C in order; capture T1 for D and withhold it.
     a.repl
         .transfer_ownership(&mut a.world, e, b.id)
         .expect("A→B");
     let outs = a.collect_all();
     b.deliver_events(a.id, &outbox_for(&outs, b.id).unwrap().events);
     c.deliver_events(a.id, &outbox_for(&outs, c.id).unwrap().events);
-    let t1_d = outbox_for(&outs, d.id).unwrap().events.clone(); // WITHHELD from D
-    assert_eq!(c.owner(proxy_c), b.id, "C tracks A→B in order");
+    let t1_d = outbox_for(&outs, d.id).unwrap().events.clone();
 
     // B AOI-enters e for C and D (so a B→C transfer reaches both); apply to C only.
     b.track(a.id);
@@ -2988,29 +3012,37 @@ fn r6_chained_reorder_freezes_observer_at_wrong_owner() {
     b.track(d.id);
     b.sim_tick();
     let bcast = b.collect_all();
-    c.deliver_all(b.id, outbox_for(&bcast, c.id).unwrap()); // C applies (owner B == from B)
-    // (withhold B's state from D; e is now in b.known[d])
+    c.deliver_all(b.id, outbox_for(&bcast, c.id).unwrap());
 
-    // B→C: deliver to C in order; CAPTURE T2 for D and withhold it.
+    // B→C: deliver to C in order; capture T2 for D and withhold it.
     let proxy_b = b.entity_owned_by(b.id);
     b.repl
         .transfer_ownership(&mut b.world, proxy_b, c.id)
         .expect("B→C");
     let outs = b.collect_all();
     c.deliver_events(b.id, &outbox_for(&outs, c.id).unwrap().events);
-    let t2_d = outbox_for(&outs, d.id).unwrap().events.clone(); // WITHHELD from D
-    assert_eq!(c.owner(proxy_c), c.id, "C adopts B→C");
+    let t2_d = outbox_for(&outs, d.id).unwrap().events.clone();
 
-    // ADVERSE cross-sender order at D: T2 (from B) FIRST, then T1 (from A).
-    d.deliver_events(b.id, &t2_d); // owner(A) != from(B) → DROPPED (the R6 loss)
-    d.deliver_events(a.id, &t1_d); // owner(A) == from(A) → flips D to owner B
+    // Adverse cross-sender order at D: T2 (from B) first (dropped by owner
+    // mismatch), then T1 (from A) — flips D to owner B while the real owner is C.
+    d.deliver_events(b.id, &t2_d);
+    d.deliver_events(a.id, &t1_d);
+    (a, b, c, d, proxy_c, proxy_d)
+}
 
-    // The FROZEN gap: D records owner B, the real owner is C.
+/// R6-1 — chained-transfer cross-sender REORDERING freezes an observer at the
+/// WRONG owner (the documented ADR-0013 R6 gap): T2 dropped (owner mismatch), T1
+/// flips D to owner B, and C's state is then rejected forever. Pinned
+/// deterministically (as E4 pins its orphan); R6-2 heals it via resync.
+#[test]
+fn r6_chained_reorder_freezes_observer_at_wrong_owner() {
+    let (_a, b, mut c, mut d, proxy_c, proxy_d) = build_r6_frozen();
     assert_eq!(
         d.owner(proxy_d),
         b.id,
         "R6 gap: observer frozen at the WRONG owner (B), real owner is C"
     );
+    assert_eq!(c.owner(proxy_c), c.id, "C is the real current owner");
     let before = d.pos(proxy_d);
     c.sim_tick();
     let cstate = c.collect_for(d.id);
@@ -3023,5 +3055,166 @@ fn r6_chained_reorder_freezes_observer_at_wrong_owner() {
         before.x.to_bits(),
         d.pos(proxy_d).x.to_bits(),
         "R6 gap: the real owner C's state is rejected by the wrong-owner proxy"
+    );
+}
+
+/// R6-2 — anti-entropy RESYNC heals the frozen observer (ADR-0024). From the R6
+/// frozen state, one digest→request→ResyncSpawn round from the real owner C
+/// corrects D's proxy owner B→C, so C's state applies and its withheld ack stream
+/// unblocks. Idempotent thereafter.
+#[test]
+fn r6_resync_heals_frozen_observer() {
+    let (_a, b, mut c, mut d, proxy_c, proxy_d) = build_r6_frozen();
+    assert_eq!(d.owner(proxy_d), b.id, "precondition: D frozen at owner B");
+
+    // C (the real owner) must know D to digest e for it: one collect_for populates
+    // C.known[d] (the state itself is dropped by D's wrong-owner proxy).
+    c.sim_tick();
+    let _ = c.collect_for(d.id);
+
+    // One resync round heals D.
+    flush_resync(&mut c, &mut d);
+    assert_eq!(
+        d.owner(proxy_d),
+        c.id,
+        "resync corrects the proxy owner B→C"
+    );
+
+    // C's normal state now APPLIES (the freeze is gone).
+    c.sim_tick();
+    let cstate = c.collect_for(d.id);
+    d.deliver_state(c.id, cstate.state.as_ref().unwrap());
+    assert!(
+        approx(d.pos(proxy_d).x, c.pos(proxy_c).x),
+        "C's state now applies to D's corrected proxy"
+    );
+
+    // The frozen ack stream unblocks: D now acks C.
+    assert!(
+        d.repl.drain_acks().iter().any(|(t, _)| *t == c.id),
+        "D now acks C's stream (the withheld ack unblocks)"
+    );
+
+    // Idempotent: once converged, C's next digest produces NO request from D
+    // (owner matches, no hash) — the round genuinely quiesces, not just re-heals.
+    for (target, bytes) in c.repl.collect_resync(&mut c.world) {
+        if target == d.id {
+            d.repl.apply_events(&mut d.world, c.id, &bytes);
+        }
+    }
+    assert!(
+        d.repl.drain_resync_requests().is_empty(),
+        "converged — a further digest triggers no resync request"
+    );
+    assert_eq!(d.owner(proxy_d), c.id, "proxy stays owner C");
+}
+
+/// R6-3 — responder-owns-check: a peer asked to resync an entity it does NOT own
+/// emits no `ResyncSpawn` (it cannot assert ownership it lacks — no theft).
+#[test]
+fn resync_responder_only_answers_owned() {
+    let mut a = TestPeer::new(1); // owns e
+    let mut b = TestPeer::new(2); // holds a proxy, does NOT own e
+    let e = a.spawn(1.0, 2.0, 0.0, 0.0);
+    b.deliver_all(a.id, &a.collect_for(b.id));
+    let proxy = b.entity_owned_by(a.id);
+    assert_eq!(
+        b.owner(proxy),
+        a.id,
+        "B holds A's entity but does not own it"
+    );
+
+    let id = net_id(a.id, e);
+    let req = EventMsg {
+        version: WIRE_VERSION,
+        sig: None,
+        event: NetEvent::ResyncRequest { ids: vec![id] },
+    };
+    let bytes = encode_event(&req).expect("encode");
+    b.repl.apply_events(&mut b.world, PeerId(9), &bytes);
+
+    assert!(
+        b.repl.drain_resync_responses(&mut b.world).is_empty(),
+        "a non-owner must not answer a resync request (no ownership assertion)"
+    );
+}
+
+/// R6-4 — own-authority guard: a `ResyncSpawn` for an entity WE own is dropped —
+/// a stale/foreign owner-assertion can never steal our authority or clobber our
+/// authoritative state.
+#[test]
+fn resync_own_authority_guard_drops_foreign_assert() {
+    let mut a = TestPeer::new(1);
+    let e = a.spawn(3.0, 3.0, 0.0, 0.0);
+    let _ = a.collect_all(); // mint e's id into the map so the guard can resolve it
+    let id = net_id(a.id, e);
+
+    let ev = EventMsg {
+        version: WIRE_VERSION,
+        sig: None,
+        event: NetEvent::ResyncSpawn {
+            id,
+            pos: quantize_vec2(99.0, 99.0),
+            vel: quantize_vec2(0.0, 0.0),
+        },
+    };
+    let bytes = encode_event(&ev).expect("encode");
+    a.repl.apply_events(&mut a.world, PeerId(2), &bytes);
+
+    assert_eq!(
+        a.owner(e),
+        a.id,
+        "own-authority guard: a ResyncSpawn cannot steal an entity we own"
+    );
+    assert!(
+        approx(a.pos(e).x, 3.0),
+        "and cannot overwrite our authoritative state"
+    );
+}
+
+/// R6-5 — the digest HASH-mismatch path (ADR-0024): a SILENT divergence on a
+/// confirmed + quiet value (correct owner, right existence — a bug / dropped
+/// correction the delta stream can no longer heal because the owner is quiet) is
+/// caught by the state-hash and healed. Exercises `component_quiet` / `fnv32` /
+/// `proxy_state_hash` end-to-end.
+#[test]
+fn resync_heals_stale_silent_value() {
+    let mut a = TestPeer::new(1);
+    let mut b = TestPeer::new(2);
+    a.spawn(5.0, 5.0, 0.0, 0.0); // stationary
+    b.deliver_all(a.id, &a.collect_for(b.id));
+    flush_acks(&mut b, &mut a); // confirmed + quiet on both sides
+    let proxy = b.entity_owned_by(a.id);
+    assert!(approx(b.pos(proxy).x, 5.0));
+    assert!(
+        a.collect_for(b.id).state.is_none(),
+        "A is quiet — the delta stream cannot heal a silent divergence"
+    );
+
+    // Simulate a silent divergence: B's proxy value drifts while A stays quiet.
+    b.world.get_mut::<Position>(proxy).unwrap().x = 9.0;
+
+    // One resync round: A's digest carries the confirmed value's hash, B finds it
+    // mismatched (same owner, different hash), and the ResyncSpawn corrects it.
+    flush_resync(&mut a, &mut b);
+    assert!(
+        approx(b.pos(proxy).x, 5.0),
+        "the digest hash-mismatch heals the stale silent value"
+    );
+    assert_eq!(
+        b.owner(proxy),
+        a.id,
+        "owner unchanged (this was a value divergence)"
+    );
+
+    // Converged: a further digest triggers no request.
+    for (target, bytes) in a.repl.collect_resync(&mut a.world) {
+        if target == b.id {
+            b.repl.apply_events(&mut b.world, a.id, &bytes);
+        }
+    }
+    assert!(
+        b.repl.drain_resync_requests().is_empty(),
+        "in sync — the matching hash triggers no further request"
     );
 }
