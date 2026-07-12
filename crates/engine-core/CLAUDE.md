@@ -36,6 +36,18 @@ Position/Velocity. `apply_input` (server, FixedUpdate before simulate): pops ONE
 entity → `Velocity=intent`, `ProcessedInput[peer]=seq`; ZEROS on underrun (matches predict). Inputs go on the
 RELIABLE channel; reconciliation is client-side (`apply_state` prunes history by `StateMsg.last_input`).
 
+**Cross-owner interactions (ADR-0027, rule R1):** the deterministic single-authority rule for interactions
+between differently-owned entities — each effect is decided + applied by the OWNER of the entity it MUTATES
+(= `authority_of` on the affected entity; "the entity being hit is authoritative", straight out of
+single-ownership: only the owner may write it, so no cross-owner write and the other entity is only READ, never
+re-simulated). `Interactable{radius}` (coarse circular volume) + `Contacts(u32)` (per-entity, owner-authoritative
+tally — NOT on the wire; a per-tick LEVEL) + `overlaps` (`dist² ≤ (ra+rb)²`, touching counts) +
+`resolve_interactions` (per overlapping pair, `+1` on each entity the local peer owns; same-owner pairs NOT
+skipped → Mode 3, owning all, applies every contact frame-perfectly = the gap DISSOLVES, no fork). Wired into
+the server `FixedUpdate` after `simulate`. `interaction_decider = min(owner)` is the provided tiebreak for a
+SHARED outcome (recorded once) — a future consumer must only write entities IT owns or emit an event (never a
+cross-owner write). Coarse = positional overlap, not frame-perfect (precise → Mode 3). netcode-audited → MERGE.
+
 ## Crate-local invariants
 - **The SAME systems run in all three modes; only authority assignment differs.**
   There must be a single `authority_of(entity)` decision point and **no

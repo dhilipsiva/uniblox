@@ -51,7 +51,14 @@ to any un-arbitrable claim — no silent black-hole). All owner changes share on
 COMPLETE.** Deferred (auditor MAJOR carry-forwards): push/pull MUTUAL EXCLUSION per entity (push + coordinator-
 pull mint the rank independently, colliding at equal seq) and CONSISTENT-MEMBERSHIP consensus (a persistent
 dual-coordinator split isn't bounded by the seq tiebreak) — both close with the `net_pump` Disconnected /
-cross-owner-interaction thread. Next Phase-3 threads: that hardening + the pump wiring; message splitting;
+cross-owner-interaction thread. **Cross-owner interactions DOCUMENTED + RULED:** ADR-0026 recorded the
+remote-vs-remote LATENCY gap as an accepted quality ceiling; **ADR-0027** built the deterministic
+single-authority INTERACTION rule (R1 — each effect decided by the OWNER of the entity it mutates =
+`authority_of` on the affected entity; a standing coarse `Interactable`/`Contacts`/`overlaps`/
+`resolve_interactions` system in engine-core wired into the server `FixedUpdate`; `interaction_decider=min`
+tiebreaks a shared outcome; reads the other's replicated `Position`, never re-simulates; Mode 3 owning all
+dissolves the gap frame-perfectly, no fork). engine-core 12 + two_world 107 green; netcode-audited → MERGE.
+Next Phase-3 threads: the ownership push/pull + membership hardening + the pump wiring; message splitting;
 per-entry ack granularity.
 
 ## Done
