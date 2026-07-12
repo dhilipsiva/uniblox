@@ -16,9 +16,10 @@ management / AOI (ADR-0021)** — the sender is now PER-PEER (`collect_all`) wit
 gating both state AND existence (the Mode-3 read-cheat defense), per-(peer,entity) delta baselines, and
 deterministic wire output; then **prediction / reconciliation / interpolation (ADR-0022)** — a separate
 `RenderPos` render layer with interpolate-others (snapshot buffer + lerp), predict-own + server reconciliation
-(input / `last_input`), and the handoff role reset. Next Phase-3 threads: anti-entropy resync, handoff depth,
-double-ownership coordination, interest-management perf (a shared per-tick snapshot; AOI-flicker hysteresis),
-a client-acks-server integration test (pre-Mode-2).
+(input / `last_input`), and the handoff role reset. The ADR-0020 ack round-trip is now integration-covered
+over the real `net_pump` (`server/tests/headless_app.rs::ack_round_trip_confirms_and_goes_quiet` — both
+directions to quiescence; the fast-follow is closed). Next Phase-3 threads: anti-entropy resync, handoff depth,
+double-ownership coordination, interest-management perf (a shared per-tick snapshot; AOI-flicker hysteresis).
 
 ## Done
 - **Cargo workspace** — virtual manifest, 9 crates under `crates/*` (glob members),
@@ -67,8 +68,12 @@ a client-acks-server integration test (pre-Mode-2).
   owner-mismatch, must not falsely confirm). **28-test two-World battery green** (T29–T37 the delta cases,
   incl. the F1 regression `state_before_spawn_defers_ack` + the gap-reset soundness `gap_reset_keeps_run_
   contiguous`); T35 proves the bandwidth win (0 steady-state bytes for a confirmed stationary scene).
-  **netcode-audited twice** (F1 blocker → fixed → MERGE). Fast-follow: a client-acks-server integration test
-  (the server ack-routing path is unit-covered but Mode-3-dead until Mode 2 lets a client own an entity).
+  **netcode-audited twice** (F1 blocker → fixed → MERGE). Fast-follow CLOSED (2026-07-12): the ack round-trip
+  is now integration-covered over the real `net_pump` by `server/tests/headless_app.rs::
+  ack_round_trip_confirms_and_goes_quiet` — the test `Client` gained the client-side ack/collect pump wiring
+  and the test drives BOTH directions to quiescence (client acks the server's stationary entity ⇒ server goes
+  quiet; a client-OWNED stationary entity exercises the server's ack-routing ⇒ client goes quiet). Both
+  plateau assertions fail if either `drain_acks` send is removed; netcode-audited → MERGE.
 - **Interest management (AOI, spatial grid)** (ADR-0021, Phase 3, HIGH) — the sender UNIFIED to PER-PEER:
   `collect(world) -> Outbox` became `collect_all(world) -> Vec<(PeerId, Outbox)>`. Each tracked peer sees only
   entities within its AOI (`set_aoi` circle; unset ⇒ unbounded/fail-open), with its own delta baseline

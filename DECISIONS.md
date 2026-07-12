@@ -527,12 +527,19 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   suite green; clippy `-D warnings` native `--all-targets` + wasm32 (protocol/replication); fmt clean. T35
   proves the bandwidth win deterministically (a confirmed stationary scene sends 0 steady-state bytes vs the
   keyframe's full re-send every 30 ticks).
-- **Residuals / fast-follows (auditor, non-blocking):** the server's ack-ROUTING wiring
-  (`server::net_pump` `drain_acks` → protocol-id→transport-peer → `send_event`) is exercised only by the
-  `two_world` `flush_acks` helper — dead in Mode 3 (the server receives no client state) and untested in
-  integration; it becomes load-bearing the moment Mode 2 lets a CLIENT own an entity, so a client-acks-server
-  integration test is a pre-Mode-2 SHOULD-FIX. Deeper desync (a peer that never sees a Spawn / a frozen
-  wrong-owner proxy) remains owned by the separate anti-entropy-resync item.
+- **Residuals / fast-follows (auditor, non-blocking):** ~~the server's ack-ROUTING wiring is exercised only by
+  the `two_world` `flush_acks` helper — dead in Mode 3 and untested in integration.~~ **CLOSED (2026-07-12)** by
+  `crates/server/tests/headless_app.rs::ack_round_trip_confirms_and_goes_quiet` — a real-transport headless test
+  that drives BOTH ack directions over the live `net_pump`: the client acks the server's stationary entity (the
+  server's per-peer delta baseline confirms ⇒ goes quiet) AND the client OWNS a stationary entity it replicates
+  to the server (the server's `net_pump` `drain_acks`→`send_event` routing confirms the client's baseline ⇒ goes
+  quiet — the previously Mode-3-dead surface, now driven by a Mode-2-shaped client-owned entity). The test
+  Client gained the missing client-side ack/collect pump wiring; both plateau assertions FAIL if either
+  `drain_acks` send is removed (verified by disabling it: recv_delta = 40 vs the ≤2 threshold). netcode-audited
+  → MERGE (non-vacuity proven via the confirmation-causality chain: a value can go quiet only after state
+  flowed AND was acked). A real production client pump must adopt the same wiring the test Client demonstrates.
+  Deeper desync (a peer that never sees a Spawn / a frozen wrong-owner proxy) remains owned by the separate
+  anti-entropy-resync item.
 - **Status:** Accepted (2026-07-11).
 
 ## ADR-0021 — Interest management (AOI, spatial grid); the sender goes PER-PEER

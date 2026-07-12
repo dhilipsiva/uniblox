@@ -31,10 +31,12 @@ discontinuity); `drain_inputs` sends only for `authority==Remote` entities (no s
 role transition itself is engine-core's `reset_render_role`. Handoff: local Owner flips immediately (no double-authority window).
 `interest` submodule = `SpatialGrid` (cell-bucketed, floor-celled, exact-dist² filter) + `Aoi`. **46-test
 two-World battery + 5 grid unit tests + codec + e2e-over-real-transport green; netcode-audited THREE times (F1
-orphan blocker + its over-broad fix, both closed → MERGE).** Phase 3 still owns: interpolation buffers,
-anti-entropy resync, message splitting, per-entry ack granularity, hysteresis for AOI flicker, a
-client-acks-server integration test (pre-Mode-2), and the documented cross-sender gaps (see lib.rs module
-docs) — including a chained handoff to a never-witnessed new owner of an adopted entity.
+orphan blocker + its over-broad fix, both closed → MERGE).** The ack round-trip is now
+integration-covered over the real `net_pump` (both directions — `server/tests/headless_app.rs::
+ack_round_trip_confirms_and_goes_quiet`, a Mode-2-shaped client-owned entity drives the server's ack-routing).
+Phase 3 still owns: anti-entropy resync, message splitting, per-entry ack granularity, hysteresis for AOI
+flicker, and the documented cross-sender gaps (see lib.rs module docs) — including a chained handoff to a
+never-witnessed new owner of an adopted entity.
 
 ## Crate-local invariants
 - **Single-ownership per entity ⇒ last-write-wins, NO CRDT.** One authority per

@@ -7,7 +7,7 @@ use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
 use bevy_ecs::prelude::*;
-use engine_core::{Owner, Position};
+use engine_core::{Owner, Position, Velocity};
 use matchbox_signaling::SignalingServer;
 use protocol::PeerId;
 use replication::Replication;
@@ -24,13 +24,17 @@ fn start_signaling() -> String {
     format!("ws://{addr}/headless_app_test")
 }
 
-/// A raw test client (no App): world + replication + transport pump, counting
-/// received state messages for the cadence assertion.
+/// A raw test client (no App): world + replication + transport pump. A full
+/// symmetric peer — it receives AND (when it owns entities) sends state, and
+/// acks the streams it applies. Counts received/sent state messages so a test
+/// can watch a confirmed value go quiet (ADR-0020 delta baseline over the pump).
 struct Client {
+    local: PeerId,
     world: World,
     repl: Replication,
     transport: Transport,
     received_state_msgs: usize,
+    state_msgs_sent: usize,
 }
 
 impl Client {
@@ -50,19 +54,28 @@ impl Client {
         engine_core::insert_sim(&mut world, id, 1.0 / 64.0);
         let repl = Replication::new(&mut world);
         Client {
+            local: id,
             world,
             repl,
             transport,
             received_state_msgs: 0,
+            state_msgs_sent: 0,
         }
+    }
+
+    /// Spawn a client-OWNED entity so this peer replicates it to the server
+    /// (Mode-2-shaped: the server holds a proxy it does not simulate). Used to
+    /// drive the server's ack-routing (`net_pump` `drain_acks`).
+    fn spawn_owned_entity(&mut self, pos: Position, vel: Velocity) -> Entity {
+        engine_core::spawn_owned(&mut self.world, self.local, pos, vel)
     }
 
     fn pump(&mut self) {
         let peers: Vec<_> = self.transport.poll_peers().expect("transport open");
         for (peer, state) in peers {
             if matches!(state, PeerState::Connected) {
-                // This client owns nothing (Mode 3) — it only receives. Tracking
-                // is inert here; kept for symmetry with the server-side pump.
+                // Track the peer so collect_all produces a per-peer outbox for
+                // it (a client that owns nothing sends an empty outbox — inert).
                 self.repl
                     .on_peer_connected(PeerId::from_uuid_bytes(*peer.0.as_bytes()));
             }
@@ -75,6 +88,41 @@ impl Client {
             self.received_state_msgs += 1;
             let from = PeerId::from_uuid_bytes(*from.0.as_bytes());
             self.repl.apply_state(&mut self.world, from, &bytes);
+        }
+
+        // Ack the streams we applied (ADR-0020) so each SENDER advances its delta
+        // baseline and a confirmed value goes quiet — the missing client-side
+        // wiring, mirroring the server's net_pump. Map protocol id → transport peer.
+        let connected: Vec<_> = self.transport.connected_peers().collect();
+        for (target, ack) in self.repl.drain_acks() {
+            if let Some(peer) = connected
+                .iter()
+                .find(|p| PeerId::from_uuid_bytes(*p.0.as_bytes()) == target)
+            {
+                let _ = self.transport.send_event(*peer, ack);
+            }
+        }
+
+        // Send our OWNED entities' state (Mode-2-shaped) to each tracked peer.
+        // A client that owns nothing yields empty outboxes — transparent to the
+        // Mode-3 receive-only tests; drives the server's ack-routing in return.
+        // NB: unlike net_pump this has NO NET_INTERVAL accumulator — it sends at
+        // poll rate (~200 Hz), which amplifies an unconfirmed value's re-sends
+        // (do not read state_msgs_sent as a ~20 Hz cadence — auditor N3).
+        for (target, out) in self.repl.collect_all(&mut self.world) {
+            let Some(peer) = connected
+                .iter()
+                .find(|p| PeerId::from_uuid_bytes(*p.0.as_bytes()) == target)
+            else {
+                continue;
+            };
+            if let Some(state) = out.state {
+                self.state_msgs_sent += 1;
+                let _ = self.transport.send_state(*peer, state);
+            }
+            for ev in out.events {
+                let _ = self.transport.send_event(*peer, ev);
+            }
         }
     }
 
@@ -206,5 +254,115 @@ async fn network_cadence_decoupled_from_fixed_tick() {
     assert!(
         rate < 45.0,
         "state cadence must be decoupled from the 64 Hz fixed tick; measured {rate:.1}/s"
+    );
+}
+
+/// Ack round-trip over the REAL pump (ADR-0020): a confirmed value goes quiet.
+/// Both directions are driven:
+///   • the client acks the server's stationary entity ⇒ the server's per-peer
+///     delta baseline confirms ⇒ the server stops re-sending it; and
+///   • the client OWNS a stationary entity it replicates to the server ⇒ the
+///     server's ack-routing (`net_pump` `drain_acks` → protocol-id→transport-peer
+///     → `send_event`, previously Mode-3-dead) confirms the client's baseline ⇒
+///     the client stops re-sending it.
+/// This is the integration coverage for the ack wiring the `two_world` unit tests
+/// prove in isolation. It FAILS if either `drain_acks` send is removed: an
+/// unconfirmed stationary value re-sends at the ~20 Hz net interval (~40 msgs in
+/// the 2 s window), a confirmed one is ~0.
+#[tokio::test(flavor = "multi_thread")]
+async fn ack_round_trip_confirms_and_goes_quiet() {
+    let room = start_signaling();
+    // No moving demo entities: a moving value re-sends every tick regardless of
+    // acks, masking the "goes quiet" signal. Spawn ONE stationary server entity
+    // (after build — collect_all re-queries the world, so it is picked up).
+    let (mut app, server_id) = boot_server(&room, 0).await;
+    engine_core::spawn_owned(
+        app.world_mut(),
+        server_id,
+        Position { x: 5.0, y: 5.0 },
+        Velocity { x: 0.0, y: 0.0 },
+    );
+    let mut client = Client::connect(&room).await;
+    let client_local = client.local;
+    // The client OWNS a stationary entity → replicates it to the server, exercising
+    // the server's ack-routing on the return path.
+    client.spawn_owned_entity(Position { x: -3.0, y: 7.0 }, Velocity { x: 0.0, y: 0.0 });
+
+    // Phase 1: converge — state has flowed BOTH ways (client holds the server's
+    // proxy AND the server holds the client's proxy).
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    loop {
+        app.update();
+        client.pump();
+        let client_has_server = client.server_proxies(server_id).len() == 1;
+        let world = app.world_mut();
+        let server_has_client = world
+            .query::<&Owner>()
+            .iter(world)
+            .any(|o| o.0 == client_local);
+        if client_has_server && server_has_client {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "state never flowed both directions (client_has_server={client_has_server})"
+        );
+        tokio::time::sleep(POLL).await;
+    }
+
+    // Phase 2: settle — let both acks round-trip so both delta baselines confirm.
+    let settle_end = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < settle_end {
+        app.update();
+        client.pump();
+        tokio::time::sleep(POLL).await;
+    }
+
+    // Phase 3: observe — a CONFIRMED stationary value is not re-sent, either way.
+    let recv_baseline = client.received_state_msgs;
+    let sent_baseline = client.state_msgs_sent;
+    let obs_end = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < obs_end {
+        app.update();
+        client.pump();
+        tokio::time::sleep(POLL).await;
+    }
+    let recv_delta = client.received_state_msgs - recv_baseline;
+    let sent_delta = client.state_msgs_sent - sent_baseline;
+
+    // Non-vacuity: a value can go quiet ONLY after state flowed on the counted
+    // channel AND was acked (confirmation causality) — so a plateau at a POSITIVE
+    // baseline is a confirmed value, not an absent stream. Make that explicit in
+    // the test rather than leaning on the (Spawn-satisfiable) position sanity below
+    // (auditor N2): both directions must have carried ≥1 state-channel message.
+    assert!(
+        recv_baseline > 0 && sent_baseline > 0,
+        "state must have flowed on BOTH channels before it could go quiet \
+         (recv={recv_baseline}, sent={sent_baseline})"
+    );
+
+    // The discriminator: unconfirmed ⇒ the value re-sends every net tick, confirmed
+    // ⇒ ~0. The small margin absorbs an in-flight re-send racing the confirmation.
+    assert!(
+        recv_delta <= 2,
+        "server's stationary entity must go quiet once the client acks it; got \
+         {recv_delta} state msgs in 2s (unconfirmed ~40 at the 20 Hz net interval — \
+         client→server ack broken)"
+    );
+    assert!(
+        sent_delta <= 2,
+        "client's stationary entity must go quiet once the server acks it; got \
+         {sent_delta} state msgs in 2s (unconfirmed ~hundreds at poll rate — \
+         net_pump ack-routing broken)"
+    );
+
+    // Sanity: the client actually converged (it holds the server's proxy at its
+    // stationary position) — the quiet is a confirmed value, not an empty stream.
+    let proxies = client.server_proxies(server_id);
+    assert_eq!(proxies.len(), 1, "client must still hold the server proxy");
+    assert!(
+        (proxies[0].x - 5.0).abs() < 0.1 && (proxies[0].y - 5.0).abs() < 0.1,
+        "server proxy must rest at its stationary position, got {:?}",
+        proxies[0]
     );
 }
