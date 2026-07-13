@@ -83,9 +83,47 @@ mod interest;
 use interest::{Aoi, DEFAULT_CELL, SpatialGrid};
 
 /// The safe single-datagram budget for the unreliable channel: beyond this,
-/// SCTP fragments the message and any one lost fragment loses ALL of it.
-/// Collect warns above this size; splitting is Phase 3 (interest management).
+/// SCTP fragments the message and any one lost fragment loses ALL of it. The
+/// AOI size-cap (ADR-0029) keeps each per-peer state snapshot within this bound.
 pub const SAFE_DATAGRAM_BYTES: usize = 1150;
+
+/// A conservative reserve for the non-entry part of a `StateMsg` on the wire
+/// (ADR-0029): the `version` byte, the `seq`/`tick`/`last_input` u64 varints (≤10
+/// bytes each), and the `entries` Vec length varint (≤5). Subtracted from the
+/// datagram budget to bound the entry payload.
+const HEADER_RESERVE: usize = 1 + 3 * 10 + 5;
+
+/// The budget for the `entries` payload of one state datagram (ADR-0029).
+const STATE_ENTRY_BUDGET: usize = SAFE_DATAGRAM_BYTES - HEADER_RESERVE;
+
+/// The absolute WORST-CASE encoded size of one `StateEntry` (a full 8-byte
+/// `spawner` u64 + 4-byte index/generation, both components present, max-varint
+/// i32s). The fast-path bound and the single-entry floor (a lone entry always
+/// fits, since this is far below the budget).
+const WORST_ENTRY_BYTES: usize = 10 + 5 + 5 + 2 * (1 + 2 * 5);
+
+/// postcard LEB128 varint byte count for a `u64`.
+fn varint_len_u64(v: u64) -> usize {
+    let mut n = 1;
+    let mut v = v >> 7;
+    while v != 0 {
+        n += 1;
+        v >>= 7;
+    }
+    n
+}
+
+/// A CONSERVATIVE upper bound on one FULL-MASK `StateEntry`'s encoded size for
+/// `id` (ADR-0029): both `pos`+`vel` present, max-varint zigzag i32 components.
+/// Stable per id (independent of which components change this tick) → the AOI
+/// size-cap keeps a stable existence set, and the actual (partial-mask) entry is
+/// always ≤ this, so the packed datagram never exceeds [`STATE_ENTRY_BUDGET`].
+fn state_entry_max_bytes(id: NetEntityId) -> usize {
+    varint_len_u64(id.spawner.0)
+        + varint_len_u64(id.index as u64)
+        + varint_len_u64(id.generation as u64)
+        + 2 * (1 + 2 * 5) // each Option<QVec2>: Some-tag + two max-varint zigzag i32
+}
 
 /// Attempted to transfer ownership of an entity this peer is not currently
 /// authoritative over (or that does not exist).
@@ -541,6 +579,66 @@ impl Replication {
                 }
             };
 
+            // AOI SIZE-CAP (ADR-0029): guarantee this peer's state datagram fits
+            // one MTU. Rank the visible-outer set NEAREST-FIRST (by dist² from the
+            // AOI center; by NetEntityId for an unbounded peer — no center),
+            // tie-broken by NetEntityId for determinism, and keep only the nearest
+            // whose CONSERVATIVE full-mask encodings sum within the entry budget.
+            // The rest are capped OUT of BOTH visible sets, so the AOI-EXIT below
+            // Despawns a capped-out KNOWN entity (dropping its baseline → a sound
+            // re-baseline on re-entry) and a new one is never entered — capping is
+            // an existence WITHHOLD (strictly more private), never a state-entry
+            // deferral (which would break the cumulative-run ack). Fast path: when
+            // the whole set fits even at the worst-case per-entry size, skip.
+            //
+            // ACCEPTED trade-offs (ADR-0029, auditor — by design, not bugs): a
+            // scene that PERSISTENTLY exceeds one MTU never replicates its farthest
+            // (unbounded: highest-id) entities to that peer — there is no rotation
+            // (soundness + nearest-first stability over completeness; the dense
+            // case is the paid-tier Mode-3 concern, and unbounded is a fail-open
+            // non-production default). And the byte frontier is not damped by the
+            // AOI hysteresis, so a frontier entity can Spawn/Despawn-churn as OTHER
+            // entities move — it reuses the audited exit/enter paths (no corruption),
+            // and only bites while over budget.
+            let (visible_outer, visible_inner) = if visible_outer.len() * WORST_ENTRY_BYTES
+                <= STATE_ENTRY_BUDGET
+            {
+                (visible_outer, visible_inner)
+            } else {
+                let mut ranked: Vec<(Entity, NetEntityId, f64, usize)> = visible_outer
+                    .iter()
+                    .filter_map(|&e| {
+                        let row = owned.get(&e)?;
+                        let dist2 = match aoi_p {
+                            Some(a) => {
+                                let dx = dequantize(row.qpos.x) - a.center.0;
+                                let dy = dequantize(row.qpos.y) - a.center.1;
+                                f64::from(dx) * f64::from(dx) + f64::from(dy) * f64::from(dy)
+                            }
+                            None => 0.0, // unbounded: no center → rank by id only
+                        };
+                        Some((e, row.id, dist2, state_entry_max_bytes(row.id)))
+                    })
+                    .collect();
+                // Nearest-first; ties (and the unbounded case) break by NetEntityId.
+                ranked.sort_by(|x, y| x.2.total_cmp(&y.2).then(x.1.cmp(&y.1)));
+                let mut kept: HashSet<Entity> = HashSet::with_capacity(ranked.len());
+                let mut used = 0usize;
+                for (e, _id, _d, sz) in ranked {
+                    // Always keep the nearest (a lone entry is far below budget);
+                    // once one doesn't fit, every FARTHER one is dropped too.
+                    if kept.is_empty() || used + sz <= STATE_ENTRY_BUDGET {
+                        used += sz;
+                        kept.insert(e);
+                    } else {
+                        break;
+                    }
+                }
+                let outer: HashSet<Entity> = visible_outer.intersection(&kept).copied().collect();
+                let inner: HashSet<Entity> = visible_inner.intersection(&kept).copied().collect();
+                (outer, inner)
+            };
+
             // AOI-EXIT — known but past the OUTER radius (still owned): despawn
             // the proxy and drop its baseline (so a re-enter re-baselines from
             // scratch — the run-start soundness across the visibility gap). A
@@ -636,10 +734,13 @@ impl Replication {
                 };
                 match encode_state(&msg) {
                     Ok(bytes) => {
+                        // The AOI size-cap (ADR-0029) bounds the entry payload to
+                        // STATE_ENTRY_BUDGET, so this should be UNREACHABLE — a warn
+                        // here means the cap under-counted (a bug), not normal load.
                         if bytes.len() > SAFE_DATAGRAM_BYTES {
                             log::warn!(
-                                "StateMsg to {p:?} is {}B (> {SAFE_DATAGRAM_BYTES}B safe datagram) \
-                                 — fragmentation loss amplification; split further in Phase 3",
+                                "StateMsg to {p:?} is {}B (> {SAFE_DATAGRAM_BYTES}B) despite the \
+                                 AOI size-cap — cap under-count bug (fragmentation loss risk)",
                                 bytes.len()
                             );
                         }

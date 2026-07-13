@@ -1044,3 +1044,45 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
 - **Status:** Accepted (2026-07-13). The ADR-0025 cross-owner carry-forwards are CLOSED (push/pull exclusion via
   sole-minter; membership via `poll_peers` + deterministic coordinator). The Phase-5 Mode-2 coordinator peer
   SERVICE (a hosted coordinator) builds on this wiring.
+
+## ADR-0029 — AOI size-cap: bound each per-peer state datagram to one MTU (splitting + per-entity acks DEFERRED)
+- **Context:** the Phase-3 "replication throughput follow-ups" item asked for message SPLITTING (over-MTU
+  snapshots) + PER-ENTRY ack granularity (a stuck entry re-sends the whole stream). Exploration + two design
+  agents reframed it: (1) the over-budget snapshot TODAY is already CORRECT — the unreliable state channel
+  (`max_retransmits: Some(0)`) fragments it via SCTP and a lost fragment just loses that snapshot (the acked
+  baseline re-sends next tick); the only harm is a higher *effective loss probability* (~94% vs 98% at 2% loss,
+  k=3), NOT a bug. (2) The stuck-entry stall is bandwidth-only, self-heals via resync in ~1–2 s, and its main
+  trigger (the R6 freeze) was already retired by ADR-0025's `OwnerSeq` gate. (3) TRUE splitting is UNSOUND with
+  the current cumulative-run ack (a later fragment false-confirms a stuck/lost middle fragment — resurrecting the
+  auditor-F1 bug), and a naive entry-cap-with-deferral is unsound too (a deferred entity with an old `run_start`
+  is false-confirmed; the gap-reset can't rescue it) — sound splitting REQUIRES a WIRE change + a negative-ack +
+  a reassembly buffer REPLACING the audited LWW gate + `Outbox.state: Option→Vec` across ~60 sites: a large,
+  high-risk change for a deferred optimization in a casual/co-op envelope.
+- **Decision (user, via AskUserQuestion):** land the SOUND, MINIMAL fix — a **size-bounded nearest-N AOI cap** in
+  `collect_all`'s per-peer loop — and DEFER true splitting + per-entity acks. Right after the visible sets are
+  computed, rank `visible_outer` NEAREST-FIRST (dist² from the AOI center; `NetEntityId` for an unbounded peer),
+  tie-broken by `NetEntityId` for determinism, and keep only the nearest whose CONSERVATIVE full-mask encodings
+  (`state_entry_max_bytes`, max-varint components — stable per id, so existence doesn't flap with per-tick
+  changes) sum within `STATE_ENTRY_BUDGET` = `SAFE_DATAGRAM_BYTES − HEADER_RESERVE`; truncate BOTH visible sets
+  to the kept set. The EXISTING audited AOI-EXIT path then Despawns a capped-out KNOWN entity + drops its
+  baseline (→ a fresh run on re-entry), and a new one is never entered — capping is an existence WITHHOLD, NEVER
+  a state-entry deferral. A fast path (`len × WORST_ENTRY_BYTES ≤ budget`) makes small scenes byte-identical.
+  NO wire change, NO `WIRE_VERSION` bump, `Outbox.state` unchanged, reuses machinery.
+- **Consequences:** each per-peer state datagram is GUARANTEED ≤ `SAFE_DATAGRAM_BYTES` (`36 + 1114 = 1150`;
+  the old `>1150` warn is now an unreachable defensive check). SOUND — no false-confirm (the exit-path baseline
+  drop gives a fresh `run_start` on re-entry; capping is never a deferral), DETERMINISTIC (total order via the
+  `NetEntityId` tiebreak), READ-CHEAT-PRESERVING (intersection only REMOVES → strictly more private). Single-
+  ownership / no-CRDT / no cross-platform determinism untouched. **Accepted trade-offs (by design, not bugs):**
+  a scene that PERSISTENTLY exceeds one MTU never replicates its farthest (unbounded: highest-id) entities to
+  that peer — there is no rotation (soundness + nearest-first stability over completeness; the dense case is the
+  paid-tier Mode-3 concern, and unbounded is a fail-open non-production default); and cap-boundary churn is not
+  damped by the AOI hysteresis (a frontier entity can Spawn/Despawn-churn as OTHERS move — reuses the audited
+  exit/enter paths, no corruption, only bites while over budget). **DEFERRED (YAGNI-until-measured):** true
+  message splitting (preserves ALL-entity visibility across datagrams) + per-entity negative-acks — revisit ONLY
+  if a measured dense-Mode-3 workload needs >budget entities with existence PRESERVED, and then via per-bucket
+  sub-streams (which keep the cumulative-run ack sound PER bucket), not tick-fragmentation. Evidence: two_world
+  116 green (Group CAP: fits-budget, nearest-kept, existence-withheld, fast-path no-op, known-evict-via-Despawn,
+  unbounded, determinism); the existing AOI/bandwidth battery unchanged; clippy `-D warnings` native + wasm32;
+  fmt clean; full workspace green. netcode-audited → **MERGE** (byte-bound airtight, no false-confirm,
+  deterministic, read-cheat-preserving all proven; the two trade-offs flagged as by-design).
+- **Status:** Accepted (2026-07-13).
