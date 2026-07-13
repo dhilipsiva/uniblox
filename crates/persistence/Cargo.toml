@@ -14,3 +14,7 @@ engine-core = { path = "../engine-core" }
 bevy_ecs.workspace = true
 serde.workspace = true
 postcard.workspace = true
+
+[dev-dependencies]
+# native FileStore tests (ADR-0034): write blobs under a throwaway directory
+tempfile.workspace = true

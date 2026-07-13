@@ -17,8 +17,9 @@
 //!
 //! The content id is order-independent: entity records are sorted into a
 //! canonical order before hashing, so the id depends only on the SET of entity
-//! states, not spawn order. Durable stores are B3 (native `FileStore`) / B4
-//! (browser `IdbStore`); this crate ships the in-memory [`MemoryStore`].
+//! states, not spawn order. Stores: the in-memory [`MemoryStore`] (wasm-safe,
+//! the test/acceptance vehicle) + the native durable [`FileStore`] (B3); the
+//! browser durable store is B4 (`IdbStore`, IndexedDB).
 
 use std::collections::HashMap;
 use std::fmt;
@@ -28,6 +29,13 @@ use bevy_ecs::world::World;
 use engine_core::{Contacts, LocalPeer, Owner, Position, Tick, Velocity, insert_sim, spawn_owned};
 use protocol::{ContentId, PeerId, VersionTriple, content_id};
 use serde::{Deserialize, Serialize};
+
+// The native durable store (B3, ADR-0034). Native-only (`std::fs`); the browser
+// durable store is B4 (`IdbStore`). Wasm builds carry only `MemoryStore`.
+#[cfg(not(target_arch = "wasm32"))]
+mod file_store;
+#[cfg(not(target_arch = "wasm32"))]
+pub use file_store::FileStore;
 
 /// Save-blob schema version, checked on load. Independent of
 /// `protocol::WIRE_VERSION` — this is the SAVE format's version. Bump on any
