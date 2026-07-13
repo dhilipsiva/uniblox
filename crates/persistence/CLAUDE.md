@@ -19,7 +19,13 @@ each blob → a `<content-id-hex>.blob` file under a root dir (durable across pr
 fallible `std::io::Result` methods (`open`/`put`/`get`/`contains`) and deliberately does NOT implement the
 infallible `ContentStore` trait — file I/O fails and swallowing it would hide errors. `put` is content-addressed
 (dedup-skip) + temp-file(unique-per-process)+atomic-`rename` (never a partial final file); `get` maps
-`NotFound → Ok(None)`.
+`NotFound → Ok(None)`. **Browser durable `IdbStore` (ADR-0035, B4):** `#[cfg(target_arch="wasm32")]`, IndexedDB
+(one object store keyed by `ContentId` hex, value = blob bytes as `Uint8Array`). ASYNC + fallible (`IdbError`,
+stringified so no `JsValue` leaks) — raw web-sys IDB (chosen over `idb`/`rexie` to keep the exact wasm-bindgen
+pin safe) + a hand-rolled `Closure`+`oneshot` event bridge (`await_request`/`await_tx`). `put` awaits the tx
+`complete` (durability); `open` pins version 1 (store created in `onupgradeneeded`, create-failure propagated).
+**Can't be machine-tested here** (no wasm-test runner matches the pin) — verified by compile + review + a manual
+browser self-test (the client's `[uniblox-idb]` on-load markers).
 
 **Format:** `SaveBlob { version:u8 /*first field = effective leading version byte*/, triple:Option<VersionTriple>,
 tick:u64, local:PeerId, entities:Vec<EntityRecord> }`; `EntityRecord { owner, pos, vel, contacts:Option<u32> }`;
@@ -38,9 +44,9 @@ determinism, contacts Some/None, version mismatch, content mismatch (+ honest-bl
   `Interactable` (content-authored, reattached from content), and `Health` (in the unconsumed `scripting` crate).
 - **Reload rebuilds via `spawn_owned`** (the sole sim-entity construction path) — never bypass it.
 - **The sync `ContentStore` trait is the IN-MEMORY abstraction only.** Durable backends fail (and, for the
-  browser, are async), so they expose backend-shaped inherent methods, NOT the infallible trait: `FileStore` (B3,
-  done) returns `io::Result`; `IdbStore` (B4, IndexedDB) will be fallible + async. Don't force a durable store into
-  the infallible trait (it would swallow I/O errors).
+  browser, are async), so they expose backend-shaped inherent methods, NOT the infallible trait: `FileStore` (B3)
+  returns `io::Result`; `IdbStore` (B4, IndexedDB) is async + returns `Result<_, IdbError>`. Don't force a durable
+  store into the infallible trait (it would swallow I/O errors).
 
 ## Rules
 Inherit all root invariants and always-do rules from `../../CLAUDE.md`.

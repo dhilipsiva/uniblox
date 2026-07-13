@@ -1252,3 +1252,38 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   inherent-`io::Result` design affirmed as the right call; 1 LOW — a shared temp name concurrent-writer race —
   FIXED with a unique per-process temp name).
 - **Status:** Accepted (2026-07-13).
+
+## ADR-0035 — browser `IdbStore`: durable content-addressed save via IndexedDB
+- **Context:** B3 (ADR-0034) gave the native durable `FileStore`; B4 adds the BROWSER durable store so a Mode-1
+  save survives a page reload in the browser (the wasm counterpart to FileStore). C1 wires the real save keybind
+  through it.
+- **Decision:** `crates/persistence/src/idb_store.rs` (`#[cfg(target_arch = "wasm32")]`) — `IdbStore` over IndexedDB:
+  one object store keyed by `ContentId::to_hex()`, value = the blob bytes as a `Uint8Array`. Async + fallible
+  (`IdbError`, a stringified message so `JsValue`/web-sys types never leak into the public API), and like FileStore
+  it does NOT implement the infallible sync `ContentStore` trait (durable + async). **Binding = raw web-sys
+  IndexedDB, NOT a helper crate:** the exact `wasm-bindgen = "=0.2.121"` pin (matches the flake's
+  `wasm-bindgen-cli`) makes `idb`/`rexie`/`gloo-storage` compat unverifiable offline (a mismatch just fails the
+  build), whereas enabling more features on the already-resolved `web-sys 0.3.98` is guaranteed compatible.
+  IndexedDB is event-callback based (`IDBRequest` fires success/error, `IDBTransaction` fires complete/error/abort
+  — NOT Promises), so a small hand-rolled `Closure` + `futures::channel::oneshot` bridge (`await_request` /
+  `await_tx`) awaits each. `put` awaits the TRANSACTION `complete` (durability — a read-back after reload needs the
+  commit, not just the request success); `get` maps `undefined`/`null` → `Ok(None)`; `open` creates the object
+  store in `onupgradeneeded` at a permanently-pinned version 1 (so `blocked` can never fire and `upgradeneeded`
+  runs once) and PROPAGATES a `create_object_store` failure (so a store-less v1 DB never silently commits). New
+  deps: `js-sys` added to `[workspace.dependencies]`; a `persistence` `[target.wasm32]` block (wasm-bindgen /
+  js-sys / futures / web-sys IDB features).
+- **Consequences:** the browser Mode-1 save is durable across a page reload. **Verification is compile + review +
+  a MANUAL browser self-test — B4's IDB code CANNOT be machine-tested in this environment** (no headless wasm-test
+  runner in the flake, and no cached `wasm-bindgen-test` release matches `=0.2.121`). Per the user's choice, the
+  client's on-load `mod demo` gains an `idb_selftest()` (`spawn_local`) that opens the store, `get`s a fixed blob
+  (→ `[uniblox-idb] first session` fresh, or `durable: prior-session blob present` on reload), then put+get
+  (`roundtrip ok`) — reloading the tab and seeing "durable" proves persistence. (C1 replaces it with the real save
+  UI.) Evidence: `cargo build`/`clippy -p persistence --target wasm32-unknown-unknown` clean + `clippy -p client
+  --target wasm32` clean; native `cargo test -p persistence` 13/13 (IdbStore cfg'd out); full workspace green; BOTH
+  WASM builds compile; **size gate re-checked → PASS** (3.39/3.41 MB brotli — only ~2–3 KB over B3; `futures`/`js-sys`
+  were already in the wasm graph). Fresh reviewer → the async bridge affirmed CORRECT (closure lifetimes across
+  `.await`, oneshot single-send, put-awaits-commit durability, get/open semantics, no `JsValue` leak, no always-do
+  violation); 1 LOW — a swallowed `onupgradeneeded` create failure could brick a v1 DB — FIXED (open now propagates
+  it); the remaining notes (no `blocked` arm — unreachable at v1, commented; relaxed tx durability — fine for
+  reload; `contains` copies the blob — mirrors FileStore) are accepted-by-design.
+- **Status:** Accepted (2026-07-13).

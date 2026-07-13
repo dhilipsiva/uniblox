@@ -112,8 +112,14 @@ determinism + mismatch/verify + clear-path); clippy native+wasm32 + fmt clean; w
 I/O fails; content-addressed dedup + unique-temp+atomic-rename), so the native Mode-1 save survives a process
 restart. 13 persistence tests (7 codec + 6 file_store incl. end-to-end save→file→verified-load + tamper detect);
 clippy native+wasm32 (FileStore cfg'd out) + fmt clean; workspace green; reviewer → clean (unique-temp fix
-applied). Remaining Phase-4: B4 browser `IdbStore` (IndexedDB, async — durable browser save) → C1 opt-in
-save/load wired into the client.
+applied). **Item B4 (ADR-0035) DONE — browser durable `IdbStore`:** IndexedDB (async; raw web-sys IDB + a hand-rolled
+`Closure`+`oneshot` bridge chosen over a helper crate for exact-pin safety; keyed by `ContentId` hex, value =
+blob bytes; `put` awaits the tx commit for durability; `open` pins version 1 + propagates a create failure), so a
+browser Mode-1 save survives a page reload. Its IDB code CAN'T be machine-tested here (no wasm-test runner matches
+the `=0.2.121` pin) — verified by compile (both wasm builds) + reviewer (async bridge affirmed correct, 1 LOW
+fixed) + a manual browser self-test in the client (`idb_selftest()`, `[uniblox-idb]` on-load markers, reload flips
+"first session"→"durable"); size gate re-checked → PASS (3.39/3.41 MB, ~+2–3 KB). Remaining Phase-4: **C1** — the
+opt-in save/load keybind in the client wiring the actual game world through a store (the LAST Phase-4 item).
 
 ## Done
 - **Cargo workspace** — virtual manifest, 10 crates under `crates/*` (glob members),
