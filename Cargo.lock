@@ -6323,8 +6323,13 @@ dependencies = [
 name = "services"
 version = "0.1.0"
 dependencies = [
+ "futures",
+ "matchbox_protocol",
  "matchbox_signaling",
+ "protocol",
+ "serde_json",
  "tokio",
+ "tokio-tungstenite",
  "tracing-subscriber",
 ]
 

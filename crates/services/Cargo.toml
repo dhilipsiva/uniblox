@@ -4,6 +4,17 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+protocol = { path = "../protocol" }        # VersionTriple for the scope key (ADR-0037)
 matchbox_signaling.workspace = true
+matchbox_protocol.workspace = true         # PeerId (the signaling-assigned UUID)
 tokio.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+# raw-WS signaling integration tests (ADR-0037): connect peers, assert relay +
+# scope isolation + the session registry. `time`/`net` extend the workspace
+# tokio features (macros/rt) for `timeout`/`sleep` + the WS client.
+tokio = { workspace = true, features = ["time", "net", "macros", "rt-multi-thread"] }
+tokio-tungstenite.workspace = true
+serde_json.workspace = true
+futures.workspace = true

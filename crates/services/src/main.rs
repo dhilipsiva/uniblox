@@ -1,13 +1,12 @@
-//! uniblox signaling server: room-based full-mesh WebRTC signaling (matchbox).
-//!
-//! Rooms are URL paths: peers connecting to `ws://host:3536/<room>` are
-//! full-meshed within that room. Phase 5 extends this with mode/version
-//! scoping and `?next=N` matchmaking via a custom `SignalingTopology`
-//! (the plain full-mesh topology has no `?next=` handling).
+//! uniblox signaling server binary (ADR-0037): scoped room-based WebRTC
+//! signaling. Rooms are URL paths; a scoped room is
+//! `<mode>~<engine>.<content>.<schema>~<lobby>` (peers with a different
+//! mode/version are isolated) and a plain path is a legacy room. The matchmaking
+//! logic + session registry live in the `services` library.
 
 use std::net::{Ipv4Addr, SocketAddr};
 
-use matchbox_signaling::SignalingServer;
+use services::{SessionRegistry, build_signaling_server};
 
 /// matchbox's conventional signaling port.
 const DEFAULT_PORT: u16 = 3536;
@@ -25,13 +24,12 @@ async fn main() {
         .unwrap_or(DEFAULT_PORT);
     let addr: SocketAddr = (Ipv4Addr::UNSPECIFIED, port).into();
 
-    let server = SignalingServer::full_mesh_builder(addr)
-        .on_peer_connected(|peer| println!("[signaling] peer connected: {peer}"))
-        .on_peer_disconnected(|peer| println!("[signaling] peer disconnected: {peer}"))
-        .cors()
-        .build();
+    let registry = SessionRegistry::new();
+    let server = build_signaling_server(addr, registry);
 
-    println!("[signaling] uniblox full-mesh signaling on ws://{addr}/<room>");
+    println!(
+        "[signaling] uniblox scoped signaling on ws://{addr}/<mode>~<engine>.<content>.<schema>~<lobby>"
+    );
     if let Err(err) = server.serve().await {
         eprintln!("[signaling] server error: {err}");
         std::process::exit(1);
