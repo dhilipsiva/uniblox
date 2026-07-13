@@ -21,10 +21,12 @@ interpolation is used. The ADR-0017 `Bouncer` sine demo is replaced; the
 (`[uniblox-demo][STATE]/[EVENT]` markers; re-verified with Bevy in-binary
 2026-07-11) and the **metrics harness** (`[uniblox-metrics]`: ed25519 sign
 ~20–25 µs / verify ~45 µs; cold-load 351 ms instantiate / 381 ms first frame,
-local headless — see `/slice-check`) and the **IndexedDB self-test** (ADR-0035, B4: `idb_selftest()` via
-`spawn_local` opens `persistence::IdbStore`, get→put→get a fixed blob → `[uniblox-idb] first session` / `durable:
-prior-session blob present` / `roundtrip ok` — reload the tab and the first marker flips to "durable", proving the
-browser save persists across reloads; C1 replaces it with the real save UI). Native main is still the stub.
+local headless — see `/slice-check`). **Opt-in Mode-1 save/load (ADR-0036, C1):** `K` saves the live world
+(`persistence::save_world` → `spawn_local` → browser `IdbStore` + a localStorage "latest" pointer), `L` loads it
+(pointer → `IdbStore::get` → a `LoadInbox` NonSend `Rc<RefCell>` bridge → an exclusive `apply_load` runs
+`load_world_verified` and RE-CLOTHES the reconstructed entities with `Sprite`/`Transform` + a fresh `Avatar`,
+since the authoritative save omits the client render/control layer). `[uniblox-save]` console markers; move → K →
+reload tab → L restores the world (also B4's real end-to-end proof). Native main is still the stub.
 
 ## Gotchas (learned here)
 - **Bevy's derive macros miss target-scoped deps** — they scan `[dependencies]`

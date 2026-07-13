@@ -1287,3 +1287,34 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   it); the remaining notes (no `blocked` arm — unreachable at v1, commented; relaxed tx durability — fine for
   reload; `contains` copies the blob — mirrors FileStore) are accepted-by-design.
 - **Status:** Accepted (2026-07-13).
+
+## ADR-0036 — client save/load keybinds: opt-in Mode-1 save through IndexedDB (Phase 4 COMPLETE)
+- **Context:** the LAST Phase-4 item (C1) — wire an opt-in save/load into the playable Mode-1 client (A2), tying
+  together `persistence::{save_world, load_world_verified}` (B2) and the browser `IdbStore` (B4) so a player can
+  persist the live world and restore it across a page reload. Also gives B4 its real end-to-end browser proof.
+- **Decision:** in the client's wasm-only `mod render`, `K` = save, `L` = load (avatar movement already owns
+  WASD+arrows incl. `S`). **Save** (`save_on_key`, exclusive): `save_world(&World)` → `(id, blob)`; `spawn_local`
+  writes the blob to `IdbStore` and the id hex to `localStorage[SLOT_KEY]` (the mutable "latest save" pointer; the
+  immutable blob is content-addressed in IndexedDB) — only logs "saved" once the pointer persists. **Load**
+  (`load_on_key`, regular): read the pointer → `ContentId::from_hex`; `spawn_local` fetches the blob and deposits
+  `(id, blob)` into a `LoadInbox`. **Apply** (`apply_load`, exclusive, per-frame): `take()` the inbox →
+  `load_world_verified(world, …)` → **re-clothe** (the save records authoritative sim state only, so `load_world`
+  rebuilds bare entities — this re-attaches `Sprite`+`Transform` to every `Position`-without-`Transform` entity and
+  re-designates one as the controllable `Avatar`). The async→ECS bridge is a `LoadInbox` NonSend resource
+  (`Rc<RefCell<Option<(ContentId, Vec<u8>)>>>` — correct on single-threaded wasm; the async task can't touch
+  `&mut World`). The B4 `idb_selftest` is removed (superseded); the client's `web-sys` gains the `Storage` feature.
+- **Consequences:** **Phase 4 (Mode 1 Standalone) is COMPLETE** — A1 (net-free `standalone` runtime), A2
+  (browser-playable Mode 1), B1 (`ContentId`/blake3), B2 (`save_world`/`load_world` + `MemoryStore`), B3 (native
+  `FileStore`), B4 (browser `IdbStore`), C1 (client save/load). Accepted demo simplifications (documented): avatar
+  identity is NOT in the authoritative save (render/control is client-only), so after load an arbitrary
+  reconstructed entity becomes the avatar; a single localStorage slot (not multi-slot/named saves); manual K/L
+  (no auto-load-on-startup). The browser path can't be machine-tested here (no wasm-test runner matches the pin) —
+  verified by compile (both WASM builds) + reviewer + a manual browser check (move → K save → reload tab → L
+  restores the avatar+NPCs to their saved positions, proving persistence AND B4 end-to-end). Evidence:
+  `cargo build`/`clippy -p client --target wasm32-unknown-unknown` clean (fixed 2 Bevy-0.19 deprecations
+  `non_send_resource`→`non_send` / `insert_non_send_resource`→`insert_non_send`, and a `type_complexity` alias);
+  native `cargo test -p client` 2/2; full workspace green; **size gate re-checked → PASS** (3.40/3.42 MB brotli,
+  ~+9–10 KB). Fresh reviewer → clean (async load bridge, re-clothe two-pass, NLL borrow release, no always-do
+  violation all affirmed); 2 LOW addressed (the save-pointer log now only claims "saved" on pointer success; stale
+  `idb_selftest` docs updated); the avatar-reshuffle is accepted-by-design.
+- **Status:** Accepted (2026-07-13).

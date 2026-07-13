@@ -7,8 +7,9 @@ The **why** behind decisions lives in `DECISIONS.md`; the **what/how** lives in
 **Current phase: PHASE 1 COMPLETE; PHASE 2 (transport hardening) COMPLETE bar the deploy-gated telemetry
 numbers; PHASE 3 (replication depth, HIGH) HAS BEGUN; PHASE 4 (Mode 1 Standalone) UNDERWAY (A1 — the
 net-free `standalone` runtime — DONE, ADR-0030; A2 — browser-playable Mode 1 in the client — DONE, ADR-0031;
-B1 `ContentId`/blake3 — DONE, ADR-0032; B2 `persistence` save/load — DONE, ADR-0033; B3/B4/C1 (durable stores +
-client hook) remaining).** The slice proved the authority-swap (gate PASSED,
+B1 `ContentId`/blake3 — DONE, ADR-0032; B2 `persistence` save/load — DONE, ADR-0033; B3 native `FileStore` —
+DONE, ADR-0034; B4 browser `IdbStore` — DONE, ADR-0035; C1 client save/load keybinds — DONE, ADR-0036 —
+**PHASE 4 COMPLETE**).** The slice proved the authority-swap (gate PASSED,
 ADR-0014) and **the Bevy client renders in-browser (ADR-0017)** with every slice measurement taken (real
 two-build sizes 3.38/3.40 MB brotli, cold-load, in-browser ed25519; size-budget gate PASSES). **Phase 2 is
 done:** str0m native/server peer (ADR-0015), ICE policy tiers + hermetic TURN relay proof (ADR-0016),
@@ -118,8 +119,15 @@ blob bytes; `put` awaits the tx commit for durability; `open` pins version 1 + p
 browser Mode-1 save survives a page reload. Its IDB code CAN'T be machine-tested here (no wasm-test runner matches
 the `=0.2.121` pin) — verified by compile (both wasm builds) + reviewer (async bridge affirmed correct, 1 LOW
 fixed) + a manual browser self-test in the client (`idb_selftest()`, `[uniblox-idb]` on-load markers, reload flips
-"first session"→"durable"); size gate re-checked → PASS (3.39/3.41 MB, ~+2–3 KB). Remaining Phase-4: **C1** — the
-opt-in save/load keybind in the client wiring the actual game world through a store (the LAST Phase-4 item).
+"first session"→"durable"); size gate re-checked → PASS (3.39/3.41 MB, ~+2–3 KB). **Item C1 (ADR-0036) DONE — PHASE 4 COMPLETE.** The client gains opt-in save/load keybinds: `K` saves the live
+world (`save_world` → `spawn_local` → browser `IdbStore` + a localStorage "latest" pointer), `L` loads it (pointer
+→ `IdbStore::get` → a `LoadInbox` NonSend `Rc<RefCell>` bridge → an exclusive `apply_load` runs
+`load_world_verified` + re-clothes the reconstructed entities with `Sprite`/`Transform`+`Avatar`, since the
+authoritative save omits render/control roles). Verified by compile (both WASM builds) + reviewer (clean) + a
+manual browser check (move → K → reload → L restores the world, also B4's end-to-end proof); size gate PASS
+(3.40/3.42 MB). **Phase 4 delivered:** the Mode-1 Standalone runtime (A1 net-free `standalone` + A2
+browser-playable) and the full content-addressed save (B1 `ContentId`/blake3 → B2 `save_world`/`load_world` +
+`MemoryStore` → B3 native `FileStore` → B4 browser `IdbStore` → C1 client keybinds).
 
 ## Done
 - **Cargo workspace** — virtual manifest, 10 crates under `crates/*` (glob members),
