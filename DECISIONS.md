@@ -1318,3 +1318,41 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   violation all affirmed); 2 LOW addressed (the save-pointer log now only claims "saved" on pointer success; stale
   `idb_selftest` docs updated); the avatar-reshuffle is accepted-by-design.
 - **Status:** Accepted (2026-07-13).
+
+## ADR-0037 — scoped signaling service: SDP/ICE relay + `{mode, version}` scoping + session registry
+- **Context:** first Phase-5 item. Turn `crates/services` from a bare stock-`matchbox_signaling` full-mesh binary
+  into a library + binary that relays SDP/ICE (matchmaking), SCOPES matchmaking by `{mode, version}` (mismatched
+  peers never match), and keeps a session registry (lists active sessions). Exploration found matchbox's `?next=N`
+  matchmaking lives ONLY in the un-vendored `matchbox_server` binary; the library (`matchbox_signaling` 0.14, what
+  we use) rooms peers strictly by URL PATH, and a topology sees only the `room` (path), never the query.
+- **Decision (user, via AskUserQuestion — "path scope + gate + registry"):** encode the scope in the room PATH —
+  `<mode>~<engine>.<content>.<schema>~<lobby>` (e.g. `m1~1.2.3~arena`; `mode ∈ {m1,m2,m3}`, triple →
+  `protocol::VersionTriple`). matchbox's FullMesh isolates strictly by the path string, so a different scope ⇒ a
+  different room ⇒ never matched (offers/answers relay only within one room) — **scoping is enforced
+  STRUCTURALLY**, reusing the battle-tested relay (no re-implemented signaling). An `on_connection_request` gate
+  rejects a malformed `~`-scoped path (`Ok(false)` = 401, never enters a room); a plain single-token path (no `~`)
+  is a legacy room, accepted as-is (keeps the `uniblox-demo` demo working). The in-memory `SessionRegistry`
+  (`Arc<Mutex<…>>`) tracks rooms→peers via a LIFECYCLE-BALANCED callback chain: the gate stashes `room` by
+  `origin: SocketAddr`; `on_id_assignment` (pre-upgrade) BRIDGES it to a `peer→room` staging; `on_peer_connected`
+  (post-upgrade) JOINs the peer into `sessions`; `on_peer_disconnected` REMOVEs + prunes. `list()`/`peer_count()`/
+  `session_count()` expose the listing (an HTTP `/_sessions` endpoint is a deferred ops add-on).
+  `build_signaling_server(addr, registry)` assembles it; the binary is a thin wrapper (port
+  `UNIBLOX_SIGNALING_PORT`/3536).
+- **Consequences:** this item CLOSES bullet 1 (peers exchange offers/answers; sessions listed; scoping enforced)
+  AND SUBSUMES bullet 2 ("groups only same-mode, same-version" — a different mode/version is a different room, so
+  mismatched peers are never matched). **Deferred** to later Phase-5 bullets (each genuinely needs more than exact
+  path-scoping): a custom `SignalingTopology` with client-specified `?next=N` session-SIZE grouping; the ASYMMETRIC
+  version filter (engine ≥ minimum; content/schema exact — requires grouping compatible-but-not-identical peers,
+  which exact-string scoping can't do); a shared Redis/Postgres registry for horizontal scale; signaling-DoS
+  rate-limiting/auth (Phase 11). NOTE: this is structural ISOLATION, not access control (no room secret; a client
+  may name any path — auth is the deferred bullet). Evidence: 3 unit tests (`parse_scope` valid + every malformed
+  form) + 7 raw-WS integration tests (A→B offer relay, distinct-mode + distinct-version isolation, malformed-scope
+  rejection, legacy-room passthrough, sorted session listing, disconnect-prune) green; clippy `-D warnings` native
+  (`--all-targets`) + fmt clean; full workspace green. Fresh reviewer (cross-checked against the matchbox 0.14.0
+  source) → structural isolation + the gate/id correlation + concurrency all affirmed correct; **1 MEDIUM FIXED** —
+  the registry add/remove were not lifecycle-balanced (add at pre-upgrade `on_id_assignment` vs remove at
+  post-upgrade `on_peer_disconnected`, so a failed-upgrade-after-id peer would over-report a session); moved the
+  `sessions` insert to the balanced `on_peer_connected`, so a listed session only ever holds connected peers (the
+  residual `peer_room` staging entry for a never-upgraded peer is non-listed, memory-only, bounded by the deferred
+  rate-limiting). No always-do violation; the `Mode` tag is signaling-local (not a gameplay/`authority_of` branch).
+- **Status:** Accepted (2026-07-13).
