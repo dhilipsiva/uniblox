@@ -74,35 +74,6 @@ mod demo {
         ));
     }
 
-    /// IndexedDB self-test (ADR-0035): prove the browser `IdbStore` round-trips
-    /// and PERSISTS across a page reload. Runs once on load — reloading the tab
-    /// should flip the first marker from "first session" to "durable".
-    async fn idb_selftest() {
-        const BLOB: &[u8] = b"uniblox-idb-selftest-v1";
-        let id = protocol::content_id(BLOB);
-        let store = match persistence::IdbStore::open("uniblox", "saves").await {
-            Ok(s) => s,
-            Err(e) => {
-                log(&format!("[uniblox-idb] open failed: {e}"));
-                return;
-            }
-        };
-        match store.get(id).await {
-            Ok(Some(_)) => log("[uniblox-idb] durable: a prior-session blob is present"),
-            Ok(None) => log("[uniblox-idb] first session: no prior blob (storing now)"),
-            Err(e) => log(&format!("[uniblox-idb] get failed: {e}")),
-        }
-        match store.put(BLOB).await {
-            Ok(put_id) if put_id == id => match store.get(id).await {
-                Ok(Some(got)) if got.as_slice() == BLOB => log("[uniblox-idb] roundtrip ok"),
-                Ok(_) => log("[uniblox-idb] roundtrip MISMATCH"),
-                Err(e) => log(&format!("[uniblox-idb] get-after-put failed: {e}")),
-            },
-            Ok(_) => log("[uniblox-idb] put returned an unexpected id"),
-            Err(e) => log(&format!("[uniblox-idb] put failed: {e}")),
-        }
-    }
-
     pub fn start() {
         // Surface Rust panics as console.error with a message + backtrace
         // (panic=abort still traps afterwards, but the cause is visible), and
@@ -110,7 +81,6 @@ mod demo {
         console_error_panic_hook::set_once();
         let _ = console_log::init_with_level(log::Level::Debug);
         bench_ed25519();
-        spawn_local(idb_selftest());
         log(&format!("[uniblox-demo] connecting to {ROOM_URL}"));
         // Default ICE (STUN): browsers reject an empty ICE-server entry, so
         // the hermetic variant is native-only. Localhost tabs connect via
@@ -182,16 +152,45 @@ fn move_dir(up: bool, down: bool, left: bool, right: bool) -> (f32, f32) {
 mod render {
     // Bevy's derive macros detect the `bevy` facade by scanning [dependencies];
     // ours is target-scoped, so they emit `bevy_ecs::` paths — alias them back.
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use bevy::ecs as bevy_ecs;
     use bevy::prelude::*;
     use engine_core::{Position, Velocity, insert_sim, spawn_owned};
-    use protocol::PeerId;
+    use persistence::{IdbStore, load_world_verified, save_world};
+    use protocol::{ContentId, PeerId};
+    use wasm_bindgen_futures::spawn_local;
 
     /// This instance's peer id. In Mode 1 every entity is owned by `LOCAL`, so
     /// `authority_of` is `Local` for all and the sim integrates everything.
     const LOCAL: PeerId = PeerId(1);
     /// Avatar movement speed, world units per second.
     const SPEED: f32 = 160.0;
+    /// IndexedDB database + object-store names for the Mode-1 save.
+    const DB: &str = "uniblox";
+    const STORE: &str = "saves";
+    /// localStorage key holding the hex of the latest save's content id (the
+    /// mutable "latest save" pointer; the immutable blob lives in IndexedDB).
+    const SLOT_KEY: &str = "uniblox.save.latest";
+
+    fn log(msg: &str) {
+        web_sys::console::log_1(&msg.into());
+    }
+
+    fn local_storage() -> Option<web_sys::Storage> {
+        web_sys::window()?.local_storage().ok()?
+    }
+
+    /// A fetched save awaiting application: `(content id, blob)`.
+    type PendingLoad = Rc<RefCell<Option<(ContentId, Vec<u8>)>>>;
+
+    /// Async→ECS inbox (ADR-0036): a `spawn_local` load task deposits the fetched
+    /// `(id, blob)`; the exclusive `apply_load` system drains + applies it next
+    /// frame. `Rc<RefCell>` is correct here — wasm is single-threaded, so this is
+    /// a NonSend resource.
+    #[derive(Default)]
+    struct LoadInbox(PendingLoad);
 
     /// Marks the player-controlled avatar (client-local, not a sim component).
     #[derive(Component)]
@@ -232,6 +231,8 @@ mod render {
                 Transform::default(),
             ));
         }
+
+        log("[uniblox-save] press K to save, L to load");
     }
 
     /// Read the movement keys and set the avatar's authoritative `Velocity`
@@ -260,6 +261,111 @@ mod render {
             transform.translation.x = pos.x;
             transform.translation.y = pos.y;
         }
+    }
+
+    /// Save the live Mode-1 world to IndexedDB on `K`, remembering its content id
+    /// in the localStorage pointer. Exclusive — `save_world` reads the whole
+    /// `&World`; the async IndexedDB write is handed to `spawn_local`.
+    fn save_on_key(world: &mut World) {
+        if !world
+            .resource::<ButtonInput<KeyCode>>()
+            .just_pressed(KeyCode::KeyK)
+        {
+            return;
+        }
+        match save_world(world) {
+            Ok((id, blob)) => {
+                let hex = id.to_hex();
+                spawn_local(async move {
+                    match IdbStore::open(DB, STORE).await {
+                        Ok(store) => match store.put(&blob).await {
+                            Ok(_) => {
+                                // Only claim "saved" once the pointer persists —
+                                // otherwise a later load can't find the blob.
+                                let pointer_ok = local_storage()
+                                    .map(|ls| ls.set_item(SLOT_KEY, &hex).is_ok())
+                                    .unwrap_or(false);
+                                if pointer_ok {
+                                    log(&format!("[uniblox-save] saved {hex}"));
+                                } else {
+                                    log(&format!(
+                                        "[uniblox-save] blob stored ({hex}) but the save pointer could not be written"
+                                    ));
+                                }
+                            }
+                            Err(e) => log(&format!("[uniblox-save] put failed: {e}")),
+                        },
+                        Err(e) => log(&format!("[uniblox-save] open failed: {e}")),
+                    }
+                });
+            }
+            Err(e) => log(&format!("[uniblox-save] serialize failed: {e}")),
+        }
+    }
+
+    /// Request a load on `L`: read the localStorage pointer and fetch the blob
+    /// into the [`LoadInbox`] (applied next frame by `apply_load`). The async
+    /// fetch can't touch the `World`, so it deposits into the inbox instead.
+    fn load_on_key(keys: Res<ButtonInput<KeyCode>>, inbox: NonSend<LoadInbox>) {
+        if !keys.just_pressed(KeyCode::KeyL) {
+            return;
+        }
+        let Some(hex) = local_storage().and_then(|ls| ls.get_item(SLOT_KEY).ok().flatten()) else {
+            log("[uniblox-save] no save to load");
+            return;
+        };
+        let Ok(id) = ContentId::from_hex(&hex) else {
+            log("[uniblox-save] stored save id is invalid");
+            return;
+        };
+        let cell = inbox.0.clone();
+        spawn_local(async move {
+            match IdbStore::open(DB, STORE).await {
+                Ok(store) => match store.get(id).await {
+                    Ok(Some(blob)) => *cell.borrow_mut() = Some((id, blob)),
+                    Ok(None) => log("[uniblox-save] save blob missing from store"),
+                    Err(e) => log(&format!("[uniblox-save] get failed: {e}")),
+                },
+                Err(e) => log(&format!("[uniblox-save] open failed: {e}")),
+            }
+        });
+    }
+
+    /// Apply a pending loaded blob to the `World` and RE-ESTABLISH the render
+    /// layer. The save records authoritative sim state only (`Position`/
+    /// `Velocity`/`Owner`), so `load_world_verified` rebuilds bare entities — this
+    /// re-attaches `Sprite`+`Transform` and re-designates the first as the
+    /// controllable `Avatar` (the save doesn't record client render/control roles).
+    fn apply_load(world: &mut World) {
+        let pending = world.non_send::<LoadInbox>().0.borrow_mut().take();
+        let Some((id, blob)) = pending else {
+            return;
+        };
+        if let Err(e) = load_world_verified(world, id, &blob, 1.0 / 64.0) {
+            log(&format!("[uniblox-save] load failed: {e}"));
+            return;
+        }
+        // Reconstructed entities have `Position` but no `Transform` — re-clothe.
+        let naked: Vec<Entity> = world
+            .iter_entities()
+            .filter(|e| e.get::<Position>().is_some() && e.get::<Transform>().is_none())
+            .map(|e| e.id())
+            .collect();
+        for (i, &e) in naked.iter().enumerate() {
+            let (color, size, is_avatar) = if i == 0 {
+                (Color::srgb(0.9, 0.4, 0.1), 48.0, true)
+            } else {
+                (Color::srgb(0.3, 0.6, 0.9), 32.0, false)
+            };
+            world.entity_mut(e).insert((
+                Sprite::from_color(color, Vec2::splat(size)),
+                Transform::default(),
+            ));
+            if is_avatar {
+                world.entity_mut(e).insert(Avatar);
+            }
+        }
+        log(&format!("[uniblox-save] loaded {}", id.to_hex()));
     }
 
     /// Logs the first rendered-frame time once ([uniblox-metrics] first-frame)
@@ -292,9 +398,20 @@ mod render {
         }));
         // Mode-1 sim at 64 Hz (matches the server/standalone tick).
         app.insert_resource(Time::<Fixed>::from_hz(64.0));
+        app.insert_non_send(LoadInbox::default());
         standalone::add_sim_systems(&mut app);
         app.add_systems(Startup, setup);
-        app.add_systems(Update, (drive_avatar, sync_render, first_frame));
+        app.add_systems(
+            Update,
+            (
+                drive_avatar,
+                sync_render,
+                save_on_key,
+                load_on_key,
+                apply_load,
+                first_frame,
+            ),
+        );
         app.run();
     }
 }

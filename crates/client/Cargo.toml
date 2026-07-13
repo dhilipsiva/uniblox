@@ -22,8 +22,8 @@ webgpu  = ["bevy/webgpu"]
 engine-core = { path = "../engine-core" }
 standalone = { path = "../standalone" }
 protocol = { path = "../protocol" }
-# Mode-1 content-addressed save; B4 uses its browser IdbStore for the on-load
-# IndexedDB self-test ([uniblox-idb] markers). C1 wires the real save keybind.
+# Mode-1 content-addressed save (C1, ADR-0036): save_world/load_world + the
+# browser IdbStore, wired to the K=save / L=load keybinds ([uniblox-save] markers).
 persistence = { path = "../persistence" }
 # The transport two-tab demo (interim, until the Bevy client lands): connects
 # to the local signaling server and exchanges packets on both channels.
@@ -31,7 +31,7 @@ transport = { path = "../transport" }
 wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
 # Window + Performance: performance.now() for the in-browser metrics harness.
-web-sys = { workspace = true, features = ["console", "Window", "Performance"] }
+web-sys = { workspace = true, features = ["console", "Window", "Performance", "Storage"] }
 gloo-timers.workspace = true
 console_error_panic_hook.workspace = true
 console_log.workspace = true
