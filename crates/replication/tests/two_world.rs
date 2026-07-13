@@ -4362,3 +4362,173 @@ fn membership_reconciles_to_the_lower_coordinator() {
         "reconciled: B defers claims to the lower-id coordinator A"
     );
 }
+
+// ═════ Group CAP — AOI size-cap: bound the state datagram to one MTU (ADR-0029) ═════
+
+/// Despawn ids in an outbox's events.
+fn despawn_ids(outbox: &Outbox) -> Vec<NetEntityId> {
+    outbox
+        .events
+        .iter()
+        .filter_map(|e| match decode_event(e).unwrap().event {
+            NetEvent::Despawn { id } => Some(id),
+            _ => None,
+        })
+        .collect()
+}
+
+/// CAP-fits + CAP-nearest — a scene far past one datagram's worth of entities is
+/// capped so the state datagram fits `SAFE_DATAGRAM_BYTES`, keeping the NEAREST to
+/// the AOI center and dropping the farthest.
+#[test]
+fn aoi_cap_bounds_datagram_and_keeps_the_nearest() {
+    let mut a = TestPeer::new(1);
+    let b = TestPeer::new(2);
+    let near = a.spawn(0.0, 0.0, 0.0, 0.0);
+    for i in 1..199 {
+        a.spawn(i as f32, 0.0, 0.0, 0.0);
+    }
+    let far = a.spawn(1000.0, 0.0, 0.0, 0.0); // the farthest from the center
+    a.set_aoi(b.id, (0.0, 0.0), 5000.0); // radius covers all 200
+    let out = a.collect_for(b.id);
+
+    let bytes = out.state.as_ref().expect("state present").len();
+    assert!(
+        bytes <= replication::SAFE_DATAGRAM_BYTES,
+        "state datagram {bytes} B must fit the {}-B budget",
+        replication::SAFE_DATAGRAM_BYTES
+    );
+    let ids: Vec<NetEntityId> = state_entries(&out).iter().map(|s| s.id).collect();
+    assert!(
+        ids.len() < 200,
+        "capped below the full set (kept {})",
+        ids.len()
+    );
+    assert!(!ids.is_empty(), "keeps at least the nearest entities");
+    assert!(
+        ids.contains(&net_id(a.id, near)),
+        "the NEAREST entity (x=0) is kept"
+    );
+    assert!(
+        !ids.contains(&net_id(a.id, far)),
+        "the FARTHEST entity (x=1000) is capped out"
+    );
+}
+
+/// CAP-readcheat — a capped-out entity's EXISTENCE is withheld (no Spawn): the cap
+/// only TIGHTENS visibility, so the Mode-3 read-cheat defense can only strengthen.
+#[test]
+fn aoi_cap_withholds_existence_of_capped_entities() {
+    let mut a = TestPeer::new(1);
+    let b = TestPeer::new(2);
+    let near = a.spawn(0.0, 0.0, 0.0, 0.0);
+    for i in 1..199 {
+        a.spawn(i as f32, 0.0, 0.0, 0.0);
+    }
+    let far = a.spawn(1000.0, 0.0, 0.0, 0.0);
+    a.set_aoi(b.id, (0.0, 0.0), 5000.0);
+    let out = a.collect_for(b.id);
+
+    let spawned = spawn_ids(&out.events);
+    assert!(
+        !spawned.contains(&net_id(a.id, far)),
+        "a capped-out entity is never Spawned (existence withheld)"
+    );
+    assert!(
+        spawned.contains(&net_id(a.id, near)),
+        "a kept entity IS Spawned"
+    );
+}
+
+/// CAP-fastpath — a small scene (well under budget) is unaffected: every entity is
+/// sent and NOTHING is despawned (the cap's fast path is a no-op).
+#[test]
+fn aoi_cap_fastpath_small_scene_unaffected() {
+    let mut a = TestPeer::new(1);
+    let b = TestPeer::new(2);
+    for i in 0..8 {
+        a.spawn(i as f32, 0.0, 0.0, 0.0);
+    }
+    a.set_aoi(b.id, (0.0, 0.0), 1000.0);
+    let out = a.collect_for(b.id);
+    assert_eq!(
+        state_entries(&out).len(),
+        8,
+        "a small scene sends all 8 entities (no cap)"
+    );
+    assert_eq!(
+        despawn_count(&out),
+        0,
+        "no spurious despawn on the fast path"
+    );
+}
+
+/// CAP-evicts-known — when the scene grows past budget, a now-far KNOWN entity is
+/// evicted via the audited AOI-EXIT path (Despawn + baseline drop → sound
+/// re-baseline on re-entry), NOT a silent state-entry deferral.
+#[test]
+fn aoi_cap_evicts_a_now_far_known_entity_via_despawn() {
+    let mut a = TestPeer::new(1);
+    let mut b = TestPeer::new(2);
+    let outer = a.spawn(500.0, 0.0, 0.0, 0.0); // initially the only entity → known
+    a.set_aoi(b.id, (0.0, 0.0), 5000.0);
+    b.deliver_all(a.id, &a.collect_for(b.id)); // b now knows `outer`
+
+    // Crowd the center so `outer` (x=500) becomes one of the FARTHEST → capped out.
+    for i in 0..200 {
+        a.spawn(i as f32 * 0.1, 0.0, 0.0, 0.0);
+    }
+    let out = a.collect_for(b.id);
+    assert!(
+        despawn_ids(&out).contains(&net_id(a.id, outer)),
+        "the now-far known entity is evicted via Despawn (AOI-exit), not silently deferred"
+    );
+}
+
+/// CAP-unbounded — an UNBOUNDED peer (no AOI set) with more than a datagram's worth
+/// of owned entities is still capped (by NetEntityId order) so its datagram fits.
+#[test]
+fn aoi_cap_bounds_an_unbounded_peer() {
+    let mut a = TestPeer::new(1);
+    let b = TestPeer::new(2);
+    for _ in 0..200 {
+        a.spawn(0.0, 0.0, 0.0, 0.0);
+    }
+    // No set_aoi → unbounded (sees all owned).
+    let out = a.collect_for(b.id);
+    let bytes = out.state.as_ref().expect("state present").len();
+    assert!(
+        bytes <= replication::SAFE_DATAGRAM_BYTES,
+        "an unbounded peer's datagram {bytes} B must still fit the budget"
+    );
+    assert!(
+        state_entries(&out).len() < 200,
+        "capped below the full owned set"
+    );
+}
+
+/// CAP-determinism — two collects of the same over-budget scene keep the IDENTICAL
+/// set (deterministic distance rank + NetEntityId tiebreak).
+#[test]
+fn aoi_cap_is_deterministic() {
+    let mut a = TestPeer::new(1);
+    let b = TestPeer::new(2);
+    for i in 0..200 {
+        a.spawn(i as f32, 0.0, 0.0, 0.0);
+    }
+    a.set_aoi(b.id, (0.0, 0.0), 5000.0);
+    let mut ids1: Vec<NetEntityId> = state_entries(&a.collect_for(b.id))
+        .iter()
+        .map(|s| s.id)
+        .collect();
+    let mut ids2: Vec<NetEntityId> = state_entries(&a.collect_for(b.id))
+        .iter()
+        .map(|s| s.id)
+        .collect();
+    ids1.sort();
+    ids2.sort();
+    assert_eq!(
+        ids1, ids2,
+        "the cap keeps a deterministic set across collects"
+    );
+}
