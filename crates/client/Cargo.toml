@@ -22,6 +22,9 @@ webgpu  = ["bevy/webgpu"]
 engine-core = { path = "../engine-core" }
 standalone = { path = "../standalone" }
 protocol = { path = "../protocol" }
+# Mode-1 content-addressed save; B4 uses its browser IdbStore for the on-load
+# IndexedDB self-test ([uniblox-idb] markers). C1 wires the real save keybind.
+persistence = { path = "../persistence" }
 # The transport two-tab demo (interim, until the Bevy client lands): connects
 # to the local signaling server and exchanges packets on both channels.
 transport = { path = "../transport" }

@@ -30,12 +30,17 @@ use engine_core::{Contacts, LocalPeer, Owner, Position, Tick, Velocity, insert_s
 use protocol::{ContentId, PeerId, VersionTriple, content_id};
 use serde::{Deserialize, Serialize};
 
-// The native durable store (B3, ADR-0034). Native-only (`std::fs`); the browser
-// durable store is B4 (`IdbStore`). Wasm builds carry only `MemoryStore`.
+// The native durable store (B3, ADR-0034). Native-only (`std::fs`).
 #[cfg(not(target_arch = "wasm32"))]
 mod file_store;
 #[cfg(not(target_arch = "wasm32"))]
 pub use file_store::FileStore;
+
+// The browser durable store (B4, ADR-0035). Wasm-only (IndexedDB, async).
+#[cfg(target_arch = "wasm32")]
+mod idb_store;
+#[cfg(target_arch = "wasm32")]
+pub use idb_store::{IdbError, IdbStore};
 
 /// Save-blob schema version, checked on load. Independent of
 /// `protocol::WIRE_VERSION` — this is the SAVE format's version. Bump on any

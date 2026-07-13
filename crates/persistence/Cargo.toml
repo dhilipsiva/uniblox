@@ -15,6 +15,28 @@ bevy_ecs.workspace = true
 serde.workspace = true
 postcard.workspace = true
 
+# Browser durable store (ADR-0035, B4): raw web-sys IndexedDB + a hand-rolled
+# IDBRequest->oneshot async bridge (no helper crate — keeps the exact
+# wasm-bindgen pin safe). `futures` is already in the wasm graph via matchbox.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen.workspace = true
+js-sys.workspace = true
+futures.workspace = true
+web-sys = { workspace = true, features = [
+    "Window",
+    "IdbFactory",
+    "IdbDatabase",
+    "IdbObjectStore",
+    "IdbTransaction",
+    "IdbTransactionMode",
+    "IdbRequest",
+    "IdbOpenDbRequest",
+    "IdbVersionChangeEvent",
+    "DomException",
+    "Event",
+    "EventTarget",
+] }
+
 [dev-dependencies]
 # native FileStore tests (ADR-0034): write blobs under a throwaway directory
 tempfile.workspace = true

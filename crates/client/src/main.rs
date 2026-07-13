@@ -74,6 +74,35 @@ mod demo {
         ));
     }
 
+    /// IndexedDB self-test (ADR-0035): prove the browser `IdbStore` round-trips
+    /// and PERSISTS across a page reload. Runs once on load — reloading the tab
+    /// should flip the first marker from "first session" to "durable".
+    async fn idb_selftest() {
+        const BLOB: &[u8] = b"uniblox-idb-selftest-v1";
+        let id = protocol::content_id(BLOB);
+        let store = match persistence::IdbStore::open("uniblox", "saves").await {
+            Ok(s) => s,
+            Err(e) => {
+                log(&format!("[uniblox-idb] open failed: {e}"));
+                return;
+            }
+        };
+        match store.get(id).await {
+            Ok(Some(_)) => log("[uniblox-idb] durable: a prior-session blob is present"),
+            Ok(None) => log("[uniblox-idb] first session: no prior blob (storing now)"),
+            Err(e) => log(&format!("[uniblox-idb] get failed: {e}")),
+        }
+        match store.put(BLOB).await {
+            Ok(put_id) if put_id == id => match store.get(id).await {
+                Ok(Some(got)) if got.as_slice() == BLOB => log("[uniblox-idb] roundtrip ok"),
+                Ok(_) => log("[uniblox-idb] roundtrip MISMATCH"),
+                Err(e) => log(&format!("[uniblox-idb] get-after-put failed: {e}")),
+            },
+            Ok(_) => log("[uniblox-idb] put returned an unexpected id"),
+            Err(e) => log(&format!("[uniblox-idb] put failed: {e}")),
+        }
+    }
+
     pub fn start() {
         // Surface Rust panics as console.error with a message + backtrace
         // (panic=abort still traps afterwards, but the cause is visible), and
@@ -81,6 +110,7 @@ mod demo {
         console_error_panic_hook::set_once();
         let _ = console_log::init_with_level(log::Level::Debug);
         bench_ed25519();
+        spawn_local(idb_selftest());
         log(&format!("[uniblox-demo] connecting to {ROOM_URL}"));
         // Default ICE (STUN): browsers reject an empty ICE-server entry, so
         // the hermetic variant is native-only. Localhost tabs connect via

@@ -2375,6 +2375,7 @@ dependencies = [
  "engine-core",
  "gloo-timers 0.3.0",
  "log",
+ "persistence",
  "protocol",
  "standalone",
  "transport",
@@ -5311,10 +5312,14 @@ version = "0.1.0"
 dependencies = [
  "bevy_ecs",
  "engine-core",
+ "futures",
+ "js-sys",
  "postcard",
  "protocol",
  "serde",
  "tempfile",
+ "wasm-bindgen",
+ "web-sys",
 ]
 
 [[package]]
