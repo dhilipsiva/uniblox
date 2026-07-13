@@ -1409,3 +1409,60 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   `engine_below_minimum` test's `wait_session_count(0)` is a weak belt behind the real `status == 426` check; (c)
   a duplicate `?engine=` param is last-wins (axum `Query`) — irrelevant in the honest-client envelope.
 - **Status:** Accepted (2026-07-13).
+
+## ADR-0039 — custom `NextTopology`: client-specified `?next=N` session-SIZE grouping
+- **Context:** third Phase-5 item. ADR-0037/0038 scoped signaling on matchbox `FullMesh` — one UNBOUNDED room per
+  scope path. The backlog wants client-specified `?next=N` session-SIZE grouping (subdivide a scope into sessions
+  of ≤ N). Exploration (two agents against the vendored `matchbox_signaling` 0.14 + `Cargo.lock`) confirmed:
+  matchbox's `?next=N` lives ONLY in the un-vendored `matchbox_server` binary (absent from our registry/lock), and
+  `FullMesh` has no size cap — so this REQUIRES a custom `SignalingTopology`.
+- **Substrate facts (from the cargo-registry source):** a custom topology is one `#[async_trait] async fn
+  state_machine(WsStateMeta{room, peer_id, sender, receiver, state, ..})`, run-to-completion per socket, built via
+  the generic `SignalingServerBuilder::new(addr, topology, state)` (`full_mesh_builder` is a wrapper over it). Two
+  hard constraints: (1) `WsStateMeta` carries the room PATH but **NOT the query** — so `?next=N` is invisible to the
+  topology and must be stashed by the gate (keyed by `origin`) and bridged to the `PeerId` at `on_id_assignment`
+  (the exact chain the registry already ran); (2) a custom topology has **no `on_peer_connected/on_peer_disconnected`**
+  (FullMesh-inherent-impl only) — join/leave bookkeeping moves INSIDE `state_machine`. The relay loop is inline in
+  `FullMesh` (not a shared helper); reusable pieces are `common_logic::{parse_request, try_send, SignalingChannel}`.
+- **Decision:** `NextTopology` GENERALIZES FullMesh — it re-implements FullMesh's relay contract exactly (on join,
+  broadcast `NewPeer(newcomer)` to EXISTING members then insert the newcomer; relay `Signal{receiver,data}` →
+  `Signal{sender:me,data}` to a SAME-session target; on exit broadcast `PeerLeft(me)`; lock discipline = collect
+  senders under the `Mutex`, DROP it, then `try_send`) and adds size grouping: **`?next` absent ⇒ one unbounded
+  session per room** (session key = the room path — so the ADR-0037/0038 tests double as a regression proof that the
+  re-implemented relay matches FullMesh on the unbounded path); **`?next=N` ⇒ the room subdivides into sessions
+  keyed `"<room>#<index>"`, each capped at N.** Lifecycle is **batch-deal / no-backfill (user-chosen via
+  AskUserQuestion):** a session SEALS at N (removed from the per-room `open` map) and never refills — a departure
+  shrinks it, but new joiners always fill the current open session (a fresh one once the last sealed). `?next` is
+  orthogonal to the scope (also caps legacy plain rooms). Invalid `?next` (`0`/non-numeric) → `400` via the gate
+  (the ADR-0038 asymmetric filter is otherwise unchanged). The `SessionRegistry` BECAME the topology's shared
+  `SignalingState` (it now holds the relay senders + grouping bookkeeping + stashed `?next`, alongside its listing);
+  the same `Arc` handle is the topology state, the gate's stash target, and the id-assignment bridge — so the
+  builder drops `full_mesh_builder`/`on_peer_connected`/`on_peer_disconnected` for
+  `SignalingServerBuilder::<NextTopology, NoCallbacks, SessionRegistry>::new(...)` + inline join/leave.
+- **Consequences:** CLOSES the "`?next=N` session-SIZE grouping" bullet. The dominant risk was "compiles but subtly
+  wrong" in the re-implemented relay + the grouping state machine — mitigated by (a) keeping ALL ADR-0037/0038
+  integration tests (now exercising `NextTopology`'s unbounded path = a FullMesh regression check) and (b) new
+  grouping tests: `next_caps_session_size_and_spills` (4 peers fill `#0`, the 5th spills to `#1`),
+  `sessions_are_relay_isolated` (a cross-session Signal is dropped — `?next=1` singletons + `expect_silence`),
+  `no_backfill_after_departure` (a sealed session at N-1 is not backfilled — a new joiner opens `#1`),
+  `invalid_next_is_rejected` (`0`/non-numeric → 400), `no_next_is_one_unbounded_session`, `next_groups_legacy_rooms_too`.
+  New deps: `async-trait` (topology impl) + `futures` promoted to a regular services dep (relay `StreamExt`) + axum's
+  `ws` feature (the relay's `Message`). 5 unit + 16 integration tests green; clippy `-D warnings` (`--all-targets`) +
+  fmt clean; full workspace green. **Deferred** (unchanged): a shared Redis/Postgres registry for horizontal scale;
+  the Mode-2 coordinator peer service; signaling-DoS rate-limiting/auth. Fresh reviewer (cross-checked against the
+  matchbox 0.14 `FullMesh` source, the `WsStateMeta`/`ws_handler` lifecycle, `common_logic`, and axum 0.8
+  path-decoding) → relay faithful to FullMesh, no-backfill state machine internally consistent, lock discipline
+  correct (the `Send` future holds no guard across `.await`), tests non-vacuous — **1 MEDIUM FIXED**: a
+  session-key NAMESPACE COLLISION — the synthesized bounded key `"<room>#<index>"` shared a flat `String` namespace
+  with the unbounded key (= the room path), so a client naming a room that percent-decodes to `"<room>#<index>"`
+  (e.g. `arena%230` → `arena#0`, which `parse_scope` accepts as lobby `arena#0`) landed in the SAME `sessions`
+  entry as another room's `?next` sub-session, crossing the lobby/`?next` isolation boundary (bounded impact — mode/
+  content/schema/min still matched, so NOT a float-desync cross). Fixed by RESERVING `#` (`SESSION_SEP`): the gate
+  now rejects any room path (scoped or legacy) containing `#` with a 400, so the bounded-key namespace is disjoint
+  from every accepted room path (new test `room_with_session_delimiter_is_rejected` — `%230` on a scoped AND a
+  legacy room → 400). 2 LOW/NIT: (a) mixing `?next` and no-`?next` on the same room silently splits peers into
+  `R` vs `R#0` — by-design opt-in, now DOC-noted as a per-lobby convention; (b) a `peer_next` staging entry leaks
+  for a bridged-but-never-upgraded peer — same acknowledged/bounded class as the ADR-0037 `peer_room` leak, not a
+  regression; (c) NIT: a redundant `sender.clone()` at the `join` call (the relay writes to target senders, never
+  self) — FIXED (moved `sender` in).
+- **Status:** Accepted (2026-07-13).

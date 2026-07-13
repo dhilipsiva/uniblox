@@ -129,7 +129,7 @@ manual browser check (move → K → reload → L restores the world, also B4's 
 browser-playable) and the full content-addressed save (B1 `ContentId`/blake3 → B2 `save_world`/`load_world` +
 `MemoryStore` → B3 native `FileStore` → B4 browser `IdbStore` → C1 client keybinds).
 
-**PHASE 5 (central services) HAS BEGUN — scoped signaling + asymmetric version filter DONE (ADR-0037/0038):**
+**PHASE 5 (central services) HAS BEGUN — scoped signaling + asymmetric filter + `?next=N` grouping DONE (ADR-0037/0038/0039):**
 `services` is now a library+binary — `build_signaling_server` wraps matchbox FullMesh with a scope in the room PATH
 (`<mode>~<content>.<schema>~<min>~<lobby>`; FullMesh isolates by path, so mismatched content/schema/min/lobby are
 structurally never matched) + an `on_connection_request` gate + an in-memory `SessionRegistry` (lifecycle-balanced:
@@ -137,11 +137,17 @@ gate stashes room by `origin` → id-assign bridges `peer→room` → connect jo
 removes+prunes). **ADR-0038 asymmetric version filter:** the client's own engine moved OUT of the room key into a
 `?engine=N` query, so compatible-but-newer engines share ONE room; the gate admits iff `engine >= min_engine`, else
 a REASONED rejection (`426` too-old / `400` malformed/missing-engine via an `axum` dep) instead of a bare 401.
-4 unit + 10 raw-WS integration tests green (offer relay, compatible-engines-share, engine-below-min-426,
-missing/non-numeric-engine-400, mode + content isolation, malformed-400, legacy room, listing, disconnect-prune);
-clippy/fmt clean; workspace green. Closes the signaling+registry+scoping bullet, the same-mode/same-version bullet,
-AND the version-triple enforcement/gating (asymmetric filter) bullet. Remaining Phase-5: custom-topology `?next=N`
-session-SIZE grouping; horizontal-scale Redis/Postgres registry; the Mode-2 coordinator peer service.
+**ADR-0039 custom `NextTopology` + `?next=N` grouping:** replaced FullMesh with a custom `SignalingTopology`
+(`SignalingServerBuilder::new`) that re-implements FullMesh's relay (via `common_logic`) GENERALIZED with
+client-specified `?next=N` session-SIZE grouping — `?next` absent ⇒ one unbounded session per room, `?next=N` ⇒ the
+room subdivides into sessions keyed `<room>#<index>` capped at N (batch-deal / no-backfill: a session seals at N and
+never refills). The topology can't see the query, so `?next` is stashed by the gate → bridged to the `PeerId` at id
+assignment; the `SessionRegistry` became the topology's shared state (relay senders + grouping + listing).
+5 unit + 16 raw-WS integration tests green (the ADR-0037/0038 relay tests now double as a FullMesh regression on the
+unbounded path, plus next-caps-and-spills, cross-session relay isolation, no-backfill, invalid-next-400,
+unbounded-when-absent, legacy-room grouping); clippy/fmt clean; workspace green. Closes the signaling+registry+scoping
+bullet, the same-mode/same-version bullet, the version-triple/asymmetric bullet, AND the `?next=N` grouping bullet.
+Remaining Phase-5: horizontal-scale Redis/Postgres registry; the Mode-2 coordinator peer service.
 
 ## Done
 - **Cargo workspace** — virtual manifest, 10 crates under `crates/*` (glob members),
