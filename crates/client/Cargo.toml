@@ -14,6 +14,14 @@ webgpu  = ["bevy/webgpu"]
 [dependencies]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+# Mode-1 (Standalone) playable view (ADR-0031): the net-free sim wired into the
+# render app. `standalone` (ADR-0030) provides `add_sim_systems`; both it and
+# engine-core carry NO transport/replication — the playable Mode-1 tier stays
+# net-free even though the client crate itself still links transport (below) for
+# the interim demo. `protocol` is named directly (`PeerId`).
+engine-core = { path = "../engine-core" }
+standalone = { path = "../standalone" }
+protocol = { path = "../protocol" }
 # The transport two-tab demo (interim, until the Bevy client lands): connects
 # to the local signaling server and exchanges packets on both channels.
 transport = { path = "../transport" }

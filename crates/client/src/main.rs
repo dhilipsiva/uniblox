@@ -3,10 +3,11 @@
 //! Two WASM builds (WebGPU + WebGL2), single-threaded (no COOP/COEP). See
 //! crates/client/CLAUDE.md and scripts/build-wasm.sh.
 //!
-//! The wasm build runs the minimal Bevy render (ADR-0017: Camera2d + one
-//! asset-free sprite, canvas `#uniblox-canvas`) alongside the transport DEMO
-//! (joins the local signaling room, exchanges greetings on both channels) and
-//! the `[uniblox-metrics]` harness. Native main is still a stub — Bevy is a
+//! The wasm build runs the Mode-1 (Standalone) playable view (ADR-0031: the
+//! net-free `standalone` sim under `DefaultPlugins` — a camera, a keyboard-driven
+//! avatar, and drifting NPCs, canvas `#uniblox-canvas`) alongside the transport
+//! DEMO (joins the local signaling room, exchanges greetings on both channels)
+//! and the `[uniblox-metrics]` harness. Native main is still a stub — Bevy is a
 //! wasm32-only dependency here; native parity is Phase 14.
 
 /// The interim two-tab transport demo (wasm only).
@@ -127,34 +128,107 @@ mod demo {
     }
 }
 
-/// The minimal Bevy render (wasm only): one camera, one moving sprite, and a
-/// first-frame metric — the smallest thing that makes cold-load/TTI and the
-/// two-build sizes REAL measurements (TODO §size-budget gate).
+/// Map directional key states to a raw movement direction (`x`/`y` in
+/// {-1,0,1}; opposing keys cancel). Pure + bevy-free so it unit-tests on native
+/// (the render app is wasm-only). `up` → `+y`, `right` → `+x`. Diagonals are
+/// un-normalized (the demo avatar moves ~√2× faster on a diagonal) — acceptable
+/// for this Mode-1 view; normalize if the controller outlives the demo. The
+/// `cfg(any(wasm32, test))` gate compiles it ONLY where used — the wasm render
+/// module and the native test — so the native non-test build has no dead code.
+#[cfg(any(target_arch = "wasm32", test))]
+fn move_dir(up: bool, down: bool, left: bool, right: bool) -> (f32, f32) {
+    let dx = i32::from(right) - i32::from(left);
+    let dy = i32::from(up) - i32::from(down);
+    (dx as f32, dy as f32)
+}
+
+/// The Mode-1 (Standalone) playable view (wasm only, ADR-0031): the net-free
+/// `standalone` sim wired into the render app. Local authority over all entities
+/// (`insert_sim`/`spawn_owned`); `standalone::add_sim_systems` runs the same
+/// engine-core FixedUpdate sim the server runs; keyboard input sets the avatar's
+/// `Velocity` and each frame `Position` is copied to the sprite `Transform`.
+/// Plus the `first-frame` metric (cold-load/TTI + two-build sizes).
 #[cfg(target_arch = "wasm32")]
 mod render {
     // Bevy's derive macros detect the `bevy` facade by scanning [dependencies];
     // ours is target-scoped, so they emit `bevy_ecs::` paths — alias them back.
     use bevy::ecs as bevy_ecs;
     use bevy::prelude::*;
+    use engine_core::{Position, Velocity, insert_sim, spawn_owned};
+    use protocol::PeerId;
 
-    /// Marker for the one demo sprite.
+    /// This instance's peer id. In Mode 1 every entity is owned by `LOCAL`, so
+    /// `authority_of` is `Local` for all and the sim integrates everything.
+    const LOCAL: PeerId = PeerId(1);
+    /// Avatar movement speed, world units per second.
+    const SPEED: f32 = 160.0;
+
+    /// Marks the player-controlled avatar (client-local, not a sim component).
     #[derive(Component)]
-    pub struct Bouncer;
+    pub struct Avatar;
 
-    fn setup(mut commands: Commands) {
-        commands.spawn(Camera2d);
-        commands.spawn((
-            Sprite::from_color(Color::srgb(0.9, 0.4, 0.1), Vec2::new(96.0, 96.0)),
+    /// Seed the Mode-1 world: a camera, a keyboard-driven avatar, and a few
+    /// locally-owned drifting NPCs. Exclusive — `insert_sim`/`spawn_owned` need
+    /// `&mut World`.
+    fn setup(world: &mut World) {
+        world.spawn(Camera2d);
+        insert_sim(world, LOCAL, 1.0 / 64.0);
+
+        let avatar = spawn_owned(
+            world,
+            LOCAL,
+            Position { x: 0.0, y: 0.0 },
+            Velocity { x: 0.0, y: 0.0 },
+        );
+        world.entity_mut(avatar).insert((
+            Sprite::from_color(Color::srgb(0.9, 0.4, 0.1), Vec2::splat(48.0)),
             Transform::default(),
-            Bouncer,
+            Avatar,
         ));
+
+        // A few locally-owned NPCs drifting in +x — visible evidence the sim runs.
+        for i in 0..4 {
+            let npc = spawn_owned(
+                world,
+                LOCAL,
+                Position {
+                    x: -240.0 + 120.0 * i as f32,
+                    y: 140.0,
+                },
+                Velocity { x: 40.0, y: 0.0 },
+            );
+            world.entity_mut(npc).insert((
+                Sprite::from_color(Color::srgb(0.3, 0.6, 0.9), Vec2::splat(32.0)),
+                Transform::default(),
+            ));
+        }
     }
 
-    /// Frames demonstrably tick: slide the sprite on a sine.
-    fn bounce(time: Res<Time>, mut sprites: Query<&mut Transform, With<Bouncer>>) {
-        let x = (time.elapsed_secs() * 1.5).sin() * 160.0;
-        for mut transform in &mut sprites {
-            transform.translation.x = x;
+    /// Read the movement keys and set the avatar's authoritative `Velocity`
+    /// directly — in Mode 1 the avatar is locally owned, so `simulate`
+    /// integrates it (no prediction/reconciliation needed).
+    fn drive_avatar(keys: Res<ButtonInput<KeyCode>>, mut q: Query<&mut Velocity, With<Avatar>>) {
+        let (dx, dy) = crate::move_dir(
+            keys.pressed(KeyCode::ArrowUp) || keys.pressed(KeyCode::KeyW),
+            keys.pressed(KeyCode::ArrowDown) || keys.pressed(KeyCode::KeyS),
+            keys.pressed(KeyCode::ArrowLeft) || keys.pressed(KeyCode::KeyA),
+            keys.pressed(KeyCode::ArrowRight) || keys.pressed(KeyCode::KeyD),
+        );
+        for mut vel in &mut q {
+            vel.x = dx * SPEED;
+            vel.y = dy * SPEED;
+        }
+    }
+
+    /// Copy each sim entity's authoritative `Position` into its render
+    /// `Transform`. Correct for Mode 1 (local authority IS the truth — no
+    /// smoothing); Modes 2/3 will read the interpolated `RenderPos` instead
+    /// (engine-core `copy_owned_render`). The camera has no `Position`, so the
+    /// query skips it.
+    fn sync_render(mut q: Query<(&Position, &mut Transform)>) {
+        for (pos, mut transform) in &mut q {
+            transform.translation.x = pos.x;
+            transform.translation.y = pos.y;
         }
     }
 
@@ -174,21 +248,24 @@ mod render {
     }
 
     pub fn run() {
-        App::new()
-            .add_plugins(DefaultPlugins.set(WindowPlugin {
-                primary_window: Some(Window {
-                    title: "uniblox".into(),
-                    canvas: Some("#uniblox-canvas".into()),
-                    fit_canvas_to_parent: true,
-                    // Keep browser shortcuts (F5, devtools) working.
-                    prevent_default_event_handling: false,
-                    ..Default::default()
-                }),
+        let mut app = App::new();
+        app.add_plugins(DefaultPlugins.set(WindowPlugin {
+            primary_window: Some(Window {
+                title: "uniblox".into(),
+                canvas: Some("#uniblox-canvas".into()),
+                fit_canvas_to_parent: true,
+                // Keep browser shortcuts (F5, devtools) working.
+                prevent_default_event_handling: false,
                 ..Default::default()
-            }))
-            .add_systems(Startup, setup)
-            .add_systems(Update, (bounce, first_frame))
-            .run();
+            }),
+            ..Default::default()
+        }));
+        // Mode-1 sim at 64 Hz (matches the server/standalone tick).
+        app.insert_resource(Time::<Fixed>::from_hz(64.0));
+        standalone::add_sim_systems(&mut app);
+        app.add_systems(Startup, setup);
+        app.add_systems(Update, (drive_avatar, sync_render, first_frame));
+        app.run();
     }
 }
 
@@ -207,8 +284,21 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use super::move_dir;
+
     #[test]
     fn smoke() {
         assert_eq!(2 + 2, 4);
+    }
+
+    #[test]
+    fn move_dir_maps_axes() {
+        assert_eq!(move_dir(false, false, false, false), (0.0, 0.0));
+        assert_eq!(move_dir(true, false, false, false), (0.0, 1.0)); // up = +y
+        assert_eq!(move_dir(false, true, false, false), (0.0, -1.0)); // down = -y
+        assert_eq!(move_dir(false, false, true, false), (-1.0, 0.0)); // left = -x
+        assert_eq!(move_dir(false, false, false, true), (1.0, 0.0)); // right = +x
+        assert_eq!(move_dir(true, true, true, true), (0.0, 0.0)); // opposing cancels
+        assert_eq!(move_dir(true, false, false, true), (1.0, 1.0)); // up-right
     }
 }
