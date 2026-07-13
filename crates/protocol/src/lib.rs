@@ -1,5 +1,6 @@
 //! `protocol` — shared wire types: peer identity, network entity identity,
-//! quantization, and the replication messages (ADR-0013).
+//! quantization, the replication messages (ADR-0013), and content-addressed
+//! identity ([`ContentId`], ADR-0032).
 //!
 //! Encoding is postcard (varint ints, wasm-safe, not self-describing — hence
 //! the leading `version` byte on every top-level message). The state channel
@@ -9,6 +10,9 @@
 //! compound loss into permanent drift — Phase 3's acked baselines own that).
 
 use serde::{Deserialize, Serialize};
+
+mod content;
+pub use content::{ContentId, ContentIdError, VersionTriple, content_id};
 
 /// Wire-format version, checked on decode. Bump on ANY message-shape change.
 /// v7 (ADR-0028 / Phase 3): coordinator sole-minter — `NetEvent` gains

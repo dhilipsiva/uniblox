@@ -33,6 +33,10 @@ log      = { version = "0.4" }
 # replication wire format (ADR-0013): postcard varint encoding, wasm-safe.
 serde    = { version = "1", default-features = false, features = ["derive", "alloc"] }
 postcard = { version = "1.1", default-features = false, features = ["use-std"] }
+# content-addressing (ADR-0032): blake3-256 content IDs for the Mode-1 save
+# (Phase 4) + object storage/publish (Phases 7/8). Already in the lock via
+# bevy_asset; `pure` forces portable Rust (no cc/C toolchain, wasm-safe).
+blake3   = { version = "1.8", default-features = false, features = ["std", "pure"] }
 # transport (matchbox two-channel WebRTC DataChannels, ADR-0012) + signaling
 matchbox_socket    = { version = "0.14" }
 matchbox_signaling = { version = "0.14" }
