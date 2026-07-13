@@ -1,0 +1,16 @@
+[package]
+name = "standalone"
+version.workspace = true
+edition.workspace = true
+
+# Mode 1 (Standalone) runtime, ADR-0030. Deliberately NET-FREE: depends only on
+# engine-core (+ protocol) and the bevy app/time/ecs crates — NO transport,
+# replication, matchbox, or str0m. That absence is the "runs with the networking
+# stack absent" acceptance, provable at the crate-graph level (and guarded by a
+# cargo-tree check in scripts/git-hooks/pre-commit).
+[dependencies]
+protocol = { path = "../protocol" }
+engine-core = { path = "../engine-core" }
+bevy_app.workspace = true
+bevy_time.workspace = true
+bevy_ecs.workspace = true

@@ -27,5 +27,16 @@ if ! cargo test; then
   exit 1
 fi
 
+# Mode-1 (standalone) must run with the networking stack ABSENT (ADR-0030): its
+# crate graph carries no transport/replication/matchbox/str0m. The Cargo.toml dep
+# list is the human-reviewable proof; this is the automated backstop. (If the
+# package is missing, cargo tree emits nothing → the check passes — non-fatal.)
+echo "[pre-commit] standalone net-free check (cargo tree)"
+if cargo tree -p standalone --edges normal 2>/dev/null \
+   | grep -Eq '(^|[^[:alnum:]_-])(transport|replication|matchbox[a-z_]*|str0m|webrtc) v[0-9]'; then
+  echo "[pre-commit] FAILED: standalone must stay net-free (no transport/replication/matchbox/str0m)." >&2
+  exit 1
+fi
+
 echo "[pre-commit] OK"
 exit 0

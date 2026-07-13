@@ -1086,3 +1086,39 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   fmt clean; full workspace green. netcode-audited → **MERGE** (byte-bound airtight, no false-confirm,
   deterministic, read-cheat-preserving all proven; the two trade-offs flagged as by-design).
 - **Status:** Accepted (2026-07-13).
+
+## ADR-0030 — `crates/standalone`: the Mode-1 (Standalone) runtime, net-free by construction
+- **Context:** Phase 4 (Mode 1 Standalone — free, local-authority, no networking, no anti-cheat) needed the first
+  standalone client-side runtime, whose bullet-1 acceptance is "runs with the networking stack absent."
+  `engine-core` is already network-free (deps: `protocol` + `bevy_ecs` only) and Mode-1-proven at the unit level
+  (`mode1_local_authority_advances`), but there was NO app builder for it — the only headless builders were
+  `server::build_server_app{,_focused}`, which REQUIRE a live `Transport` and whose crate hard-depends on
+  `transport`+`replication`. A standalone built inside `server` would drag the whole net stack into its graph;
+  one built inside `engine-core` would break that crate's documented invariant that it never depends on
+  `bevy_app`/`bevy_time`.
+- **Decision:** a NEW crate `crates/standalone` depending only on `engine-core`(+`protocol`) and
+  `bevy_app`/`bevy_time`/`bevy_ecs`. `build_standalone_app(local, entity_count) -> App` mirrors the server spine —
+  `(TaskPoolPlugin, TimePlugin, ScheduleRunnerPlugin::run_loop(1/64 s))` + `Time::<Fixed>::from_hz(64.0)` +
+  `insert_sim(world, local, 1/64)` + a `spawn_owned(owner=local)` loop — but with NO `Net`/`net_pump`/`Replication`/
+  `Transport` and NO transport parameter. Its FixedUpdate is `add_sim_systems(app)` = `(sync_sim_dt, advance_tick,
+  simulate, resolve_interactions).chain()` — the net-free SHARED SEAM reused by the browser-playable client (Item
+  A2) — the SAME engine-core systems the server runs, minus the server-only `count_tick`/`apply_input`. `sync_sim_dt`
+  is a 3-line duplicate of the server's private one (the `server` crate can't be a dep here). The `server` is NOT
+  refactored to share the seam (its `apply_input`/`count_tick` sit mid-chain and resist clean reuse for ~1 line) —
+  the authority-swap thesis is satisfied by shared *systems*, not shared *scheduling*.
+- **Consequences:** "networking absent" is provable at the CRATE-GRAPH level — `cargo tree -p standalone
+  --edges normal` reaches only `bevy_app`/`bevy_ecs`/`bevy_time` + `engine-core → protocol`; no
+  `transport`/`replication`/`matchbox`/`str0m`. A `cargo tree` grep in `scripts/git-hooks/pre-commit` is the
+  automated backstop (fails the commit if any net crate is linked; the `Cargo.toml` dep list is the primary
+  human-reviewable proof). Mode 1 is pure data — every entity owned by `local`, so `authority_of` returns `Local`
+  for all and `simulate` integrates every one (the `Authority::Remote` arm never fires); Mode 1 SKIPS the entire
+  prediction/interpolation/input-reconcile stack (`Controlled*`/`InputHistory`/`predict`/`apply_input`/`interpolate`/
+  `reset_render_role`) — none are scheduled. This item closes Phase-4 bullet-1's literal acceptance HEADLESSLY; the
+  browser-playable tier (render + input) is Item A2, the content-addressed save is Items B1–B4/C1. Evidence:
+  `crates/standalone` — 1 inline unit test (all-`Local` ownership) + 2 integration tests
+  (`standalone_advances_under_local_authority_without_networking`, `standalone_integrates_velocity_on_x`, driving
+  the real App on wall-clock) green; full workspace `cargo test` green (nothing else changed); clippy `-D warnings`
+  native + fmt clean; the net-free guard PASSES on the real tree and correctly matches every net crate (incl.
+  `matchbox_socket`) while rejecting lookalikes (`bevy_replicon`, `my-transport`). Fresh reviewer → clean (one LOW —
+  a dead `matchbox` regex token — fixed to `matchbox[a-z_]*`).
+- **Status:** Accepted (2026-07-13).

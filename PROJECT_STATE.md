@@ -5,7 +5,8 @@ The **why** behind decisions lives in `DECISIONS.md`; the **what/how** lives in
 `docs/final-buildspec.md`; the backlog lives in `TODO.md`.
 
 **Current phase: PHASE 1 COMPLETE; PHASE 2 (transport hardening) COMPLETE bar the deploy-gated telemetry
-numbers; PHASE 3 (replication depth, HIGH) HAS BEGUN.** The slice proved the authority-swap (gate PASSED,
+numbers; PHASE 3 (replication depth, HIGH) HAS BEGUN; PHASE 4 (Mode 1 Standalone) HAS BEGUN (Item A1 — the
+net-free `standalone` runtime — DONE, ADR-0030).** The slice proved the authority-swap (gate PASSED,
 ADR-0014) and **the Bevy client renders in-browser (ADR-0017)** with every slice measurement taken (real
 two-build sizes 3.38/3.40 MB brotli, cold-load, in-browser ed25519; size-budget gate PASSES). **Phase 2 is
 done:** str0m native/server peer (ADR-0015), ICE policy tiers + hermetic TURN relay proof (ADR-0016),
@@ -77,9 +78,23 @@ per-entity acks are DEFERRED (YAGNI-until-measured; revisit for a dense-Mode-3 w
 sub-streams). two_world 116 green (Group CAP); netcode-audited → MERGE (byte-bound airtight, no false-confirm,
 deterministic, read-cheat-preserving). Next Phase-3 threads: the Phase-5 Mode-2 coordinator peer SERVICE.
 
+**PHASE 4 (Mode 1 Standalone) HAS BEGUN — Item A1 (standalone runtime) DONE (ADR-0030):** a NEW `standalone`
+crate assembles the Mode-1 app — `build_standalone_app(local, entity_count)` = the server spine (TaskPool/Time/
+ScheduleRunner + `Time::<Fixed>::from_hz(64)` + `insert_sim` + `spawn_owned(owner=local)` + the FixedUpdate sim
+chain via `add_sim_systems`) MINUS `Net`/`net_pump`/`Replication`/`Transport`/`apply_input`/`count_tick`. It is
+**net-free by construction** — its crate graph reaches only bevy_app/ecs/time + engine-core→protocol; a
+`cargo tree` guard in `scripts/git-hooks/pre-commit` backstops it — which CLOSES Phase-4 bullet-1's "runs with
+the networking stack absent" acceptance headlessly. Mode 1 is pure data (every entity owned by `local`), so
+`simulate` integrates all and the prediction/interp/input stack is unused/unscheduled. `add_sim_systems` is the
+net-free seam the browser-playable client (A2) reuses; `server` is NOT refactored to share it. `standalone`:
+1 inline + 2 integration tests green; full workspace green; clippy/fmt clean; reviewer → clean. Remaining Phase-4:
+the browser-playable tier (A2 — render the sim + keyboard input in the client) + the content-addressed save
+(B1 `ContentId`/blake3 in `protocol` → B2 `persistence` crate → B3 native `FileStore` → B4 browser `IdbStore` →
+C1 opt-in save/load wired into the client).
+
 ## Done
-- **Cargo workspace** — virtual manifest, 9 crates under `crates/*` (glob members),
-  size-optimized `[profile.release]`. `cargo build` + `cargo test` green (9 smoke tests).
+- **Cargo workspace** — virtual manifest, 10 crates under `crates/*` (glob members),
+  size-optimized `[profile.release]`. `cargo build` + `cargo test` green.
 - **Single-threaded stance** — no COOP/COEP anywhere (serve script + capability page + ADR-0003).
 - **AI-workflow scaffolding** — per-crate `CLAUDE.md`, `DECISIONS.md`, four subagents
   (`test-writer`, `netcode-auditor`, `sandbox-auditor`, `reviewer`), five slash commands

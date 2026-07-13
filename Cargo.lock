@@ -6543,6 +6543,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "standalone"
+version = "0.1.0"
+dependencies = [
+ "bevy_app",
+ "bevy_ecs",
+ "bevy_time",
+ "engine-core",
+ "protocol",
+]
+
+[[package]]
 name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
