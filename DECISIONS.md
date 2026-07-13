@@ -1466,3 +1466,58 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   regression; (c) NIT: a redundant `sender.clone()` at the `join` call (the relay writes to target senders, never
   self) — FIXED (moved `sender` in).
 - **Status:** Accepted (2026-07-13).
+
+## ADR-0040 — horizontal scale: stateless nodes + a shared Redis session registry
+- **Context:** the last non-coordinator Phase-5 bullet. `SessionRegistry` was a single-node in-process
+  `Arc<Mutex<…>>` holding BOTH the node-local WebRTC relay state (live `SignalingChannel` senders + `?next`
+  grouping) AND the session listing. The buildspec (`final-buildspec.md:63`) calls for **stateless signaling nodes
+  behind a load balancer + the session registry in Redis/Postgres**. Acceptance: "two nodes share the registry."
+- **Confirmed scope (exploration, 3 agents):** this is a shared **REGISTRY** (session→peer LISTING / matchmaking
+  metadata), NOT cross-node relay. The relay holds per-connection `SignalingChannel`s that can't be serialized, so
+  **the two peers of a session must stay on ONE node** (sticky routing at the LB — a documented deployment
+  assumption; cross-node relay is unaddressed in the docs and OUT OF SCOPE). Postgres is reserved for the separate
+  `platform` crate (identity/billing), so the session registry is its own right-sized store. **User decisions
+  (AskUserQuestion): Redis backend + a hermetic real-Redis test.**
+- **Decision — split node-local relay from a shared `RegistryStore`:** keep the node-local relay + `?next` grouping
+  EXACTLY as-is (the correctness-critical `NextTopology` path is untouched; the 18 signaling tests are its
+  regression). Add a shared **`RegistryStore`** (`#[async_trait]`, fallible `RegistryResult`) that MIRRORS
+  session→peer membership tagged by `node`: `record_join`/`record_leave`/`list`/`peer_count`/`session_count`. Impls:
+  **`MemoryRegistryStore`** (`Arc<Mutex<HashMap<key, HashSet<(node, peer)>>>>`, infallible — the single-node default
+  AND, shared across instances, the two-node test double) and **`RedisRegistryStore`** (redis-rs 0.27 async
+  `MultiplexedConnection`; key scheme with NO `KEYS`/`SCAN` — per session a SET `uniblox:sess:<key>` of
+  `<node>|<peer>` members + an index SET `uniblox:sessions`; `record_join` = `SADD` member + `SADD` index,
+  `record_leave` = `SREM` member then de-index when the set empties, `peer_count`/`session_count` = `SCARD`, `list`
+  = `SMEMBERS` index → `SCARD` each). `SessionRegistry` became `{ local: Arc<Mutex<RegistryInner>>, store:
+  Arc<dyn RegistryStore>, node_id: Arc<str> }` (`new()` = in-memory + a `uuid::v4` node id; `with_store(store,
+  node_id)` injects a shared store). **`join`/`leave` are now async:** the sync local work runs under the lock, the
+  guard is DROPPED (the `_local` helper returns owned `(key, senders)`), THEN the store is mirrored — so no
+  `MutexGuard` crosses the `.await` and the `state_machine` future stays `Send`. A store failure is
+  best-effort-logged (`tracing::warn!`) and NEVER breaks the node-local relay. The sync `list`/`peer_count`/
+  `session_count` stay (this node's live view — the existing tests); new async `global_list`/`global_peer_count`/
+  `global_session_count` read the shared store. `main.rs` gained opt-in `UNIBLOX_REDIS_URL` (+ `UNIBLOX_NODE_ID`).
+  `flake.nix` gained `pkgs.redis` (like `pkgs.coturn`) for the hermetic test.
+- **Consequences:** CLOSES the "horizontal scale" bullet — "two nodes share the registry" is proven twice: the
+  hermetic `two_nodes_share_a_redis_registry` (two nodes over a REAL spawned `redis-server`, either node's
+  `global_list` shows both + a departure prunes it) and `two_nodes_share_a_memory_registry` (the abstraction/mirror
+  path, no external dep), plus `redis_store_records_and_prunes` (store-level de-index). **Deferred:** cross-node
+  relay (sticky routing assumed); atomic `MULTI`/Lua store ops (the non-atomic multi-command sequence's worst case
+  is a transient, self-healing `session_count`, never a lost relay); TTL/heartbeat crash-cleanup of a dead node's
+  stale members; autoscale-under-load (Phase-11). New deps: `redis` (tokio-comp), `uuid` (v4), `tracing`. 5 unit +
+  18 signaling + 2 hermetic-redis integration tests green; clippy `-D warnings` (`--all-targets`) + fmt clean; full
+  workspace green (incl. coturn + redis hermetic tests). Fresh reviewer (verified against the redis-rs 0.27 source +
+  the async lifetime) → **SOUND** (relay unchanged, store a genuine listing-only mirror that can't corrupt the relay,
+  no guard across the `.await` — compiler-proven via the `Send` future); **2 MEDIUM + 1 LOW FIXED**: (M1) the store
+  mirror sat on the relay's critical path — `join`/`leave` awaited the store BEFORE broadcasting `NewPeer`/`PeerLeft`,
+  so a black-holed Redis (redis-rs has no default response timeout) could hang peer discovery for minutes. Fixed by
+  splitting into a sync `join_local`/`leave_local` (guard dropped inside) → broadcast IMMEDIATELY → a bounded
+  `mirror_join`/`mirror_leave` (`tokio::time::timeout(STORE_MIRROR_TIMEOUT=2s)`, `time` feature added): a stall now
+  degrades to a ≤2s delay of only that peer's relay-loop start, never a hang. (M2) the `?next` `#index` counter is
+  node-local, so two nodes' `room#0` groups collided into ONE store entry, conflating the global listing. Fixed by
+  keying the store by the SESSION IDENTITY `(node, key)` (memory `HashMap<(node,key),…>`; redis `<node>\0<key>`),
+  `list`/`peer_count` stripping the node prefix — two nodes' same-key sessions are now DISTINCT (new
+  `same_next_room_on_two_nodes_is_not_conflated` test). (LOW) `join_local`/`leave_local` return `Option` — a poisoned
+  lock records no phantom store entry. 2 LOW/NIT stay by-design (leave-time poison is unreachable under `panic=abort`;
+  the inline bounded mirror trades a ≤2s worst-case answer-delay for mirror-ordering simplicity — spawning is
+  deferred; `session_count`'s transient `SCARD` disagreement is documented + MULTI/Lua-deferred). **Re-review of the
+  fix delta → fixes sound, no HIGH/MEDIUM, no regressions.**
+- **Status:** Accepted (2026-07-13).

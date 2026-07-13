@@ -29,14 +29,28 @@ Binary = thin wrapper (port `UNIBLOX_SIGNALING_PORT`/3536, `RUST_LOG` tracing). 
 modified client can lie, but can't lie into a *stricter* room with an old engine: a different `min` is a different
 room).
 
+## Horizontal scale (ADR-0040)
+`SessionRegistry` is split: the **node-local relay** (`RegistryInner` — sessions-with-senders + `?next` grouping,
+unchanged) drives the WebRTC relay; a shared **`RegistryStore`** (`#[async_trait]`, fallible) MIRRORS session→peer
+membership so many STATELESS nodes share one listing. `SessionRegistry { local, store, node_id }`; `new()` = in-memory
+single-node, `with_store(store, node_id)` = shared. `join`/`leave` are async — the local work runs under the lock, the
+guard is DROPPED, THEN the store is mirrored (no `MutexGuard` across `.await`; the `state_machine` future stays `Send`);
+a store failure is best-effort-logged, never breaks the relay. The sync `list`/`peer_count`/`session_count` are THIS
+node's view; the async `global_*` read the shared store. Stores: `MemoryRegistryStore` (default; shared = the two-node
+test double) + `RedisRegistryStore` (redis-rs; `uniblox:sess:<key>` member SET + `uniblox:sessions` index SET;
+SADD/SREM/SCARD, de-index on empty). The binary opts in via `UNIBLOX_REDIS_URL` (+ `UNIBLOX_NODE_ID`). **Only the
+LISTING is shared — the relay is node-local, so a session's two peers must be on the same node (sticky routing;
+cross-node relay is out of scope).** Hermetic test spawns a real `redis-server` (flake `pkgs.redis`, coturn precedent).
+
 ## Crate-local invariants
-- **DONE (ADR-0037/0038/0039):** `{mode, version}` scoping via the room path + the connection gate + the session
-  registry; the **ASYMMETRIC version filter** (admit `engine >= min`, content + schema EXACT, reasoned `426`/`400`);
-  and **`?next=N` session-SIZE grouping** via the custom `NextTopology` (batch-deal / no-backfill; unbounded when
-  `?next` absent). The relay is re-implemented from FullMesh's contract — the ADR-0037/0038 tests double as its
-  regression proof on the unbounded path.
-- **DEFERRED (later Phase-5 bullets):** the Mode-2 coordinator peer service; stateless nodes + a shared
-  Redis/Postgres registry for horizontal scale; rate-limit + authenticate room join (signaling-DoS, Phase 11).
+- **DONE (ADR-0037/0038/0039/0040):** `{mode, version}` scoping + the connection gate + the session registry; the
+  **ASYMMETRIC version filter** (admit `engine >= min`, content + schema EXACT, reasoned `426`/`400`); **`?next=N`
+  session-SIZE grouping** via the custom `NextTopology` (batch-deal / no-backfill); and **horizontal scale** — the
+  `RegistryStore` split + `RedisRegistryStore` (two stateless nodes share one Redis registry). The relay is
+  re-implemented from FullMesh's contract — the ADR-0037/0038 tests double as its regression on the unbounded path.
+- **DEFERRED (later Phase-5 / Phase-11):** the Mode-2 coordinator peer service; cross-node relay (sticky routing
+  assumed); atomic `MULTI`/Lua store ops + TTL/heartbeat crash-cleanup + autoscale-under-load; rate-limit +
+  authenticate room join (signaling-DoS, Phase 11).
 - Scoping is structural ISOLATION, not access control (no room secret; a client may name any path — auth is
   the deferred bullet).
 

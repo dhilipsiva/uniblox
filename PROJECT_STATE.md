@@ -129,7 +129,7 @@ manual browser check (move → K → reload → L restores the world, also B4's 
 browser-playable) and the full content-addressed save (B1 `ContentId`/blake3 → B2 `save_world`/`load_world` +
 `MemoryStore` → B3 native `FileStore` → B4 browser `IdbStore` → C1 client keybinds).
 
-**PHASE 5 (central services) HAS BEGUN — scoped signaling + asymmetric filter + `?next=N` grouping DONE (ADR-0037/0038/0039):**
+**PHASE 5 (central services) — scoped signaling + asymmetric filter + `?next=N` grouping + horizontal scale DONE (ADR-0037/0038/0039/0040); only the Mode-2 coordinator remains:**
 `services` is now a library+binary — `build_signaling_server` wraps matchbox FullMesh with a scope in the room PATH
 (`<mode>~<content>.<schema>~<min>~<lobby>`; FullMesh isolates by path, so mismatched content/schema/min/lobby are
 structurally never matched) + an `on_connection_request` gate + an in-memory `SessionRegistry` (lifecycle-balanced:
@@ -143,11 +143,18 @@ client-specified `?next=N` session-SIZE grouping — `?next` absent ⇒ one unbo
 room subdivides into sessions keyed `<room>#<index>` capped at N (batch-deal / no-backfill: a session seals at N and
 never refills). The topology can't see the query, so `?next` is stashed by the gate → bridged to the `PeerId` at id
 assignment; the `SessionRegistry` became the topology's shared state (relay senders + grouping + listing).
-5 unit + 16 raw-WS integration tests green (the ADR-0037/0038 relay tests now double as a FullMesh regression on the
-unbounded path, plus next-caps-and-spills, cross-session relay isolation, no-backfill, invalid-next-400,
-unbounded-when-absent, legacy-room grouping); clippy/fmt clean; workspace green. Closes the signaling+registry+scoping
-bullet, the same-mode/same-version bullet, the version-triple/asymmetric bullet, AND the `?next=N` grouping bullet.
-Remaining Phase-5: horizontal-scale Redis/Postgres registry; the Mode-2 coordinator peer service.
+**ADR-0040 horizontal scale:** `SessionRegistry` split into the node-local relay (unchanged) + a shared
+`RegistryStore` that MIRRORS session→peer membership so many STATELESS nodes share one listing (`{local, store,
+node_id}`; async `join`/`leave` mirror with NO `MutexGuard` across the `.await`; sync local `list`/`peer_count`/
+`session_count` vs async `global_*`). Stores: `MemoryRegistryStore` (default) + `RedisRegistryStore` (redis-rs;
+`uniblox:sess:<key>` member SET + `uniblox:sessions` index SET; SADD/SREM/SCARD + de-index). Binary opts in via
+`UNIBLOX_REDIS_URL`. Only the LISTING is shared — the relay is node-local (sticky routing; cross-node relay out of
+scope). Proven by a hermetic test spawning a real `redis-server` (flake `pkgs.redis`, coturn precedent).
+5 unit + 18 raw-WS integration + 2 hermetic-redis tests green (the ADR-0037/0038 relay tests double as a FullMesh
+regression on the unbounded path, plus next-caps-and-spills, cross-session isolation, no-backfill, two-node-share ×2
+[memory + real redis], store de-index); clippy/fmt clean; workspace green (incl. coturn + redis). Closes the
+signaling+registry+scoping, same-mode/same-version, version-triple/asymmetric, `?next=N` grouping, AND horizontal-scale
+bullets. Remaining Phase-5: the Mode-2 coordinator peer service.
 
 ## Done
 - **Cargo workspace** — virtual manifest, 10 crates under `crates/*` (glob members),
