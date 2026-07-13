@@ -63,6 +63,7 @@
             pkgs.twiggy # per-function byte attribution
             pkgs.nodejs_22 # node + npx for .mcp.json servers / Playwright
             pkgs.coturn # turnserver for the hermetic TURN-relay tests (ADR-0016)
+            pkgs.redis # redis-server for the hermetic shared-registry tests (ADR-0040)
           ];
 
           shellHook = ''

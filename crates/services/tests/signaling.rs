@@ -6,11 +6,14 @@
 //! relay isolation), legacy-room passthrough, and the session registry.
 
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use matchbox_protocol::{JsonPeerEvent, JsonPeerRequest, PeerId};
-use services::{SessionInfo, SessionRegistry, build_signaling_server};
+use services::{
+    MemoryRegistryStore, RegistryStore, SessionInfo, SessionRegistry, build_signaling_server,
+};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
@@ -449,6 +452,93 @@ async fn room_with_session_delimiter_is_rejected() {
     // Also rejected on a legacy plain room.
     let (status, _) = connect_reject(addr, "demo%230").await;
     assert_eq!(status, 400, "a '#' in a legacy room must be 400");
+}
+
+// ---- horizontal scale: two nodes share a registry (ADR-0040) ----
+
+/// Poll a node's SHARED-registry session count until it reaches `want`.
+async fn wait_global_session_count(reg: &SessionRegistry, want: usize) {
+    for _ in 0..100 {
+        if reg.global_session_count().await.unwrap_or(usize::MAX) == want {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!(
+        "global_session_count never reached {want} (got {:?})",
+        reg.global_session_count().await
+    );
+}
+
+#[tokio::test]
+async fn two_nodes_share_a_memory_registry() {
+    // Two STATELESS nodes over ONE shared store: each node's GLOBAL view
+    // aggregates BOTH nodes' sessions (the horizontal-scale acceptance, proven
+    // with the in-memory store — the Redis backend is proven in redis_registry.rs).
+    let store: Arc<dyn RegistryStore> = Arc::new(MemoryRegistryStore::new());
+    let reg_a = SessionRegistry::with_store(store.clone(), "node-a");
+    let reg_b = SessionRegistry::with_store(store.clone(), "node-b");
+
+    let mut sa = build_signaling_server((Ipv4Addr::LOCALHOST, 0), reg_a.clone());
+    let mut sb = build_signaling_server((Ipv4Addr::LOCALHOST, 0), reg_b.clone());
+    let addr_a = sa.bind().expect("bind a");
+    let addr_b = sb.bind().expect("bind b");
+    tokio::spawn(sa.serve());
+    tokio::spawn(sb.serve());
+
+    // A peer joins node A (scope X); another joins node B (scope Y).
+    let mut a = connect(addr_a, "m1~7.2~3~arena", Some(5)).await;
+    let _a = assigned_id(&mut a).await;
+    let mut b = connect(addr_b, "m1~9.2~3~lobby", Some(5)).await;
+    let _b = assigned_id(&mut b).await;
+
+    // EITHER node's shared-registry view shows BOTH sessions.
+    wait_global_session_count(&reg_a, 2).await;
+    wait_global_session_count(&reg_b, 2).await;
+    let rooms: Vec<String> = reg_b
+        .global_list()
+        .await
+        .expect("global_list")
+        .into_iter()
+        .map(|s| s.room)
+        .collect();
+    assert!(
+        rooms.contains(&"m1~7.2~3~arena".to_string()),
+        "node A's session must be visible from node B, got {rooms:?}"
+    );
+    assert!(
+        rooms.contains(&"m1~9.2~3~lobby".to_string()),
+        "node B's session must be visible from node A, got {rooms:?}"
+    );
+
+    // Each node's LOCAL view still sees only its own session.
+    assert_eq!(reg_a.session_count(), 1);
+    assert_eq!(reg_b.session_count(), 1);
+}
+
+#[tokio::test]
+async fn same_next_room_on_two_nodes_is_not_conflated() {
+    // Two nodes each host a `?next=2` group for the SAME room; both name it
+    // `<room>#0` locally. The shared registry keys by (node, session), so they are
+    // TWO distinct sessions — not one conflated group (ADR-0040 reviewer MEDIUM-2).
+    let store: Arc<dyn RegistryStore> = Arc::new(MemoryRegistryStore::new());
+    let reg_a = SessionRegistry::with_store(store.clone(), "node-a");
+    let reg_b = SessionRegistry::with_store(store.clone(), "node-b");
+
+    let mut sa = build_signaling_server((Ipv4Addr::LOCALHOST, 0), reg_a.clone());
+    let mut sb = build_signaling_server((Ipv4Addr::LOCALHOST, 0), reg_b.clone());
+    let addr_a = sa.bind().expect("bind a");
+    let addr_b = sb.bind().expect("bind b");
+    tokio::spawn(sa.serve());
+    tokio::spawn(sb.serve());
+
+    let mut a = connect_next(addr_a, "m1~7.2~3~arena", Some(5), Some(2)).await;
+    let _a = assigned_id(&mut a).await;
+    let mut b = connect_next(addr_b, "m1~7.2~3~arena", Some(5), Some(2)).await;
+    let _b = assigned_id(&mut b).await;
+
+    // Two distinct sessions in the shared registry (would be 1 if conflated).
+    wait_global_session_count(&reg_a, 2).await;
 }
 
 #[tokio::test]

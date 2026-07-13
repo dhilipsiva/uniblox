@@ -48,6 +48,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::extract::ws::Message;
@@ -60,6 +61,14 @@ use matchbox_signaling::{
     ClientRequestError, NoCallbacks, SignalingServer, SignalingServerBuilder, SignalingState,
     SignalingTopology, WsStateMeta,
 };
+use tokio::time::timeout;
+use uuid::Uuid;
+
+mod redis_store;
+mod store;
+
+pub use redis_store::RedisRegistryStore;
+pub use store::{MemoryRegistryStore, RegistryError, RegistryResult, RegistryStore, SessionInfo};
 
 /// The scope delimiter between a room path's tilde-separated parts.
 const SCOPE_SEP: char = '~';
@@ -69,6 +78,11 @@ const ENGINE_PARAM: &str = "engine";
 
 /// The `?next=N` query key carrying the desired session-SIZE cap.
 const NEXT_PARAM: &str = "next";
+
+/// Bounded wait for a shared-registry mirror op. A slow/black-holed store (redis-rs
+/// has no default response timeout) degrades to a bounded delay + a dropped mirror,
+/// never a hang that would stall a peer's relay-loop start (ADR-0040).
+const STORE_MIRROR_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The RESERVED delimiter that separates a room from its sub-session index in a
 /// bounded session key (`"<room>#<index>"`). A room path may NOT contain it (the
@@ -221,15 +235,6 @@ pub fn parse_next(query: &HashMap<String, String>) -> Result<Option<usize>, Scop
     }
 }
 
-/// One active session in a [`SessionRegistry::list`] listing. `room` is the
-/// session key: a room path (unbounded), or `"<room>#<index>"` when subdivided by
-/// `?next=N`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SessionInfo {
-    pub room: String,
-    pub peers: usize,
-}
-
 #[derive(Default)]
 struct RegistryInner {
     /// Gate-stashed `?next` size (None = unbounded) per connecting address;
@@ -237,12 +242,12 @@ struct RegistryInner {
     pending: HashMap<SocketAddr, Option<usize>>,
     /// peer → requested session size, bridged from `pending` at id assignment
     /// (fires before the topology's `state_machine`); consumed (removed) by
-    /// [`join`](SessionRegistry::join). A never-upgraded id-assigned peer leaves a
-    /// staged entry — non-listed, memory only, bounded by the deferred rate-limit.
+    /// [`join_local`](SessionRegistry::join_local). A never-upgraded id-assigned
+    /// peer leaves a staged entry — memory only, bounded by the deferred rate-limit.
     peer_next: HashMap<PeerId, Option<usize>>,
     /// Live sessions keyed by session key: the room path (unbounded), or
     /// `"<room>#<index>"` when subdivided by `?next=N`. Maps each member to its
-    /// relay sender. This is what `list()` reports.
+    /// relay sender. This is what the node-local `list()` reports.
     sessions: HashMap<String, HashMap<PeerId, SignalingChannel>>,
     /// The current OPEN (fillable) session key per room, for `?next=N` rooms only.
     /// Removed when the session seals (reaches N) ⇒ no backfill (ADR-0039).
@@ -253,25 +258,59 @@ struct RegistryInner {
     peer_session: HashMap<PeerId, String>,
 }
 
-/// In-memory state of active signaling sessions — the shared [`SignalingState`]
-/// backing [`NextTopology`]. Holds each session's peers + relay senders, the
-/// `?next` grouping bookkeeping, and the stashed `?next` awaiting id assignment.
-/// Cheap to `clone` (shared `Arc`): the same handle is the topology state, the
-/// gate's stash target, and the id-assignment bridge.
-#[derive(Clone, Default)]
-pub struct SessionRegistry(Arc<Mutex<RegistryInner>>);
+/// The signaling node's session state — the [`SignalingState`] backing
+/// [`NextTopology`] (ADR-0040). Two layers:
+///
+/// * **node-local relay** (`local`): each session's peers + live relay senders +
+///   the `?next` grouping bookkeeping. Drives the relay; never leaves the process.
+///   `list`/`peer_count`/`session_count` report THIS node's live sessions.
+/// * **shared registry** (`store`): a [`RegistryStore`] mirror of session→peer
+///   membership, tagged by `node_id`, that many STATELESS nodes share. The
+///   `global_*` methods report the registry across all nodes.
+///
+/// Cheap to `clone` (shared `Arc`s): the same handle is the topology state, the
+/// gate's stash target, and the id-assignment bridge. Only the LISTING is shared —
+/// the relay is node-local, so the two peers of a session must be on the same node
+/// (sticky routing; cross-node relay is out of scope).
+#[derive(Clone)]
+pub struct SessionRegistry {
+    local: Arc<Mutex<RegistryInner>>,
+    store: Arc<dyn RegistryStore>,
+    node_id: Arc<str>,
+}
 
 impl SignalingState for SessionRegistry {}
 
+impl Default for SessionRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SessionRegistry {
+    /// A single-node registry: an in-memory store + a fresh random node id.
     pub fn new() -> Self {
-        Self::default()
+        Self::with_store(
+            Arc::new(MemoryRegistryStore::new()),
+            Uuid::new_v4().to_string(),
+        )
+    }
+
+    /// A registry over a SHARED `store` (e.g. Redis, or one `MemoryRegistryStore`
+    /// shared by several nodes) with an explicit `node_id`. Two nodes over one
+    /// store share the registry (the horizontal-scale surface).
+    pub fn with_store(store: Arc<dyn RegistryStore>, node_id: impl Into<Arc<str>>) -> Self {
+        Self {
+            local: Arc::new(Mutex::new(RegistryInner::default())),
+            store,
+            node_id: node_id.into(),
+        }
     }
 
     /// Gate: stash the requested `?next` size for a connecting address (the only
     /// id available before id assignment).
     fn stash(&self, addr: SocketAddr, next: Option<usize>) {
-        if let Ok(mut g) = self.0.lock() {
+        if let Ok(mut g) = self.local.lock() {
             g.pending.insert(addr, next);
         }
     }
@@ -279,22 +318,26 @@ impl SessionRegistry {
     /// Id assignment (fires PRE-topology): bridge the stashed `?next` from the
     /// connecting `addr` to its assigned `PeerId`, so the topology can read it.
     fn bridge(&self, addr: SocketAddr, peer: PeerId) {
-        if let Ok(mut g) = self.0.lock()
+        if let Ok(mut g) = self.local.lock()
             && let Some(next) = g.pending.remove(&addr)
         {
             g.peer_next.insert(peer, next);
         }
     }
 
-    /// Topology join: assign `peer` (connecting to `room`) to a session per the
-    /// batch-deal / no-backfill rule, register its `sender`, and RETURN the
-    /// senders of the peers ALREADY in that session (so the caller can broadcast
-    /// `NewPeer` AFTER releasing the lock — the newcomer thus gets no self-event,
-    /// matching FullMesh).
-    fn join(&self, room: &str, peer: PeerId, sender: SignalingChannel) -> Vec<SignalingChannel> {
-        let Ok(mut g) = self.0.lock() else {
-            return Vec::new();
-        };
+    /// Node-local join assignment (sync; the lock is dropped before it returns).
+    /// Assigns `peer` to a session per the batch-deal / no-backfill rule, registers
+    /// its `sender`, and returns `Some((session key, existing members' senders))` —
+    /// the senders captured BEFORE inserting the newcomer (so it gets no
+    /// self-event). `None` iff the local lock is poisoned (nothing was registered,
+    /// so the caller mirrors nothing — LOW-2 symmetry).
+    fn join_local(
+        &self,
+        room: &str,
+        peer: PeerId,
+        sender: SignalingChannel,
+    ) -> Option<(String, Vec<SignalingChannel>)> {
+        let mut g = self.local.lock().ok()?;
         // Requested size: `None` if the peer carried no `?next` (or wasn't
         // bridged). `.flatten()` collapses "no entry" and "entry == None".
         let next = g.peer_next.remove(&peer).flatten();
@@ -343,29 +386,26 @@ impl SessionRegistry {
         if sealed && g.open.get(room).map(String::as_str) == Some(key.as_str()) {
             g.open.remove(room); // no backfill: a sealed session is never reused
         }
-        g.peer_session.insert(peer, key);
-        existing
+        g.peer_session.insert(peer, key.clone());
+        Some((key, existing))
     }
 
     /// The relay target for a `Signal`: `receiver`'s sender IFF it shares
     /// `peer`'s session (cross-session ⇒ `None`, the isolation boundary).
     fn target(&self, peer: PeerId, receiver: PeerId) -> Option<SignalingChannel> {
-        let g = self.0.lock().ok()?;
+        let g = self.local.lock().ok()?;
         let key = g.peer_session.get(&peer)?;
         g.sessions.get(key)?.get(&receiver).cloned()
     }
 
-    /// Topology exit: drop `peer` from its session (pruning an emptied session +
-    /// clearing a dangling `open` pointer) and RETURN the remaining members'
-    /// senders (so the caller can broadcast `PeerLeft` after releasing the lock).
-    fn leave(&self, peer: PeerId) -> Vec<SignalingChannel> {
-        let Ok(mut g) = self.0.lock() else {
-            return Vec::new();
-        };
+    /// Node-local leave (sync; lock dropped before it returns): drop `peer` from
+    /// its session (pruning an emptied session + clearing a dangling `open`
+    /// pointer). Returns `Some((session key, remaining members' senders))`, or
+    /// `None` if the peer was in no session (or the lock is poisoned).
+    fn leave_local(&self, peer: PeerId) -> Option<(String, Vec<SignalingChannel>)> {
+        let mut g = self.local.lock().ok()?;
         g.peer_next.remove(&peer); // in case the peer never reached `join`
-        let Some(key) = g.peer_session.remove(&peer) else {
-            return Vec::new();
-        };
+        let key = g.peer_session.remove(&peer)?;
         let mut remaining = Vec::new();
         let mut emptied = false;
         if let Some(members) = g.sessions.get_mut(&key) {
@@ -379,12 +419,47 @@ impl SessionRegistry {
             // session that emptied; a sealed one was already un-pointed).
             g.open.retain(|_, v| v != &key);
         }
-        remaining
+        Some((key, remaining))
     }
 
-    /// List active sessions (session keys + peer counts), sorted for determinism.
+    /// Mirror a join to the shared registry — best-effort with a BOUNDED timeout
+    /// (`STORE_MIRROR_TIMEOUT`): a slow/black-holed store degrades to a bounded
+    /// delay + a dropped mirror, NEVER a hang (redis-rs has no default response
+    /// timeout). Called AFTER the caller broadcast `NewPeer`, so peer discovery is
+    /// never delayed by the store — only this peer's own relay-loop start, and only
+    /// up to the timeout. The listing may miss this peer; the relay is unaffected.
+    async fn mirror_join(&self, key: &str, peer: PeerId) {
+        match timeout(
+            STORE_MIRROR_TIMEOUT,
+            self.store.record_join(&self.node_id, key, peer),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!("shared registry record_join failed: {e}"),
+            Err(_) => tracing::warn!("shared registry record_join timed out"),
+        }
+    }
+
+    /// Mirror a leave to the shared registry — best-effort, bounded (see
+    /// [`mirror_join`](Self::mirror_join)).
+    async fn mirror_leave(&self, key: &str, peer: PeerId) {
+        match timeout(
+            STORE_MIRROR_TIMEOUT,
+            self.store.record_leave(&self.node_id, key, peer),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!("shared registry record_leave failed: {e}"),
+            Err(_) => tracing::warn!("shared registry record_leave timed out"),
+        }
+    }
+
+    /// List THIS node's live sessions (keys + peer counts), sorted. For the shared
+    /// registry across all nodes, use [`global_list`](Self::global_list).
     pub fn list(&self) -> Vec<SessionInfo> {
-        let Ok(g) = self.0.lock() else {
+        let Ok(g) = self.local.lock() else {
             return Vec::new();
         };
         let mut out: Vec<SessionInfo> = g
@@ -399,18 +474,33 @@ impl SessionRegistry {
         out
     }
 
-    /// Number of peers currently in the session keyed `key`.
+    /// Peers in `key` ON THIS NODE. See [`global_peer_count`](Self::global_peer_count).
     pub fn peer_count(&self, key: &str) -> usize {
-        self.0
+        self.local
             .lock()
             .ok()
             .and_then(|g| g.sessions.get(key).map(HashMap::len))
             .unwrap_or(0)
     }
 
-    /// Number of active sessions.
+    /// Active sessions ON THIS NODE. See [`global_session_count`](Self::global_session_count).
     pub fn session_count(&self) -> usize {
-        self.0.lock().map(|g| g.sessions.len()).unwrap_or(0)
+        self.local.lock().map(|g| g.sessions.len()).unwrap_or(0)
+    }
+
+    /// The SHARED registry's sessions across all nodes (from the store).
+    pub async fn global_list(&self) -> RegistryResult<Vec<SessionInfo>> {
+        self.store.list().await
+    }
+
+    /// Peers in `key` across all nodes (from the shared registry store).
+    pub async fn global_peer_count(&self, key: &str) -> RegistryResult<usize> {
+        self.store.peer_count(key).await
+    }
+
+    /// Active sessions across all nodes (from the shared registry store).
+    pub async fn global_session_count(&self) -> RegistryResult<usize> {
+        self.store.session_count().await
     }
 }
 
@@ -449,12 +539,18 @@ impl SignalingTopology<NoCallbacks, SessionRegistry> for NextTopology {
             ..
         } = upgrade;
 
-        // Assign a session; announce the newcomer to the peers ALREADY there
-        // (they initiate the offers). `sender` is moved into the session map (it
-        // is not used again — the relay writes to TARGET senders). The lock is
-        // released before we broadcast.
-        let existing = state.join(&room, peer_id, sender);
+        // Register the peer LOCALLY (sync), announce it to the peers ALREADY there
+        // (they initiate the offers) IMMEDIATELY, THEN mirror the join to the
+        // shared registry with a bounded timeout. Announcing before the store means
+        // a slow/black-holed store never delays peer discovery — only this peer's
+        // own relay-loop start, bounded. `sender` is moved into the session map
+        // (the relay writes to TARGET senders, never self). A poisoned local lock
+        // ⇒ nothing registered ⇒ end (the socket closes).
+        let Some((key, existing)) = state.join_local(&room, peer_id, sender) else {
+            return;
+        };
         broadcast(&existing, &JsonPeerEvent::NewPeer(peer_id));
+        state.mirror_join(&key, peer_id).await;
 
         // Relay loop (mirrors matchbox FullMesh): forward each Signal to the named
         // receiver IFF it shares this peer's session; drop KeepAlive; a bad frame
@@ -486,9 +582,12 @@ impl SignalingTopology<NoCallbacks, SessionRegistry> for NextTopology {
             }
         }
 
-        // Peer gone: drop it from its session, tell the remaining members.
-        let remaining = state.leave(peer_id);
-        broadcast(&remaining, &JsonPeerEvent::PeerLeft(peer_id));
+        // Peer gone: drop it from its session (local), tell the remaining members
+        // IMMEDIATELY, THEN mirror the removal to the shared registry (bounded).
+        if let Some((key, remaining)) = state.leave_local(peer_id) {
+            broadcast(&remaining, &JsonPeerEvent::PeerLeft(peer_id));
+            state.mirror_leave(&key, peer_id).await;
+        }
     }
 }
 

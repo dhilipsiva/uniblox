@@ -9,7 +9,10 @@ matchbox_protocol.workspace = true         # PeerId + JsonPeer{Request,Event} wi
 axum = { workspace = true, features = ["ws"] }  # reasoned gate rejections (ADR-0038) + ws::Message for the relay (ADR-0039)
 async-trait.workspace = true               # the custom NextTopology SignalingTopology impl (ADR-0039)
 futures.workspace = true                   # StreamExt on the WsStateMeta receiver (relay loop, ADR-0039)
-tokio.workspace = true
+redis.workspace = true                     # the shared Redis session-registry backend (ADR-0040)
+uuid.workspace = true                      # per-node id for the shared registry (ADR-0040)
+tracing.workspace = true                   # best-effort store-mirror failure logs (ADR-0040)
+tokio = { workspace = true, features = ["time"] }  # bounded timeout on the store mirror (ADR-0040)
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
