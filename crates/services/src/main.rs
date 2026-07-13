@@ -1,9 +1,11 @@
-//! uniblox signaling server binary (ADR-0037/0038): scoped room-based WebRTC
-//! signaling. Rooms are URL paths; a scoped room is
+//! uniblox signaling server binary (ADR-0037/0038/0039): scoped room-based
+//! WebRTC signaling. Rooms are URL paths; a scoped room is
 //! `<mode>~<content>.<schema>~<min>~<lobby>` (content/schema/min/lobby isolate
 //! structurally) and the client's own engine rides the `?engine=N` query, gated
-//! `>= min` (the asymmetric filter). A plain path is a legacy room. The
-//! matchmaking logic + session registry live in the `services` library.
+//! `>= min` (the asymmetric filter). An optional `?next=N` caps session SIZE
+//! (peers deal into sessions of at most N). A plain path is a legacy room. The
+//! custom topology + matchmaking + session registry live in the `services`
+//! library.
 
 use std::net::{Ipv4Addr, SocketAddr};
 
@@ -29,7 +31,7 @@ async fn main() {
     let server = build_signaling_server(addr, registry);
 
     println!(
-        "[signaling] uniblox scoped signaling on ws://{addr}/<mode>~<engine>.<content>.<schema>~<lobby>"
+        "[signaling] uniblox scoped signaling on ws://{addr}/<mode>~<content>.<schema>~<min>~<lobby>?engine=N[&next=N]"
     );
     if let Err(err) = server.serve().await {
         eprintln!("[signaling] server error: {err}");

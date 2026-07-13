@@ -1,8 +1,9 @@
-//! Integration tests for the scoped signaling service (ADR-0037/0038): raw
+//! Integration tests for the scoped signaling service (ADR-0037/0038/0039): raw
 //! WebSocket peers (mirroring matchbox's own tests) prove the SDP/ICE relay, the
 //! ASYMMETRIC version filter (compatible engines share a room; a too-old engine
-//! is rejected WITH A REASON), content/schema scope isolation, legacy-room
-//! passthrough, and the session registry.
+//! is rejected WITH A REASON), content/schema scope isolation, `?next=N`
+//! session-SIZE grouping (cap + spill-to-new-session + no-backfill + cross-session
+//! relay isolation), legacy-room passthrough, and the session registry.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
@@ -27,14 +28,50 @@ async fn boot() -> (SessionRegistry, SocketAddr) {
 }
 
 /// Connect a peer. `engine` is the client's own version → `?engine=N`; `None`
-/// sends no query (for legacy plain rooms, which have no engine gate).
+/// sends no engine (for legacy plain rooms, which have no engine gate).
 async fn connect(addr: SocketAddr, room: &str, engine: Option<u32>) -> Ws {
-    let url = match engine {
-        Some(e) => format!("ws://{addr}/{room}?engine={e}"),
-        None => format!("ws://{addr}/{room}"),
+    connect_next(addr, room, engine, None).await
+}
+
+/// Connect a peer with an optional `?engine=N` AND an optional `?next=N`
+/// session-SIZE cap.
+async fn connect_next(
+    addr: SocketAddr,
+    room: &str,
+    engine: Option<u32>,
+    next: Option<usize>,
+) -> Ws {
+    let mut params = Vec::new();
+    if let Some(e) = engine {
+        params.push(format!("engine={e}"));
+    }
+    if let Some(n) = next {
+        params.push(format!("next={n}"));
+    }
+    let query = if params.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", params.join("&"))
     };
-    let (ws, _resp) = connect_async(url).await.expect("ws connect");
+    let (ws, _resp) = connect_async(format!("ws://{addr}/{room}{query}"))
+        .await
+        .expect("ws connect");
     ws
+}
+
+/// Assert NO signaling event arrives on `ws` for `dur` (ping/pong frames are
+/// tolerated). Used to prove cross-session relay isolation.
+async fn expect_silence(ws: &mut Ws, dur: Duration) {
+    let deadline = tokio::time::Instant::now() + dur;
+    loop {
+        match tokio::time::timeout_at(deadline, ws.next()).await {
+            Err(_) => return, // deadline reached with no signaling event → silent
+            Ok(Some(Ok(Message::Text(txt)))) => panic!("expected silence, got {txt}"),
+            Ok(Some(Ok(_))) => continue, // ping/pong/binary — keep waiting
+            Ok(Some(Err(e))) => panic!("ws error during silence wait: {e:?}"),
+            Ok(None) => panic!("stream closed during silence wait"),
+        }
+    }
 }
 
 /// Attempt a connection expected to be REJECTED at the WS upgrade; return the
@@ -279,4 +316,150 @@ async fn disconnect_prunes_the_session() {
 
     drop(a); // close the socket
     wait_session_count(&reg, 0).await; // pruned once empty
+}
+
+// ---- ?next=N session-SIZE grouping (ADR-0039) ----
+
+#[tokio::test]
+async fn next_caps_session_size_and_spills() {
+    // The headline: ?next=4 deals peers into sessions of at most 4. Four peers on
+    // one scope fill session #0; the 5th spills into a fresh session #1.
+    let (reg, addr) = boot().await;
+    let scope = "m1~7.2~3~arena";
+
+    // Keep the sockets alive (dropping a Ws disconnects the peer).
+    let mut first_four = Vec::new();
+    for _ in 0..4 {
+        let mut ws = connect_next(addr, scope, Some(5), Some(4)).await;
+        let _ = assigned_id(&mut ws).await;
+        first_four.push(ws);
+    }
+    // All four landed in the SAME (first) session, which then sealed at 4.
+    wait_peer_count(&reg, "m1~7.2~3~arena#0", 4).await;
+    wait_session_count(&reg, 1).await;
+
+    // The 5th cannot join the sealed session → a new one opens.
+    let mut fifth = connect_next(addr, scope, Some(5), Some(4)).await;
+    let _ = assigned_id(&mut fifth).await;
+    wait_session_count(&reg, 2).await;
+    wait_peer_count(&reg, "m1~7.2~3~arena#1", 1).await;
+    assert_eq!(
+        reg.peer_count("m1~7.2~3~arena#0"),
+        4,
+        "the sealed session stays at its cap"
+    );
+}
+
+#[tokio::test]
+async fn sessions_are_relay_isolated() {
+    // ?next=1 seals every peer into its own session. A Signal aimed across
+    // sessions is dropped (the target isn't in the sender's session).
+    let (reg, addr) = boot().await;
+    let scope = "m1~7.2~3~arena";
+
+    let mut a = connect_next(addr, scope, Some(5), Some(1)).await;
+    let _a_id = assigned_id(&mut a).await;
+    let mut b = connect_next(addr, scope, Some(5), Some(1)).await;
+    let b_id = assigned_id(&mut b).await;
+
+    wait_session_count(&reg, 2).await; // two singleton sessions
+
+    // A → B, but B is in a different session ⇒ the relay must not deliver it.
+    let offer = JsonPeerRequest::Signal {
+        receiver: b_id,
+        data: serde_json::json!({ "Offer": "cross-session" }),
+    };
+    a.send(Message::text(offer.to_string()))
+        .await
+        .expect("send offer");
+    expect_silence(&mut b, Duration::from_millis(400)).await;
+}
+
+#[tokio::test]
+async fn no_backfill_after_departure() {
+    // A sealed session never refills: after a peer leaves a full ?next=2 session,
+    // a new joiner opens a fresh session rather than backfilling the free slot.
+    let (reg, addr) = boot().await;
+    let scope = "m1~7.2~3~arena";
+
+    let mut a = connect_next(addr, scope, Some(5), Some(2)).await;
+    let _a = assigned_id(&mut a).await;
+    let mut b = connect_next(addr, scope, Some(5), Some(2)).await;
+    let _b = assigned_id(&mut b).await;
+    wait_peer_count(&reg, "m1~7.2~3~arena#0", 2).await; // sealed at 2
+    wait_session_count(&reg, 1).await;
+
+    drop(a); // #0 drops to 1, but stays sealed (no backfill)
+    wait_peer_count(&reg, "m1~7.2~3~arena#0", 1).await;
+
+    // A new joiner opens session #1 instead of filling #0's free slot.
+    let mut c = connect_next(addr, scope, Some(5), Some(2)).await;
+    let _c = assigned_id(&mut c).await;
+    wait_session_count(&reg, 2).await;
+    wait_peer_count(&reg, "m1~7.2~3~arena#1", 1).await;
+    assert_eq!(
+        reg.peer_count("m1~7.2~3~arena#0"),
+        1,
+        "the sealed session is not backfilled"
+    );
+}
+
+#[tokio::test]
+async fn invalid_next_is_rejected() {
+    let (_reg, addr) = boot().await;
+    // ?next=0 (not positive) and ?next=abc (non-numeric) ⇒ 400 with a reason.
+    let (status, body) = connect_reject(addr, "m1~7.2~3~arena?engine=5&next=0").await;
+    assert_eq!(status, 400, "next=0 must be 400");
+    assert!(
+        body.contains("next"),
+        "reason should mention next, got {body:?}"
+    );
+    let (status, _) = connect_reject(addr, "m1~7.2~3~arena?engine=5&next=abc").await;
+    assert_eq!(status, 400, "non-numeric next must be 400");
+}
+
+#[tokio::test]
+async fn no_next_is_one_unbounded_session() {
+    // No ?next ⇒ one unbounded session per room (the FullMesh-equivalent path).
+    let (reg, addr) = boot().await;
+    let room = "m1~7.2~3~arena";
+
+    let mut peers = Vec::new();
+    for _ in 0..3 {
+        let mut ws = connect(addr, room, Some(5)).await;
+        let _ = assigned_id(&mut ws).await;
+        peers.push(ws);
+    }
+    wait_peer_count(&reg, room, 3).await; // session key == the room path
+    wait_session_count(&reg, 1).await;
+}
+
+#[tokio::test]
+async fn room_with_session_delimiter_is_rejected() {
+    let (_reg, addr) = boot().await;
+    // `%230` percent-decodes (axum) to `arena#0`, which would collide with a
+    // `?next` sub-session key `<room>#<index>` and cross the isolation boundary —
+    // the gate reserves `#` and rejects it (scoped path here; also legacy).
+    let (status, body) = connect_reject(addr, "m1~7.2~3~arena%230?engine=5").await;
+    assert_eq!(status, 400, "a '#' in the room must be 400");
+    assert!(
+        body.contains('#'),
+        "reason should mention '#', got {body:?}"
+    );
+    // Also rejected on a legacy plain room.
+    let (status, _) = connect_reject(addr, "demo%230").await;
+    assert_eq!(status, 400, "a '#' in a legacy room must be 400");
+}
+
+#[tokio::test]
+async fn next_groups_legacy_rooms_too() {
+    // ?next is orthogonal to the scope — it also caps a legacy plain room.
+    let (reg, addr) = boot().await;
+
+    let mut a = connect_next(addr, "uniblox-demo", None, Some(1)).await;
+    let _a = assigned_id(&mut a).await;
+    let mut b = connect_next(addr, "uniblox-demo", None, Some(1)).await;
+    let _b = assigned_id(&mut b).await;
+
+    wait_session_count(&reg, 2).await; // each sealed into its own singleton
 }
