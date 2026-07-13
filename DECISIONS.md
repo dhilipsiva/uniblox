@@ -1356,3 +1356,56 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   residual `peer_room` staging entry for a never-upgraded peer is non-listed, memory-only, bounded by the deferred
   rate-limiting). No always-do violation; the `Mode` tag is signaling-local (not a gameplay/`authority_of` branch).
 - **Status:** Accepted (2026-07-13).
+
+## ADR-0038 — asymmetric version filter (version-triple enforcement/gating) + reasoned rejection
+- **Context:** second Phase-5 item. ADR-0037 gave `services` an EXACT `{mode, version}` scope in the room path,
+  isolating any non-identical version structurally, with a bare-401 gate. The backlog's "version-triple
+  enforcement/gating" bullet wants the ASYMMETRIC filter: admit a client whose **engine ≥ the game's declared
+  minimum** (engine releases are backward-compatible) while requiring **content ID + schema version to match
+  EXACTLY**, and reject an incompatible join **with a clear reason**. Version-gating on join is the desync defense
+  (engine/binary is a versioned release, not hot-reloadable in prod; content is hot-reloadable at runtime).
+- **The forced design change:** under matchbox FullMesh, room == literal path string, so for engine-3 and engine-5
+  peers to share ONE session the client's own engine MUST leave the room key. So (user-chosen via AskUserQuestion —
+  "per-lobby min in the room path"):
+  - **Scope format evolves** `<mode>~<engine>.<content>.<schema>~<lobby>` → **`<mode>~<content>.<schema>~<min>~<lobby>`**
+    (e.g. `m1~7.2~3~arena`). content/schema/min/lobby stay in the key ⇒ their exact match is structural (a different
+    content/schema/min/lobby is a different room ⇒ never matched).
+  - **The client's own engine rides `?engine=N`** (query, NOT in the key — confirmed matchbox_socket forwards the
+    whole room URL incl. query verbatim, and the gate sees `WsUpgradeMeta.query_params`). So different-but-compatible
+    engines share ONE room.
+  - **The gate implements the asymmetric compare:** `parse_scope` the `~`-path, `parse_engine` the query, and admit
+    iff `engine >= scope.min_engine`. Rejections are now REASONED (returned verbatim by matchbox on `Err(Response)`):
+    **`426 Upgrade Required`** + body for `engine < min` ("engine X below required minimum Y"), **`400 Bad Request`**
+    + body for a malformed scope or a missing/non-numeric `?engine`. Built via a new `axum` dep
+    (`(StatusCode, String).into_response()`, unifies to matchbox's axum 0.8.9 — not re-exported). A plain path (no
+    `~`) stays a legacy room (accepted, no engine gate — keeps `uniblox-demo` working). Empty path → bare 401.
+  - **content/schema mismatch is structural isolation, NOT an explicit rejection** — the server has no "expected"
+    content/schema to reject against (a lobby is DEFINED by its content/schema); a mismatched joiner is simply in a
+    different room and is never matched. Only the engine-too-old + malformed cases are an explicit at-join rejection.
+  - The `SessionRegistry` lifecycle is UNCHANGED (engine leaving the key is transparent to it — rooms are still
+    keyed by the full path; compatible engines just land in the same room).
+- **Trust model (documented, not a regression):** `?engine` and the path `min` are self-declared. Per `CLAUDE.md`,
+  the version gate is desync defense for HONEST clients, NOT anti-cheat — a modified client can lie about its engine,
+  but cannot lie its way into a *stricter* room with an old engine (a different `min` is a different room; within a
+  `min=N` room every honest peer is gated `>= N`). content/schema exactness is likewise honest-client structural.
+- **Consequences:** CLOSES the "version-triple enforcement/gating (asymmetric filter)" bullet. **Deferred**
+  (unchanged): a custom `SignalingTopology` with client-`?next=N` session-SIZE grouping; the Mode-2 coordinator peer
+  service; horizontal-scale Redis/Postgres registry; signaling-DoS rate-limiting/auth (Phase 11). Evidence: 4 unit
+  tests (`parse_scope` valid + every malformed form; `parse_engine` valid/missing/non-numeric; distinct-key
+  discrimination across mode/content/schema/min/lobby) + 10 raw-WS integration tests (offer relay;
+  **compatible-engines-share-one-session** — engine 5 + engine 3 both ≥ min 3 share a room; **engine-below-min → 426
+  + reason**; missing/non-numeric-engine → 400; distinct-mode + distinct-content isolation; malformed-scope → 400;
+  legacy room; sorted listing; disconnect-prune) green; clippy `-D warnings` (`--all-targets`) + fmt clean; full
+  workspace green (fixed a `doc_lazy_continuation` on the `Scope` doc). No always-do violation (no `unwrap`/`expect`
+  in non-test code; the `#[allow(clippy::result_large_err)]` is still justified — returning the large `Response`
+  Err IS the reasoned-rejection mechanism). Fresh reviewer (cross-checked against the matchbox 0.14 source —
+  gate contract, router, query extraction) → **SOUND, no CRITICAL/HIGH/MEDIUM findings, nothing to fix**: the
+  `engine < min` boundary (== min admitted, min-1 rejected), the 426/400/401 status mapping, the room key still
+  carrying mode+content+schema+min+lobby (engine leaving didn't widen matching), the honest-client trust model, and
+  the always-do rules all affirmed; the isolation tests are non-vacuous (`wait_*` panic on timeout). Three by-design
+  NITs surfaced (not defects): (a) `min` in the room key can transiently fragment a same-content playerbase if an
+  operator raises min without a content/schema bump — intended per the "different min = different room" model, and
+  `min` is a shared manifest constant (only the per-client engine is correctly out of the key); (b) the
+  `engine_below_minimum` test's `wait_session_count(0)` is a weak belt behind the real `status == 426` check; (c)
+  a duplicate `?engine=` param is last-wins (axum `Query`) — irrelevant in the honest-client envelope.
+- **Status:** Accepted (2026-07-13).

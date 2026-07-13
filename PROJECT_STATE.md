@@ -129,17 +129,19 @@ manual browser check (move → K → reload → L restores the world, also B4's 
 browser-playable) and the full content-addressed save (B1 `ContentId`/blake3 → B2 `save_world`/`load_world` +
 `MemoryStore` → B3 native `FileStore` → B4 browser `IdbStore` → C1 client keybinds).
 
-**PHASE 5 (central services) HAS BEGUN — scoped signaling DONE (ADR-0037):** `services` is now a library+binary —
-`build_signaling_server` wraps matchbox FullMesh with `{mode, version}` scoping via the room PATH
-(`<mode>~<engine>.<content>.<schema>~<lobby>`; FullMesh isolates by path, so mismatched peers are structurally
-never matched — offers/answers relay only within one room) + an `on_connection_request` gate (rejects malformed
-scopes; plain paths stay legacy rooms) + an in-memory `SessionRegistry` (lifecycle-balanced: gate stashes room by
-`origin` → id-assign bridges `peer→room` → connect joins `sessions` → disconnect removes+prunes). 3 unit + 7
-raw-WS integration tests green (offer relay, scope isolation ×2, malformed-reject, legacy room, listing,
-disconnect-prune); clippy/fmt clean; workspace green; reviewer → 1 MEDIUM (registry add/remove lifecycle imbalance)
-FIXED. Closes the signaling+registry+scoping bullet AND the same-mode/same-version bullet. Remaining Phase-5:
-custom-topology `?next=N` session-SIZE grouping; the asymmetric version filter; horizontal-scale Redis/Postgres
-registry; the Mode-2 coordinator peer service.
+**PHASE 5 (central services) HAS BEGUN — scoped signaling + asymmetric version filter DONE (ADR-0037/0038):**
+`services` is now a library+binary — `build_signaling_server` wraps matchbox FullMesh with a scope in the room PATH
+(`<mode>~<content>.<schema>~<min>~<lobby>`; FullMesh isolates by path, so mismatched content/schema/min/lobby are
+structurally never matched) + an `on_connection_request` gate + an in-memory `SessionRegistry` (lifecycle-balanced:
+gate stashes room by `origin` → id-assign bridges `peer→room` → connect joins `sessions` → disconnect
+removes+prunes). **ADR-0038 asymmetric version filter:** the client's own engine moved OUT of the room key into a
+`?engine=N` query, so compatible-but-newer engines share ONE room; the gate admits iff `engine >= min_engine`, else
+a REASONED rejection (`426` too-old / `400` malformed/missing-engine via an `axum` dep) instead of a bare 401.
+4 unit + 10 raw-WS integration tests green (offer relay, compatible-engines-share, engine-below-min-426,
+missing/non-numeric-engine-400, mode + content isolation, malformed-400, legacy room, listing, disconnect-prune);
+clippy/fmt clean; workspace green. Closes the signaling+registry+scoping bullet, the same-mode/same-version bullet,
+AND the version-triple enforcement/gating (asymmetric filter) bullet. Remaining Phase-5: custom-topology `?next=N`
+session-SIZE grouping; horizontal-scale Redis/Postgres registry; the Mode-2 coordinator peer service.
 
 ## Done
 - **Cargo workspace** — virtual manifest, 10 crates under `crates/*` (glob members),
