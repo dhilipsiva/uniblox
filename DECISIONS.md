@@ -1122,3 +1122,38 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   `matchbox_socket`) while rejecting lookalikes (`bevy_replicon`, `my-transport`). Fresh reviewer → clean (one LOW —
   a dead `matchbox` regex token — fixed to `matchbox[a-z_]*`).
 - **Status:** Accepted (2026-07-13).
+
+## ADR-0031 — browser-playable Mode 1: wire the standalone sim into the client
+- **Context:** Phase-4 A1 (ADR-0030) landed the headless net-free `standalone` runtime; the user's scope choice for
+  Phase 4 is headless + **browser-playable**. Item A2 makes Mode 1 actually playable in the browser by wiring the
+  SAME net-free sim into the client's existing `DefaultPlugins` render app (which previously rendered only the
+  ADR-0017 `Bouncer` sine demo).
+- **Decision:** add `engine-core`/`standalone`/`protocol` to the client's `wasm32` deps (all net-free — no
+  transport/replication enters the SIM path; the client crate still links `transport` for the separate interim
+  `demo`). In `mod render`: `setup` (exclusive `&mut World`) spawns a `Camera2d`, a locally-owned `Avatar`, and a
+  few drifting NPCs via `engine_core::{insert_sim, spawn_owned}` (owner = `LOCAL = PeerId(1)`), attaching
+  `Sprite`+`Transform`; `standalone::add_sim_systems(&mut app)` runs the engine-core FixedUpdate sim; `drive_avatar`
+  maps held movement keys → the avatar's authoritative `Velocity` (via a pure, native-unit-tested crate-root
+  `move_dir` helper, `cfg(any(wasm32, test))` so no native dead-code); `sync_render` copies `Position` →
+  `Transform`. Because Mode 1 is local-authority, NO prediction/interpolation/reconciliation is used — input writes
+  `Velocity` and `simulate` integrates it. The `Bouncer`/`bounce` demo is removed; `first_frame` + the transport
+  `demo` are kept.
+- **Consequences:** Mode 1 is playable in-browser running the IDENTICAL engine-core sim as the server/standalone
+  (the reused `add_sim_systems` is A1-integration-tested). Sim (`FixedUpdate`, 64 Hz) + input/render (`Update`)
+  coexist under `DefaultPlugins` (it drives both; `Res<Time>` in `FixedUpdate` = `Time<Fixed>`, which
+  `sync_sim_dt` reads). Load-bearing type-unification confirmed: a single `bevy_app 0.19` in the lockfile ⇒
+  `standalone`'s `bevy_app::App` IS the client's `bevy::app::App`. **Size-budget gate re-checked → PASS:**
+  3.39/3.41 MB brotli per build (webgl2 3,388,432 B / webgpu 3,409,077 B) — ~+10 KB vs the prior 3.38/3.40
+  (engine-core/standalone/protocol are tiny logic crates; bevy was already linked), well under ~8 MB. Accepted
+  nits (documented, not defects): un-normalized diagonal speed (~√2× on a diagonal — fine for the demo view);
+  `RenderPos` is carried by `spawn_owned` but unread here (Mode 1 reads `Position` directly — `copy_owned_render`/
+  `RenderPos` is the Modes-2/3 upgrade path). Evidence: `client` native `cargo test` 2/2 (smoke + `move_dir_maps_axes`);
+  clippy `-D warnings` native (`--all-targets`) + `wasm32-unknown-unknown` clean; fmt clean; full workspace `cargo
+  test` green; `scripts/build-wasm.sh` compiled BOTH builds (webgl2 + webgpu) and produced valid artifacts
+  (wasm-bindgen + wasm-opt + brotli all succeeded). Fresh reviewer → clean (no always-do violations; type-unify +
+  Camera-exclusion + cfg-gate all confirmed). **Live in-browser render + keyboard movement could NOT be exercised
+  in this environment** (the WSL-hosted dev server is torn down at the `wsl -e bash -lc` boundary, and the in-app
+  browser can't render the heavy Bevy WASM without GPU) — flagged for a manual browser check (`scripts/serve.sh` +
+  open in a real browser: confirm the scene renders, NPCs drift, arrow/WASD moves the avatar, `[uniblox-metrics]
+  first-frame` fires).
+- **Status:** Accepted (2026-07-13).

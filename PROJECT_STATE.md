@@ -5,8 +5,9 @@ The **why** behind decisions lives in `DECISIONS.md`; the **what/how** lives in
 `docs/final-buildspec.md`; the backlog lives in `TODO.md`.
 
 **Current phase: PHASE 1 COMPLETE; PHASE 2 (transport hardening) COMPLETE bar the deploy-gated telemetry
-numbers; PHASE 3 (replication depth, HIGH) HAS BEGUN; PHASE 4 (Mode 1 Standalone) HAS BEGUN (Item A1 — the
-net-free `standalone` runtime — DONE, ADR-0030).** The slice proved the authority-swap (gate PASSED,
+numbers; PHASE 3 (replication depth, HIGH) HAS BEGUN; PHASE 4 (Mode 1 Standalone) UNDERWAY (A1 — the
+net-free `standalone` runtime — DONE, ADR-0030; A2 — browser-playable Mode 1 in the client — DONE, ADR-0031;
+content-addressed save B1–B4/C1 remaining).** The slice proved the authority-swap (gate PASSED,
 ADR-0014) and **the Bevy client renders in-browser (ADR-0017)** with every slice measurement taken (real
 two-build sizes 3.38/3.40 MB brotli, cold-load, in-browser ed25519; size-budget gate PASSES). **Phase 2 is
 done:** str0m native/server peer (ADR-0015), ICE policy tiers + hermetic TURN relay proof (ADR-0016),
@@ -86,11 +87,17 @@ chain via `add_sim_systems`) MINUS `Net`/`net_pump`/`Replication`/`Transport`/`a
 `cargo tree` guard in `scripts/git-hooks/pre-commit` backstops it — which CLOSES Phase-4 bullet-1's "runs with
 the networking stack absent" acceptance headlessly. Mode 1 is pure data (every entity owned by `local`), so
 `simulate` integrates all and the prediction/interp/input stack is unused/unscheduled. `add_sim_systems` is the
-net-free seam the browser-playable client (A2) reuses; `server` is NOT refactored to share it. `standalone`:
-1 inline + 2 integration tests green; full workspace green; clippy/fmt clean; reviewer → clean. Remaining Phase-4:
-the browser-playable tier (A2 — render the sim + keyboard input in the client) + the content-addressed save
-(B1 `ContentId`/blake3 in `protocol` → B2 `persistence` crate → B3 native `FileStore` → B4 browser `IdbStore` →
-C1 opt-in save/load wired into the client).
+net-free seam the browser-playable client reuses; `server` is NOT refactored to share it. `standalone`:
+1 inline + 2 integration tests green; full workspace green; clippy/fmt clean; reviewer → clean. **Item A2
+(ADR-0031) DONE — browser-playable Mode 1:** the `client` wires that net-free sim into its `DefaultPlugins`
+render app (`Camera2d` + a keyboard-driven `Avatar` + drifting NPCs via `insert_sim`/`spawn_owned`;
+`standalone::add_sim_systems` on FixedUpdate; `drive_avatar` input→`Velocity` via a native-tested `move_dir`;
+`sync_render` `Position`→`Transform`; no prediction/interp — local authority), replacing the ADR-0017 Bouncer
+demo. Both WASM builds compile; size gate re-checked → PASS (3.39/3.41 MB brotli, ~+10 KB); `client` native test
+2/2, clippy native+wasm32 + fmt clean, workspace green, reviewer → clean. Live in-browser render+keyboard was NOT
+exercisable in this environment (WSL server teardown + no-GPU in-app browser) — flagged for a manual browser
+check. Remaining Phase-4: the content-addressed save (B1 `ContentId`/blake3 in `protocol` → B2 `persistence` crate
+→ B3 native `FileStore` → B4 browser `IdbStore` → C1 opt-in save/load wired into the client).
 
 ## Done
 - **Cargo workspace** — virtual manifest, 10 crates under `crates/*` (glob members),

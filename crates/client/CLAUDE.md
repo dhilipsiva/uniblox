@@ -7,9 +7,17 @@
 **Bevy 0.19 renders (ADR-0017)** — wasm32-ONLY dependency (native Bevy would
 drag alsa/udev/X11 into the devShell; native parity is Phase 14), pruned to
 `["2d", "bevy_winit", "webgl2"]` (+`bevy/webgpu` via the crate's `webgpu`
-feature for the second build). Minimal scene: `Camera2d` + one asset-free
-bouncing sprite into canvas `#uniblox-canvas`, plus a `first-frame` metric.
-Alongside it the wasm build runs the **transport two-tab demo**
+feature for the second build). **Mode-1 (Standalone) playable view (ADR-0031):**
+the net-free `standalone` sim is wired into the `DefaultPlugins` render app —
+`Camera2d` + a keyboard-driven `Avatar` + a few drifting NPCs (all locally owned
+via `engine_core::{insert_sim, spawn_owned}`), `standalone::add_sim_systems` runs
+the engine-core FixedUpdate sim, `drive_avatar` maps held keys → the avatar's
+`Velocity` (pure native-tested `move_dir`), `sync_render` copies `Position` →
+sprite `Transform` (direct read — Mode 1 is local-authority, no smoothing; Modes
+2/3 will read the interpolated `RenderPos`/`copy_owned_render`). No prediction/
+interpolation is used. The ADR-0017 `Bouncer` sine demo is replaced; the
+`first-frame` metric is kept. Size gate re-checked → PASS (3.39/3.41 MB brotli,
+~+10 KB). Alongside it the wasm build runs the **transport two-tab demo**
 (`[uniblox-demo][STATE]/[EVENT]` markers; re-verified with Bevy in-binary
 2026-07-11) and the **metrics harness** (`[uniblox-metrics]`: ed25519 sign
 ~20–25 µs / verify ~45 µs; cold-load 351 ms instantiate / 381 ms first frame,
