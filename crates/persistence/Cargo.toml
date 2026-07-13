@@ -1,0 +1,16 @@
+[package]
+name = "persistence"
+version.workspace = true
+edition.workspace = true
+
+# The Mode-1 content-addressed save (ADR-0033). Serializes the authoritative
+# world state to a postcard blob, hashes it to a protocol::ContentId (blake3,
+# ADR-0032), and reconstructs an equivalent world by id. DTO-mirrors the
+# engine-core components so engine-core stays serde-free. No direct blake3 dep —
+# reached via protocol::content_id.
+[dependencies]
+protocol = { path = "../protocol" }
+engine-core = { path = "../engine-core" }
+bevy_ecs.workspace = true
+serde.workspace = true
+postcard.workspace = true
