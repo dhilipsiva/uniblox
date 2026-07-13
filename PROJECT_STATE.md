@@ -7,7 +7,8 @@ The **why** behind decisions lives in `DECISIONS.md`; the **what/how** lives in
 **Current phase: PHASE 1 COMPLETE; PHASE 2 (transport hardening) COMPLETE bar the deploy-gated telemetry
 numbers; PHASE 3 (replication depth, HIGH) HAS BEGUN; PHASE 4 (Mode 1 Standalone) UNDERWAY (A1 — the
 net-free `standalone` runtime — DONE, ADR-0030; A2 — browser-playable Mode 1 in the client — DONE, ADR-0031;
-content-addressed save B1–B4/C1 remaining).** The slice proved the authority-swap (gate PASSED,
+B1 `ContentId`/blake3 — DONE, ADR-0032; B2 `persistence` save/load — DONE, ADR-0033; B3/B4/C1 (durable stores +
+client hook) remaining).** The slice proved the authority-swap (gate PASSED,
 ADR-0014) and **the Bevy client renders in-browser (ADR-0017)** with every slice measurement taken (real
 two-build sizes 3.38/3.40 MB brotli, cold-load, in-browser ed25519; size-budget gate PASSES). **Phase 2 is
 done:** str0m native/server peer (ADR-0015), ICE policy tiers + hermetic TURN relay proof (ADR-0016),
@@ -100,9 +101,14 @@ check. **Item B1 (ADR-0032) DONE — content-addressing:** `ContentId([u8;32])` 
 (`content_id()`, `to_hex`/`from_hex`, `ContentIdError`, `Ord`) + a reserved `VersionTriple` in `protocol`
 (blake3 pinned `pure` — no C toolchain, wasm-safe; already in the lock via bevy_asset, so ~no new wasm code and
 the client doesn't use it yet). `protocol` tests green incl. a known blake3 empty-vector; clippy native+wasm32 +
-fmt clean; workspace green; reviewer → clean. Remaining Phase-4: the rest of the save (B2 `persistence` crate
-`SaveBlob`/`save_world`/`load_world`/`MemoryStore` → B3 native `FileStore` → B4 browser `IdbStore` → C1 opt-in
-save/load wired into the client).
+fmt clean; workspace green; reviewer → clean. **Item B2 (ADR-0033) DONE — the content-addressed save:** a new `persistence` crate — `save_world(&World) ->
+(ContentId, Vec<u8>)` (read-only, `Owner`-filtered, canonical-sorted so the id is spawn-order-independent) +
+`load_world`/`load_world_verified` (two-pass clear → `insert_sim` → rebuild via `spawn_owned` + `Contacts` insert)
++ a `ContentStore` trait + in-memory `MemoryStore`; a DTO-mirror `SaveBlob` keeps engine-core serde-free. **Closes
+Phase-4 bullet-2's "save/reload by content ID" acceptance headlessly** (in-memory). 7 tests green (round-trip +
+determinism + mismatch/verify + clear-path); clippy native+wasm32 + fmt clean; workspace green; reviewer → clean
+(4 nits applied). Remaining Phase-4: durable stores + the client hook (B3 native `FileStore` → B4 browser
+`IdbStore` (IndexedDB, async) → C1 opt-in save/load wired into the client).
 
 ## Done
 - **Cargo workspace** — virtual manifest, 10 crates under `crates/*` (glob members),
