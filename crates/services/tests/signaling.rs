@@ -1,7 +1,8 @@
-//! Integration tests for the scoped signaling service (ADR-0037): raw WebSocket
-//! peers (mirroring matchbox's own tests) prove the SDP/ICE relay, `{mode,
-//! version}` scope isolation, malformed-scope rejection, legacy-room passthrough,
-//! and the session registry.
+//! Integration tests for the scoped signaling service (ADR-0037/0038): raw
+//! WebSocket peers (mirroring matchbox's own tests) prove the SDP/ICE relay, the
+//! ASYMMETRIC version filter (compatible engines share a room; a too-old engine
+//! is rejected WITH A REASON), content/schema scope isolation, legacy-room
+//! passthrough, and the session registry.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
@@ -10,7 +11,7 @@ use futures::{SinkExt, StreamExt};
 use matchbox_protocol::{JsonPeerEvent, JsonPeerRequest, PeerId};
 use services::{SessionInfo, SessionRegistry, build_signaling_server};
 use tokio::net::TcpStream;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -25,11 +26,30 @@ async fn boot() -> (SessionRegistry, SocketAddr) {
     (reg, addr)
 }
 
-async fn connect(addr: SocketAddr, room: &str) -> Ws {
-    let (ws, _resp) = connect_async(format!("ws://{addr}/{room}"))
-        .await
-        .expect("ws connect");
+/// Connect a peer. `engine` is the client's own version → `?engine=N`; `None`
+/// sends no query (for legacy plain rooms, which have no engine gate).
+async fn connect(addr: SocketAddr, room: &str, engine: Option<u32>) -> Ws {
+    let url = match engine {
+        Some(e) => format!("ws://{addr}/{room}?engine={e}"),
+        None => format!("ws://{addr}/{room}"),
+    };
+    let (ws, _resp) = connect_async(url).await.expect("ws connect");
     ws
+}
+
+/// Attempt a connection expected to be REJECTED at the WS upgrade; return the
+/// HTTP status code + reason body the gate sent.
+async fn connect_reject(addr: SocketAddr, path_and_query: &str) -> (u16, String) {
+    match connect_async(format!("ws://{addr}/{path_and_query}")).await {
+        Err(WsError::Http(resp)) => {
+            let status = resp.status().as_u16();
+            let body =
+                String::from_utf8_lossy(resp.body().as_deref().unwrap_or_default()).into_owned();
+            (status, body)
+        }
+        Err(other) => panic!("expected an HTTP rejection, got {other:?}"),
+        Ok(_) => panic!("expected rejection, but the connection was accepted"),
+    }
 }
 
 /// Next signaling event (ignoring ping/pong), with a timeout so a hang fails fast.
@@ -83,11 +103,11 @@ async fn wait_session_count(reg: &SessionRegistry, want: usize) {
 #[tokio::test]
 async fn same_scope_peers_match_and_relay_offers() {
     let (reg, addr) = boot().await;
-    let room = "m1~1.2.3~arena";
+    let room = "m1~7.2~3~arena";
 
-    let mut a = connect(addr, room).await;
+    let mut a = connect(addr, room, Some(5)).await;
     let a_id = assigned_id(&mut a).await;
-    let mut b = connect(addr, room).await;
+    let mut b = connect(addr, room, Some(5)).await;
     let b_id = assigned_id(&mut b).await;
 
     // A sees B join (same room).
@@ -117,46 +137,102 @@ async fn same_scope_peers_match_and_relay_offers() {
 }
 
 #[tokio::test]
-async fn distinct_scopes_are_isolated() {
+async fn compatible_engines_share_one_session() {
+    // The headline of the asymmetric filter: same content/schema/lobby/min, but
+    // DIFFERENT engine versions (both >= min 3) → same room → matched. An
+    // "older-but-compatible" engine joins the same session as a newer one.
     let (reg, addr) = boot().await;
+    let room = "m1~7.2~3~arena"; // min-engine 3
 
-    // Same version + lobby, DIFFERENT mode ⇒ different room ⇒ never matched.
-    let mut a = connect(addr, "m1~1.2.3~arena").await;
+    let mut a = connect(addr, room, Some(5)).await; // newer engine
     let _a = assigned_id(&mut a).await;
-    let mut b = connect(addr, "m2~1.2.3~arena").await;
-    let _b = assigned_id(&mut b).await;
+    let mut b = connect(addr, room, Some(3)).await; // exactly the minimum
+    let b_id = assigned_id(&mut b).await;
 
-    // Two separate single-peer sessions — FullMesh cannot relay across rooms.
-    wait_session_count(&reg, 2).await;
-    assert_eq!(reg.peer_count("m1~1.2.3~arena"), 1);
-    assert_eq!(reg.peer_count("m2~1.2.3~arena"), 1);
+    match next_event(&mut a).await {
+        JsonPeerEvent::NewPeer(id) => assert_eq!(id, b_id),
+        other => {
+            panic!("expected NewPeer(b) — compatible engines must share a room, got {other:?}")
+        }
+    }
+    wait_peer_count(&reg, room, 2).await;
+    wait_session_count(&reg, 1).await;
 }
 
 #[tokio::test]
-async fn different_version_is_isolated() {
+async fn engine_below_minimum_is_rejected_with_reason() {
     let (reg, addr) = boot().await;
-    let mut a = connect(addr, "m1~1.2.3~arena").await;
-    let _a = assigned_id(&mut a).await;
-    let mut b = connect(addr, "m1~9.2.3~arena").await; // engine differs
-    let _b = assigned_id(&mut b).await;
-    wait_session_count(&reg, 2).await;
+    // engine 2 < min 3 ⇒ 426 Upgrade Required + a reason naming the minimum.
+    let (status, body) = connect_reject(addr, "m1~7.2~3~arena?engine=2").await;
+    assert_eq!(status, 426, "engine below minimum must be 426");
+    assert!(
+        body.contains("minimum"),
+        "reason should explain the minimum, got {body:?}"
+    );
+    // Nothing was admitted.
+    wait_session_count(&reg, 0).await;
 }
 
 #[tokio::test]
-async fn malformed_scope_is_rejected() {
+async fn missing_or_non_numeric_engine_is_rejected() {
     let (_reg, addr) = boot().await;
-    // `~`-shaped but not a valid scope ⇒ the gate returns 401 ⇒ handshake fails.
-    let result = connect_async(format!("ws://{addr}/m1~garbage")).await;
-    assert!(result.is_err(), "malformed scope should be rejected");
+    // Scoped room but no ?engine= ⇒ 400 with a reason.
+    let (status, body) = connect_reject(addr, "m1~7.2~3~arena").await;
+    assert_eq!(status, 400, "missing engine must be 400");
+    assert!(
+        body.contains("engine"),
+        "reason should mention engine, got {body:?}"
+    );
+    // Non-numeric ?engine= ⇒ 400 as well.
+    let (status, _) = connect_reject(addr, "m1~7.2~3~arena?engine=nope").await;
+    assert_eq!(status, 400, "non-numeric engine must be 400");
+}
+
+#[tokio::test]
+async fn distinct_modes_are_isolated() {
+    let (reg, addr) = boot().await;
+
+    // Same content/schema/min/lobby + valid engine, DIFFERENT mode ⇒ different
+    // room ⇒ never matched.
+    let mut a = connect(addr, "m1~7.2~3~arena", Some(5)).await;
+    let _a = assigned_id(&mut a).await;
+    let mut b = connect(addr, "m2~7.2~3~arena", Some(5)).await;
+    let _b = assigned_id(&mut b).await;
+
+    wait_session_count(&reg, 2).await;
+    assert_eq!(reg.peer_count("m1~7.2~3~arena"), 1);
+    assert_eq!(reg.peer_count("m2~7.2~3~arena"), 1);
+}
+
+#[tokio::test]
+async fn different_content_is_isolated() {
+    let (reg, addr) = boot().await;
+    // content differs (7 vs 9) — content must match EXACTLY ⇒ structural
+    // isolation even though both engines clear the minimum.
+    let mut a = connect(addr, "m1~7.2~3~arena", Some(5)).await;
+    let _a = assigned_id(&mut a).await;
+    let mut b = connect(addr, "m1~9.2~3~arena", Some(5)).await;
+    let _b = assigned_id(&mut b).await;
+    wait_session_count(&reg, 2).await;
+}
+
+#[tokio::test]
+async fn malformed_scope_is_rejected_with_reason() {
+    let (_reg, addr) = boot().await;
+    // `~`-shaped but not a valid scope ⇒ 400 with a reason (was a bare 401 pre-0038).
+    let (status, body) = connect_reject(addr, "m1~garbage?engine=5").await;
+    assert_eq!(status, 400, "malformed scope must be 400");
+    assert!(!body.is_empty(), "malformed scope should carry a reason");
 }
 
 #[tokio::test]
 async fn legacy_plain_room_still_matches() {
     let (reg, addr) = boot().await;
 
-    let mut a = connect(addr, "uniblox-demo").await;
+    // No `~`, no `?engine=` — a legacy room with no version gate.
+    let mut a = connect(addr, "uniblox-demo", None).await;
     let _a = assigned_id(&mut a).await;
-    let mut b = connect(addr, "uniblox-demo").await;
+    let mut b = connect(addr, "uniblox-demo", None).await;
     let b_id = assigned_id(&mut b).await;
 
     match next_event(&mut a).await {
@@ -170,9 +246,9 @@ async fn legacy_plain_room_still_matches() {
 async fn registry_lists_sessions() {
     let (reg, addr) = boot().await;
 
-    let mut a = connect(addr, "m1~1.2.3~arena").await;
+    let mut a = connect(addr, "m1~7.2~3~arena", Some(5)).await;
     let _a = assigned_id(&mut a).await;
-    let mut b = connect(addr, "m3~1.2.3~arena").await;
+    let mut b = connect(addr, "m3~7.2~3~arena", Some(5)).await;
     let _b = assigned_id(&mut b).await;
 
     wait_session_count(&reg, 2).await;
@@ -181,11 +257,11 @@ async fn registry_lists_sessions() {
         list,
         vec![
             SessionInfo {
-                room: "m1~1.2.3~arena".to_string(),
+                room: "m1~7.2~3~arena".to_string(),
                 peers: 1,
             },
             SessionInfo {
-                room: "m3~1.2.3~arena".to_string(),
+                room: "m3~7.2~3~arena".to_string(),
                 peers: 1,
             },
         ]
@@ -195,9 +271,9 @@ async fn registry_lists_sessions() {
 #[tokio::test]
 async fn disconnect_prunes_the_session() {
     let (reg, addr) = boot().await;
-    let room = "m1~1.2.3~arena";
+    let room = "m1~7.2~3~arena";
 
-    let mut a = connect(addr, room).await;
+    let mut a = connect(addr, room, Some(5)).await;
     let _a = assigned_id(&mut a).await;
     wait_peer_count(&reg, room, 1).await;
 

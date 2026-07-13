@@ -6323,10 +6323,10 @@ dependencies = [
 name = "services"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "futures",
  "matchbox_protocol",
  "matchbox_signaling",
- "protocol",
  "serde_json",
  "tokio",
  "tokio-tungstenite",

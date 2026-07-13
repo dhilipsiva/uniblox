@@ -4,9 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-protocol = { path = "../protocol" }        # VersionTriple for the scope key (ADR-0037)
 matchbox_signaling.workspace = true
 matchbox_protocol.workspace = true         # PeerId (the signaling-assigned UUID)
+axum.workspace = true                      # reasoned gate rejections (426/400 + body, ADR-0038)
 tokio.workspace = true
 tracing-subscriber.workspace = true
 

@@ -1,8 +1,9 @@
-//! uniblox signaling server binary (ADR-0037): scoped room-based WebRTC
+//! uniblox signaling server binary (ADR-0037/0038): scoped room-based WebRTC
 //! signaling. Rooms are URL paths; a scoped room is
-//! `<mode>~<engine>.<content>.<schema>~<lobby>` (peers with a different
-//! mode/version are isolated) and a plain path is a legacy room. The matchmaking
-//! logic + session registry live in the `services` library.
+//! `<mode>~<content>.<schema>~<min>~<lobby>` (content/schema/min/lobby isolate
+//! structurally) and the client's own engine rides the `?engine=N` query, gated
+//! `>= min` (the asymmetric filter). A plain path is a legacy room. The
+//! matchmaking logic + session registry live in the `services` library.
 
 use std::net::{Ipv4Addr, SocketAddr};
 

@@ -1,31 +1,52 @@
-//! uniblox signaling service (ADR-0037): room-based WebRTC SDP/ICE signaling
-//! with `{mode, version}` scoping and an in-memory session registry.
+//! uniblox signaling service: room-based WebRTC SDP/ICE signaling with a
+//! `{mode, version}` scope, the ASYMMETRIC version filter (ADR-0038), and an
+//! in-memory session registry.
 //!
-//! The scope is encoded in the ROOM PATH — `<mode>~<engine>.<content>.<schema>~<lobby>`
-//! (e.g. `m1~1.2.3~arena`). matchbox's FullMesh topology rooms peers strictly by
-//! the path string, so peers with a different mode/version land in a DIFFERENT
-//! room and are never matched — scoping is enforced structurally (offers/answers
-//! only relay within one room). A connection gate rejects malformed scoped joins;
-//! a plain single-token path (no `~`) is accepted as a legacy room (keeps the
-//! `uniblox-demo` demo working). The [`SessionRegistry`] tracks + lists sessions.
+//! The scope is encoded in the ROOM PATH — `<mode>~<content>.<schema>~<min>~<lobby>`
+//! (e.g. `m1~7.2~3~arena`: mode `m1`, content `7`, schema `2`, min-engine `3`,
+//! lobby `arena`); the client sends its OWN engine version out-of-band as the
+//! `?engine=N` query param. matchbox's FullMesh topology rooms peers strictly by
+//! the path string, so:
+//!
+//! * **content + schema + lobby + min** are in the path ⇒ their exact match is
+//!   structural (a different content/schema/lobby/min is a different room ⇒ never
+//!   matched — no float-desync across incompatible peers).
+//! * **the client's engine is NOT in the path** (it's the `?engine=` query) ⇒
+//!   different-but-compatible engine versions share ONE room. The gate admits a
+//!   join iff `engine >= min` — the ASYMMETRIC filter (engine releases are
+//!   backward-compatible; content/schema must match exactly).
+//!
+//! The connection gate returns a REASONED rejection: `426 Upgrade Required` +
+//! body for `engine < min`, `400 Bad Request` + body for a malformed scope or a
+//! missing/non-numeric `?engine`. A plain single-token path (no `~`) is accepted
+//! as a legacy room (keeps the `uniblox-demo` demo working; no engine gate). The
+//! [`SessionRegistry`] tracks + lists sessions.
+//!
+//! **Trust model:** `?engine` and the path `min` are self-declared. This is
+//! desync defense for HONEST clients (`CLAUDE.md`: the version gate is not
+//! anti-cheat — a modified client can lie, but cannot lie its way into a
+//! *stricter* room with an old engine, since a different `min` is a different
+//! room).
 //!
 //! Deferred to later Phase-5 items: a custom `SignalingTopology` with
-//! client-specified `?next=N` session-SIZE grouping; the ASYMMETRIC version
-//! filter (engine ≥ minimum; content/schema exact — needs grouping
-//! compatible-but-not-identical peers); a shared Redis/Postgres registry for
-//! horizontal scale; and signaling-DoS rate-limiting/auth.
+//! client-specified `?next=N` session-SIZE grouping; a shared Redis/Postgres
+//! registry for horizontal scale; and signaling-DoS rate-limiting/auth.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use matchbox_protocol::PeerId;
 use matchbox_signaling::SignalingServer;
-use protocol::VersionTriple;
 
-/// The scope delimiter within a single room-path segment.
+/// The scope delimiter between a room path's tilde-separated parts.
 const SCOPE_SEP: char = '~';
+
+/// The `?engine=N` query key carrying the client's own engine version.
+const ENGINE_PARAM: &str = "engine";
 
 /// The mode tag of a scoped room. The engine has no `Mode` enum (mode is data
 /// everywhere else); this tag exists ONLY to scope matchmaking at signaling.
@@ -50,36 +71,53 @@ impl Mode {
     }
 }
 
-/// A parsed matchmaking scope: two peers match only if their FULL scope (mode +
-/// version + lobby) is identical (exact match — the asymmetric version filter is
-/// a later item).
+/// A parsed matchmaking scope. Two peers share a room iff their FULL scope
+/// (mode, content, schema, min-engine, lobby) is identical — content/schema/lobby
+/// exactness is structural. The client's own engine is NOT part of the scope
+/// (it rides the `?engine=` query, gated `>= min_engine`), so compatible-but-newer
+/// engines share one room (the ASYMMETRIC filter, ADR-0038).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Scope {
     pub mode: Mode,
-    pub version: VersionTriple,
+    /// Content ID — must match EXACTLY across peers (structural).
+    pub content: u32,
+    /// Schema version — must match EXACTLY across peers (structural).
+    pub schema: u32,
+    /// The game's declared MINIMUM engine version; a joiner is admitted iff its
+    /// own `?engine=` is `>= min_engine`.
+    pub min_engine: u32,
     pub lobby: String,
 }
 
-/// Why a `~`-shaped room path is not a valid scope.
+/// Why a `~`-shaped room path is not a valid scope, or a `?engine=` is missing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScopeError {
-    /// Not exactly `<mode>~<triple>~<lobby>`.
+    /// Not exactly `<mode>~<content>.<schema>~<min>~<lobby>` (wrong part count).
     Shape,
     /// The mode tag is not one of `m1` / `m2` / `m3`.
     Mode,
-    /// The version triple is not three dot-separated `u32`s.
-    Version,
+    /// `content` is not a `u32`, or the `content.schema` part isn't two fields.
+    Content,
+    /// `schema` is not a `u32`, or the `content.schema` part isn't two fields.
+    Schema,
+    /// The min-engine part is not a `u32`.
+    Min,
     /// The lobby segment is empty.
     Lobby,
+    /// The `?engine=` query param is absent or not a `u32`.
+    Engine,
 }
 
 impl fmt::Display for ScopeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            ScopeError::Shape => "scope must be <mode>~<engine>.<content>.<schema>~<lobby>",
+            ScopeError::Shape => "scope must be <mode>~<content>.<schema>~<min>~<lobby>",
             ScopeError::Mode => "mode must be m1, m2, or m3",
-            ScopeError::Version => "version must be three dot-separated u32s",
+            ScopeError::Content => "content must be a u32 (<content>.<schema>)",
+            ScopeError::Schema => "schema must be a u32 (<content>.<schema>)",
+            ScopeError::Min => "min-engine must be a u32",
             ScopeError::Lobby => "lobby must be non-empty",
+            ScopeError::Engine => "missing or non-numeric ?engine=<u32>",
         })
     }
 }
@@ -91,36 +129,49 @@ impl std::error::Error for ScopeError {}
 pub fn parse_scope(path: &str) -> Result<Scope, ScopeError> {
     let mut it = path.split(SCOPE_SEP);
     let mode = it.next().ok_or(ScopeError::Shape)?;
-    let triple = it.next().ok_or(ScopeError::Shape)?;
+    let content_schema = it.next().ok_or(ScopeError::Shape)?;
+    let min = it.next().ok_or(ScopeError::Shape)?;
     let lobby = it.next().ok_or(ScopeError::Shape)?;
     if it.next().is_some() {
-        return Err(ScopeError::Shape); // more than three parts
+        return Err(ScopeError::Shape); // more than four parts
     }
     let mode = Mode::parse(mode).ok_or(ScopeError::Mode)?;
-    let version = parse_triple(triple)?;
+    let (content, schema) = parse_content_schema(content_schema)?;
+    let min_engine = min.parse().map_err(|_| ScopeError::Min)?;
     if lobby.is_empty() {
         return Err(ScopeError::Lobby);
     }
     Ok(Scope {
         mode,
-        version,
+        content,
+        schema,
+        min_engine,
         lobby: lobby.to_string(),
     })
 }
 
-fn parse_triple(s: &str) -> Result<VersionTriple, ScopeError> {
+/// Split the `<content>.<schema>` scope part into its two `u32`s.
+fn parse_content_schema(s: &str) -> Result<(u32, u32), ScopeError> {
     let mut it = s.split('.');
-    let engine = it.next().ok_or(ScopeError::Version)?;
-    let content = it.next().ok_or(ScopeError::Version)?;
-    let schema = it.next().ok_or(ScopeError::Version)?;
+    let content = it.next().ok_or(ScopeError::Content)?;
+    let schema = it.next().ok_or(ScopeError::Schema)?;
     if it.next().is_some() {
-        return Err(ScopeError::Version); // more than three parts
+        return Err(ScopeError::Schema); // more than two fields
     }
-    Ok(VersionTriple {
-        engine: engine.parse().map_err(|_| ScopeError::Version)?,
-        content: content.parse().map_err(|_| ScopeError::Version)?,
-        schema: schema.parse().map_err(|_| ScopeError::Version)?,
-    })
+    Ok((
+        content.parse().map_err(|_| ScopeError::Content)?,
+        schema.parse().map_err(|_| ScopeError::Schema)?,
+    ))
+}
+
+/// Read the client's own engine version from the `?engine=<u32>` query params.
+/// Separate from [`parse_scope`] because the engine is deliberately OUT of the
+/// room key (so compatible engines share a room).
+pub fn parse_engine(query: &HashMap<String, String>) -> Result<u32, ScopeError> {
+    query
+        .get(ENGINE_PARAM)
+        .and_then(|v| v.parse().ok())
+        .ok_or(ScopeError::Engine)
 }
 
 /// One active session (room) in a [`SessionRegistry::list`] listing.
@@ -236,12 +287,30 @@ impl SessionRegistry {
     }
 }
 
+/// A `400 Bad Request` gate rejection carrying a plain-text reason.
+fn bad_request(reason: impl Into<String>) -> Response {
+    (StatusCode::BAD_REQUEST, reason.into()).into_response()
+}
+
+/// A `426 Upgrade Required` gate rejection: the client's engine is below the
+/// game's declared minimum.
+fn engine_too_old(engine: u32, min_engine: u32) -> Response {
+    (
+        StatusCode::UPGRADE_REQUIRED,
+        format!("engine {engine} below required minimum {min_engine}; upgrade to join"),
+    )
+        .into_response()
+}
+
 /// Build the scoped uniblox signaling server: matchbox FullMesh (rooms = URL
-/// path, so a mode/version scope in the path is isolated structurally) + a gate
-/// that rejects malformed scoped joins + the `registry` wired to track sessions
-/// (via the gate `origin` → id-assignment `PeerId` → disconnect correlation).
-// The gate must return matchbox's `Result<bool, axum::Response>` (a large `Err`);
-// we only ever return `Ok`, so `result_large_err` doesn't apply.
+/// path, so content/schema/lobby/min in the path are isolated structurally) + a
+/// gate implementing the ASYMMETRIC version filter (admit `?engine >= min`,
+/// reasoned 426/400 rejection otherwise) + the `registry` wired to track
+/// sessions (via the gate `origin` → id-assignment `PeerId` → disconnect
+/// correlation).
+// The gate returns matchbox's `Result<bool, axum::Response>` — `Response` is a
+// large `Err` type, but returning it IS the point (a reasoned rejection), so the
+// `result_large_err` lint doesn't apply.
 #[allow(clippy::result_large_err)]
 pub fn build_signaling_server(
     addr: impl Into<SocketAddr>,
@@ -255,12 +324,18 @@ pub fn build_signaling_server(
         .on_connection_request(move |meta| {
             let room = meta.path.clone().unwrap_or_default();
             if room.is_empty() {
-                return Ok(false); // no room ⇒ reject
+                return Ok(false); // no room ⇒ bare 401
             }
-            // A `~`-shaped path MUST be a well-formed scope; a plain path is a
-            // legacy room (accepted as-is).
-            if room.contains(SCOPE_SEP) && parse_scope(&room).is_err() {
-                return Ok(false); // malformed scope ⇒ 401, never enters a room
+            // A `~`-shaped path MUST be a well-formed scope AND carry a
+            // `?engine=` that clears the declared minimum. A plain path is a
+            // legacy room (accepted as-is — no engine gate).
+            if room.contains(SCOPE_SEP) {
+                let scope = parse_scope(&room).map_err(|e| bad_request(e.to_string()))?;
+                let engine =
+                    parse_engine(&meta.query_params).map_err(|e| bad_request(e.to_string()))?;
+                if engine < scope.min_engine {
+                    return Err(engine_too_old(engine, scope.min_engine));
+                }
             }
             gate_reg.stash(meta.origin, room);
             Ok(true)
@@ -276,48 +351,64 @@ pub fn build_signaling_server(
 mod tests {
     use super::*;
 
-    fn triple(e: u32, c: u32, s: u32) -> VersionTriple {
-        VersionTriple {
-            engine: e,
-            content: c,
-            schema: s,
-        }
+    fn query(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[test]
     fn parses_a_valid_scope() {
         assert_eq!(
-            parse_scope("m1~1.2.3~arena"),
+            parse_scope("m1~7.2~3~arena"),
             Ok(Scope {
                 mode: Mode::Standalone,
-                version: triple(1, 2, 3),
+                content: 7,
+                schema: 2,
+                min_engine: 3,
                 lobby: "arena".to_string(),
             })
         );
-        assert_eq!(parse_scope("m2~10.0.7~lobby").unwrap().mode, Mode::P2p);
-        assert_eq!(parse_scope("m3~0.0.0~x").unwrap().mode, Mode::Server);
+        assert_eq!(parse_scope("m2~10.0~7~lobby").unwrap().mode, Mode::P2p);
+        assert_eq!(parse_scope("m3~0.0~0~x").unwrap().mode, Mode::Server);
     }
 
     #[test]
     fn rejects_malformed_scopes() {
-        assert_eq!(parse_scope("m1~1.2.3"), Err(ScopeError::Shape)); // too few parts
-        assert_eq!(parse_scope("m1~1.2.3~a~b"), Err(ScopeError::Shape)); // too many
-        assert_eq!(parse_scope("x1~1.2.3~a"), Err(ScopeError::Mode)); // bad mode
-        assert_eq!(parse_scope("m1~1.2~a"), Err(ScopeError::Version)); // short triple
-        assert_eq!(parse_scope("m1~1.2.3.4~a"), Err(ScopeError::Version)); // long triple
-        assert_eq!(parse_scope("m1~a.b.c~a"), Err(ScopeError::Version)); // non-numeric
-        assert_eq!(parse_scope("m1~1.2.3~"), Err(ScopeError::Lobby)); // empty lobby
+        assert_eq!(parse_scope("m1~7.2~3"), Err(ScopeError::Shape)); // too few parts
+        assert_eq!(parse_scope("m1~7.2~3~a~b"), Err(ScopeError::Shape)); // too many
+        assert_eq!(parse_scope("x1~7.2~3~a"), Err(ScopeError::Mode)); // bad mode
+        assert_eq!(parse_scope("m1~7~3~a"), Err(ScopeError::Schema)); // no schema field
+        assert_eq!(parse_scope("m1~7.2.9~3~a"), Err(ScopeError::Schema)); // 3 fields
+        assert_eq!(parse_scope("m1~a.2~3~a"), Err(ScopeError::Content)); // non-numeric content
+        assert_eq!(parse_scope("m1~7.b~3~a"), Err(ScopeError::Schema)); // non-numeric schema
+        assert_eq!(parse_scope("m1~7.2~x~a"), Err(ScopeError::Min)); // non-numeric min
+        assert_eq!(parse_scope("m1~7.2~3~"), Err(ScopeError::Lobby)); // empty lobby
         assert_eq!(parse_scope("garbage"), Err(ScopeError::Shape)); // no delimiters
+    }
+
+    #[test]
+    fn reads_the_engine_query_param() {
+        assert_eq!(parse_engine(&query(&[("engine", "5")])), Ok(5));
+        assert_eq!(parse_engine(&query(&[])), Err(ScopeError::Engine)); // missing
+        assert_eq!(
+            parse_engine(&query(&[("engine", "nope")])),
+            Err(ScopeError::Engine) // non-numeric
+        );
     }
 
     #[test]
     fn distinct_scopes_are_distinct_keys() {
         // The room string IS the scope key; FullMesh isolates by it, so these
-        // never share a room (mode / version / lobby each discriminate).
+        // never share a room (mode / content / schema / min / lobby each
+        // discriminate — the client's own engine is NOT in the key).
         for (a, b) in [
-            ("m1~1.2.3~arena", "m2~1.2.3~arena"), // mode differs
-            ("m1~1.2.3~arena", "m1~9.2.3~arena"), // engine differs
-            ("m1~1.2.3~arena", "m1~1.2.3~other"), // lobby differs
+            ("m1~7.2~3~arena", "m2~7.2~3~arena"), // mode differs
+            ("m1~7.2~3~arena", "m1~9.2~3~arena"), // content differs
+            ("m1~7.2~3~arena", "m1~7.9~3~arena"), // schema differs
+            ("m1~7.2~3~arena", "m1~7.2~4~arena"), // min differs
+            ("m1~7.2~3~arena", "m1~7.2~3~other"), // lobby differs
         ] {
             assert_ne!(a, b);
             assert_ne!(parse_scope(a).unwrap(), parse_scope(b).unwrap());
