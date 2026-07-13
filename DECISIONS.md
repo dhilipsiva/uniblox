@@ -1221,3 +1221,34 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   invariant the `filter_map` relies on, a `MemoryStore::contains` override (avoid a blob clone), and the
   clear-path test.
 - **Status:** Accepted (2026-07-13).
+
+## ADR-0034 — native `FileStore`: durable content-addressed save on disk
+- **Context:** B2 (ADR-0033) shipped `save_world`/`load_world` + the in-memory `MemoryStore`; B3 adds a DURABLE
+  native store so a Mode-1 save survives a process restart on desktop. Browser durability (IndexedDB) is B4; the
+  client keybind is C1.
+- **Decision:** `crates/persistence/src/file_store.rs` (native-only, `#[cfg(not(target_arch = "wasm32"))]` on the
+  `mod` + `pub use` — `std::fs`, the same native precedent as `scripting`'s hot-reload; the wasm build carries only
+  `MemoryStore`). `FileStore { root }` writes each blob to `<root>/<content-id-hex>.blob`. **Inherent fallible
+  methods returning `std::io::Result`** — `open` (create_dir_all), `put(&self, &[u8])`, `get(&self, ContentId)`,
+  `contains` — and it deliberately does NOT implement the infallible sync `ContentStore` trait: file I/O genuinely
+  fails (permissions, disk full), and swallowing that into an infallible trait would hide real errors. The
+  `ContentStore` trait stays the in-memory (`MemoryStore`) abstraction; durable backends get backend-shaped APIs
+  (B4's `IdbStore` is fallible AND async, so it also won't implement the sync trait) — no polymorphic consumer over
+  `{Memory, File}` exists (C1 uses the browser store), so a unified fallible store trait is YAGNI. `put` is
+  content-addressed (dedup-skip if the final file exists) and writes via a UNIQUE-per-process temp file +
+  `fs::rename` (atomic on the same fs), so the final `.blob` name is never partial and concurrent writers don't
+  collide on the temp. `get` maps `NotFound → Ok(None)` (an evictable cache miss), other I/O errors → `Err`.
+  `tempfile` added as a dev-dep for the tests.
+- **Consequences:** the native Mode-1 save is durable across process restarts; the wasm build is unchanged
+  (FileStore compiled out). A corrupt/partial file (were one to occur) is caught downstream —
+  `load_world_verified` → `ContentMismatch`, or `load_world` → `Codec` — never silently loaded. Accepted
+  by-design (reviewer INFO, not defects): `contains` via `path.exists()` reports `false` on a stat error (fine for
+  a presence check; `get` still surfaces the `Err`); a leftover temp from a mid-write crash is harmless
+  (`.blob.tmp`, ignored, self-heals on the next put); and "durable across restart" is page-cache visibility, not
+  `fsync` power-loss crash-consistency (the doc claims only the former). Evidence: 13 `persistence` tests (7 codec +
+  6 file_store: put/get round-trip, durable-across-reopen, idempotent-one-file, missing/contains, end-to-end
+  `save_world → FileStore → load_world_verified`, on-disk tamper → `ContentMismatch`); clippy `-D warnings` native
+  (`--all-targets`) + `wasm32-unknown-unknown` clean; fmt clean; full workspace green. Fresh reviewer → clean (the
+  inherent-`io::Result` design affirmed as the right call; 1 LOW — a shared temp name concurrent-writer race —
+  FIXED with a unique per-process temp name).
+- **Status:** Accepted (2026-07-13).

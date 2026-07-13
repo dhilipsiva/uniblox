@@ -107,8 +107,13 @@ fmt clean; workspace green; reviewer → clean. **Item B2 (ADR-0033) DONE — th
 + a `ContentStore` trait + in-memory `MemoryStore`; a DTO-mirror `SaveBlob` keeps engine-core serde-free. **Closes
 Phase-4 bullet-2's "save/reload by content ID" acceptance headlessly** (in-memory). 7 tests green (round-trip +
 determinism + mismatch/verify + clear-path); clippy native+wasm32 + fmt clean; workspace green; reviewer → clean
-(4 nits applied). Remaining Phase-4: durable stores + the client hook (B3 native `FileStore` → B4 browser
-`IdbStore` (IndexedDB, async) → C1 opt-in save/load wired into the client).
+(4 nits applied). **Item B3 (ADR-0034) DONE — native durable `FileStore`:** `<content-id-hex>.blob` files under a root dir
+(`#[cfg(not(wasm32))]`, `std::fs`; inherent `io::Result` methods, NOT the infallible `ContentStore` trait —
+I/O fails; content-addressed dedup + unique-temp+atomic-rename), so the native Mode-1 save survives a process
+restart. 13 persistence tests (7 codec + 6 file_store incl. end-to-end save→file→verified-load + tamper detect);
+clippy native+wasm32 (FileStore cfg'd out) + fmt clean; workspace green; reviewer → clean (unique-temp fix
+applied). Remaining Phase-4: B4 browser `IdbStore` (IndexedDB, async — durable browser save) → C1 opt-in
+save/load wired into the client.
 
 ## Done
 - **Cargo workspace** — virtual manifest, 10 crates under `crates/*` (glob members),
