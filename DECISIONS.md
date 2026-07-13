@@ -1157,3 +1157,31 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   open in a real browser: confirm the scene renders, NPCs drift, arrow/WASD moves the avatar, `[uniblox-metrics]
   first-frame` fires).
 - **Status:** Accepted (2026-07-13).
+
+## ADR-0032 — `ContentId`: blake3-256 content-addressing in `protocol`
+- **Context:** Phase-4's content-addressed save (Item B2) needs to hash a serialized world blob to a stable,
+  collision-resistant id and reload by it; Phases 7 (object storage) and 8 (publish) reuse the same primitive.
+  Nothing suitable existed — the only hash in the workspace was a hand-rolled non-cryptographic 32-bit FNV-1a
+  (`replication`'s resync divergence check), and `blake3` was in `Cargo.lock` (1.8.5) only TRANSITIVELY via
+  `bevy_asset`, reachable exclusively in the wasm/client graph, not from the shared crates.
+- **Decision:** add a `ContentId([u8; 32])` = the blake3-256 digest of a canonical byte blob, plus
+  `content_id(&[u8]) -> ContentId`, `as_bytes`/`from_bytes`, `to_hex`/`from_hex` (reusing `blake3::Hash`'s hex,
+  no `hex` crate), `Display`, and a `ContentIdError::BadHex`, in **`protocol`** (its stated home for "content
+  IDs"). Derives mirror `PeerId`/`NetEntityId` incl. `Ord` (deterministic content-store iteration + stable
+  tests). `blake3` is pinned in `[workspace.dependencies]` as `{ default-features = false, features = ["std",
+  "pure"] }` — `pure` forces portable Rust so the native `server`/`standalone` graphs need no `cc`/C toolchain,
+  and it is wasm-safe. Also added a RESERVED `VersionTriple { engine, content, schema }` (a `pub` forward hook,
+  not yet consumed) so a Phase-4 save blob can carry `Option<VersionTriple>` = `None` and Phase-5 can turn on
+  `{engine,content,schema}` join-gating with no shape change.
+- **Consequences:** THE content-addressing primitive is now available to the shared crates. Because `blake3` was
+  already linked in the wasm client (via `bevy_asset`), B1 adds ~no new wasm code, and the client does not yet USE
+  `ContentId` (that is C1) — so no client size-gate re-run. `pure` also pulls `bevy_asset`'s blake3 onto the
+  portable path under feature-union in a native client build (identical digests by design — zero correctness risk,
+  negligible perf, no-op on wasm). Serde/postcard encode `ContentId` as 32 raw bytes (no length prefix); the
+  digest byte-array is endianness-free and `Ord` is lexicographic — portable + stable. Evidence: `protocol`
+  `cargo test` green incl. a KNOWN blake3 empty-input vector (`af1349b9…f3262`) that locks the algorithm, hex
+  round-trip, garbage-hex rejection, and a postcard round-trip (`len()==32`); clippy `-D warnings` native
+  (`--all-targets`) + `wasm32-unknown-unknown` clean; fmt clean; full workspace green. Fresh reviewer → clean
+  (2 LOW: this ADR was a dangling reference — now recorded; `from_hex` accepts case-insensitive hex — doc softened
+  to say so).
+- **Status:** Accepted (2026-07-13).

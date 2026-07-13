@@ -96,8 +96,13 @@ render app (`Camera2d` + a keyboard-driven `Avatar` + drifting NPCs via `insert_
 demo. Both WASM builds compile; size gate re-checked → PASS (3.39/3.41 MB brotli, ~+10 KB); `client` native test
 2/2, clippy native+wasm32 + fmt clean, workspace green, reviewer → clean. Live in-browser render+keyboard was NOT
 exercisable in this environment (WSL server teardown + no-GPU in-app browser) — flagged for a manual browser
-check. Remaining Phase-4: the content-addressed save (B1 `ContentId`/blake3 in `protocol` → B2 `persistence` crate
-→ B3 native `FileStore` → B4 browser `IdbStore` → C1 opt-in save/load wired into the client).
+check. **Item B1 (ADR-0032) DONE — content-addressing:** `ContentId([u8;32])` = the blake3-256 digest of a byte blob
+(`content_id()`, `to_hex`/`from_hex`, `ContentIdError`, `Ord`) + a reserved `VersionTriple` in `protocol`
+(blake3 pinned `pure` — no C toolchain, wasm-safe; already in the lock via bevy_asset, so ~no new wasm code and
+the client doesn't use it yet). `protocol` tests green incl. a known blake3 empty-vector; clippy native+wasm32 +
+fmt clean; workspace green; reviewer → clean. Remaining Phase-4: the rest of the save (B2 `persistence` crate
+`SaveBlob`/`save_world`/`load_world`/`MemoryStore` → B3 native `FileStore` → B4 browser `IdbStore` → C1 opt-in
+save/load wired into the client).
 
 ## Done
 - **Cargo workspace** — virtual manifest, 10 crates under `crates/*` (glob members),

@@ -18,8 +18,14 @@ all reliable, directed) + the **ADR-0025 A ownership-arbitration rank** `OwnerSe
 (lexicographic `Ord` — `seq` dominant, `coordinator` breaks equal-seq ties toward the higher id) which now rides
 `OwnershipTransfer{id,new_owner,seq}` AND `ResyncSpawn` (A-kernel) + the **coordinator PULL handshake**
 `NetEvent::{ClaimOwnership{id}, OwnershipCommit{id,new_owner,seq}, ClaimRejected{id}}` (A-handshake), versioned
-postcard codecs (mismatch → clean Err). **`WIRE_VERSION`=6.** The `{engine, content, schema}` version triple
-lands in Phase 5.
+postcard codecs (mismatch → clean Err). **`WIRE_VERSION`=7.** **Content-addressing (ADR-0032):**
+`ContentId([u8;32])` = the blake3-256 digest of a byte blob (`content_id()`, `to_hex`/`from_hex` round-trip,
+`ContentIdError`, `Ord` for deterministic content-store iteration) — THE primitive for the Phase-4 Mode-1 save
+(B2) + Phase-7 object storage + Phase-8 publish. `blake3` is pinned `{default-features=false, features=["std",
+"pure"]}` (already in the lock via `bevy_asset`; `pure` = no `cc`/C toolchain, wasm-safe). The reserved
+`VersionTriple {engine, content, schema}` is a forward hook (a `pub`, not-yet-consumed type) — Phase 5 enforces
+the `{engine, content, schema}` triple at session join, and a save blob carries `Option<VersionTriple>`=`None`
+today so enabling it needs no shape change.
 
 ## Crate-local invariants
 - The `{engine, content, schema}` version triple lives here; it is the desync
