@@ -80,7 +80,20 @@ the Mode-1/coordinator/mechanics primitive — the sole-minter is a DOCUMENTED d
 `apply_events` NEVER mutates `peers` (an earlier observe-traffic belt was removed — it could resurrect a
 departed peer as a ghost that `reassign_orphans` might elect as a dead owner); the deterministic `coordinator()`
 + seq gate + resync converge a transient split once views reconcile. Full partition consensus is out of scope
-(casual/co-op envelope). Phase 3 still owns: message splitting, per-entry ack granularity.
+(casual/co-op envelope).
+**ADR-0029 — AOI size-cap:** each per-peer state datagram is GUARANTEED ≤ `SAFE_DATAGRAM_BYTES`. `collect_all`
+ranks `visible_outer` nearest-first (dist² from the AOI center; `NetEntityId` for unbounded), tie-broken by
+`NetEntityId`, and keeps only the nearest whose CONSERVATIVE full-mask sizes (`state_entry_max_bytes`) sum
+within the budget; the rest are capped out of BOTH visible sets → the existing AOI-EXIT Despawns a capped-out
+known entity + drops its baseline (fresh run on re-entry) — capping is an existence WITHHOLD, NEVER a
+state-entry deferral (which would break the cumulative-run ack). A fast path keeps small scenes byte-identical;
+the old `>1150` warn is now an unreachable defensive check. Auditor-MERGE (byte-bound airtight, no
+false-confirm, deterministic, read-cheat-preserving). Accepted trade-offs (by design): a persistently-over-budget
+scene never replicates its farthest/highest-id entities (no rotation); cap-boundary churn isn't hysteresis-damped.
+**DEFERRED (YAGNI-until-measured):** true message splitting + per-entity negative-acks — the over-MTU blob is
+already CORRECT (higher loss probability, not a bug) and the stuck-entry stall is bandwidth-only + self-heals;
+revisit only if a measured dense-Mode-3 workload needs >budget entities with existence PRESERVED, then via
+per-bucket sub-streams.
 
 ## Crate-local invariants
 - **Single-ownership per entity ⇒ last-write-wins, NO CRDT.** One authority per

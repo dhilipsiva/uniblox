@@ -66,8 +66,16 @@ coordinator-minted commit, so a concurrent push+pull can't double-mint (`transfe
 Mode-1/coordinator/mechanics primitive — the discipline is documented, not hard-guarded). (b) **Membership** —
 `poll_peers` is the sole authority (`apply_events` never mutates `peers`; an audit caught + removed a
 ghost-peer belt); deterministic `coordinator()` + seq gate + resync converge a split (full partition consensus
-out of scope). two_world 110 + headless 8 green; netcode-audited → MAJOR ghost belt removed. Next Phase-3
-threads: message splitting; per-entry ack granularity; the Phase-5 Mode-2 coordinator peer SERVICE.
+out of scope). two_world 110 + headless 8 green; netcode-audited → MAJOR ghost belt removed. **ADR-0029 — AOI size-cap DONE +
+splitting/per-entity-acks DEFERRED:** `collect_all` now GUARANTEES each per-peer state datagram ≤
+`SAFE_DATAGRAM_BYTES` — it keeps only the nearest entities that fit (rank by dist²/id, conservative full-mask
+sizes), routing overflow through the audited AOI-exit path (an existence WITHHOLD, not a state-entry deferral;
+no wire change). Deep design work (2 agents) showed true message-splitting is UNSOUND with the current
+cumulative-run ack (needs a big negative-ack + reassembly rework) and the over-MTU blob is already correct
+(higher loss probability, not a bug) + the stuck-entry stall is bandwidth-only + self-heals — so splitting +
+per-entity acks are DEFERRED (YAGNI-until-measured; revisit for a dense-Mode-3 workload via per-bucket
+sub-streams). two_world 116 green (Group CAP); netcode-audited → MERGE (byte-bound airtight, no false-confirm,
+deterministic, read-cheat-preserving). Next Phase-3 threads: the Phase-5 Mode-2 coordinator peer SERVICE.
 
 ## Done
 - **Cargo workspace** — virtual manifest, 9 crates under `crates/*` (glob members),
