@@ -36,7 +36,12 @@ transport = { path = "../transport", version = "0.1.0" }
 wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
 # Window + Performance: performance.now() for the in-browser metrics harness.
-web-sys = { workspace = true, features = ["console", "Window", "Performance", "Storage"] }
+web-sys = { workspace = true, features = ["console", "Window", "Performance", "Storage", "Location", "UrlSearchParams", "Crypto", "Response", "Request", "RequestInit"] }
+js-sys.workspace = true
+# Mode 2 in the browser (ADR-0051): the peer app (the server's own systems and pump) and the
+# replicator's signing key type.
+server = { path = "../server", version = "0.1.0" }
+replication = { path = "../replication", version = "0.1.0" }
 gloo-timers.workspace = true
 console_error_panic_hook.workspace = true
 console_log.workspace = true

@@ -20,7 +20,11 @@ bevy_time.workspace = true
 bevy_ecs.workspace = true
 futures.workspace = true
 log.workspace = true
-getrandom.workspace = true   # the per-process event-signing key (ADR-0049)
+
+# The per-process event-signing key (ADR-0049). Native only: the browser draws its key from
+# crypto.getRandomValues, and getrandom needs an explicit backend on wasm32.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+getrandom.workspace = true
 
 [dev-dependencies]
 # scripted_modes.rs runs Mode 1 on the real standalone app (ADR-0045).

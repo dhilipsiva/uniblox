@@ -2143,3 +2143,39 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
     `just test-all` and CI.
 - **Status:** Proposed (2026-10-21) on branch `todo/P4-UNIBLOX-05`, part of a HIGH-risk item.
 
+## ADR-0051 — Mode 2 end to end in the browser: the server's app as a peer
+- **Context:** Mode 2 (P2P hybrid) had been proven with native peers and hand-ferried worlds. The browser
+  client ran only the Mode-1 view and a transport demo, so nothing showed browser peers joining through the
+  scoped, authenticated signaling service and arbitrating ownership, including through host migration.
+- **Decision — one app for every mode:** `server::build_peer_app(transport, local, key, entities)` is the same
+  app the Mode-3 server runs: the same FixedUpdate systems and the same `net_pump`. Only the authority
+  assignment differs: each peer owns what it spawns. This is ADR-0014's thesis carried into the browser. The
+  server crate builds for wasm32: the OS-random key, the server builders and bundle loading are native-only,
+  and the browser draws its key from `crypto.getRandomValues`.
+- **Decision — the join:** with `?mode2=<room>&signal=<http base>` the page fetches a join token from the
+  service's endpoint (cross-origin, ADR-0047) and joins `ws(s)://…/<room>?engine=N&token=…[&next=N]`. Its
+  signaling id becomes its protocol peer id, as on the server.
+- **Decision — the arbitration window:** the coordinator commits only once the first pending claim or transfer
+  request has waited `arbitration_window` (`server::set_arbitration_window`; zero, the default, keeps
+  arbitrating every frame). Contending claims that arrive within the window are arbitrated together: the
+  lowest id wins and the rest get `ClaimRejected`. This makes the outcome independent of arrival jitter.
+- **Decision — observability:** `server::{coordinator, net_id, rejected_claims, claim}` let a host see and
+  drive the arbitration. The page logs `[uniblox-mode2]` markers (its id, the entity count, the coordinator,
+  each ownership change, claims and rejections), and a new `#claim…` hash claims the first entity the
+  coordinator owns.
+- **Consequences:** `just browser-e2e` (and so CI) adds a Mode-2 scenario on a second, authenticated signaling
+  server:
+  - three tabs reach a full mesh and agree on the coordinator;
+  - two claim the same entity inside a 2 s window: the lower id commits and the other is rejected;
+  - the coordinator's tab closes: both survivors agree on the new coordinator (the lowest surviving id) and
+    re-tag the departed peer's entity to it;
+  - a claim then commits under the new coordinator.
+
+  It passed three runs out of three. The wasm builds grew by about 45 KB brotli (3.62 and 3.64 MB, under the
+  8 MB gate).
+- **Not covered:** the election is the lowest live id (ADR-0025), not the "oldest survivor" the original Phase-5
+  wording named. Views of membership can still differ for a moment (ADR-0028 b). The independent human
+  review of the ownership-arbitration core still applies. Real networks (NAT, loss) are a separate,
+  environment-gated measurement.
+- **Status:** Accepted (2026-10-21) on branch `todo/P4-UNIBLOX-06`.
+

@@ -26,7 +26,10 @@ local headless — see `/slice-check`). **Opt-in Mode-1 save/load (ADR-0036, C1)
 (pointer → `IdbStore::get` → a `LoadInbox` NonSend `Rc<RefCell>` bridge → an exclusive `apply_load` runs
 `load_world_verified` and RE-CLOTHES the reconstructed entities with `Sprite`/`Transform` + a fresh `Avatar`,
 since the authoritative save omits the client render/control layer). `[uniblox-save]` console markers; move → K →
-reload tab → L restores the world (also B4's real end-to-end proof). Native main is still the stub.
+reload tab → L restores the world (also B4's real end-to-end proof). **Mode 2 (ADR-0051, `src/mode2.rs`):** `?mode2=<room>&signal=<http base>` replaces the Mode-1 view with a peer: a join
+token from the signaling endpoint, `Transport::connect` to the scoped room, a key from `crypto.getRandomValues`, and
+`server::build_peer_app` (the server's own app and pump) on the wasm schedule runner. `[uniblox-mode2]` markers; a new
+`#claim…` hash claims the coordinator's first entity. Native main is still the stub.
 
 ## Gotchas (learned here)
 - **Bevy's derive macros miss target-scoped deps** — they scan `[dependencies]`

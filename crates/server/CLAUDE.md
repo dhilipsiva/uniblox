@@ -5,6 +5,13 @@ the Mode 3 authoritative hub.
 **Risk tier:** standard (Mode 3 validation logic becomes HIGH in Phases 9/11).
 
 ## Status
+**Also the Mode-2 browser peer (ADR-0051):** `build_peer_app(transport, local, key, entities)` is this same app
+with a caller-supplied signing key, and the crate builds for wasm32 (the OS-random `fresh_signing_key`,
+`build_server_app*` and `load_content` are native-only). `net_pump` commits only once the first pending
+arbitration has waited `arbitration_window` (`set_arbitration_window`; default zero = every frame), so contending
+claims inside it are arbitrated together. `coordinator`/`net_id`/`rejected_claims`/`claim` expose the arbitration
+to a host.
+
 Implemented (the Mode-3 headless runtime, ADR-0014 — the authority-swap gate PASSED).
 `build_server_app`: standalone `bevy_app`+`bevy_time` (TaskPool + Time + ScheduleRunner
 at 1/64 s — NOT the `bevy` umbrella; `MinimalPlugins` lives in `bevy_internal`),

@@ -80,6 +80,13 @@ pub struct Net {
     focus_radius: Option<f32>,
     /// Monotonic per-connection lane for placing avatars at disjoint positions.
     avatar_lane: u64,
+    /// The coordinator's arbitration window: it commits only once the first pending claim or
+    /// transfer request has waited this long, so contending claims that arrive within it are
+    /// arbitrated together (the lowest id wins, the rest are rejected). Zero = every frame.
+    arbitration_window: Duration,
+    /// The pump's virtual clock, and when (on it) the current pending arbitration was first seen.
+    clock: Duration,
+    first_pending: Option<Duration>,
 }
 
 /// Route a batch of DIRECTED events `(target protocol id, encoded bytes)` on the
@@ -224,8 +231,17 @@ pub fn net_pump(world: &mut World) {
     // coordinator (lowest live peer), arbitrate queued claims/transfer-requests
     // into directed OwnershipCommit/ClaimRejected. No-op when not the coordinator
     // or nothing is pending; drains every frame (reliable, rare).
-    let commits = net.repl.drain_commits(world);
-    send_directed(&mut net.transport, commits);
+    net.clock += dt;
+    if net.repl.has_pending_arbitration() {
+        let since = *net.first_pending.get_or_insert(net.clock);
+        if net.clock.saturating_sub(since) >= net.arbitration_window {
+            net.first_pending = None;
+            let commits = net.repl.drain_commits(world);
+            send_directed(&mut net.transport, commits);
+        }
+    } else {
+        net.first_pending = None;
+    }
 
     // Send on the network tick only.
     net.acc += dt;
@@ -290,7 +306,8 @@ pub fn net_pump(world: &mut World) {
 }
 
 /// A fresh event-signing key for this process (ADR-0049), from the OS random source. A failing OS
-/// random source is fatal: the server cannot sign without it.
+/// random source is fatal: the server cannot sign without it. Native only (see Cargo.toml).
+#[cfg(not(target_arch = "wasm32"))]
 pub fn fresh_signing_key() -> replication::SigningKey {
     let mut seed = [0u8; 32];
     if let Err(err) = getrandom::fill(&mut seed) {
@@ -305,21 +322,43 @@ pub fn fresh_signing_key() -> replication::SigningKey {
 /// server-owned demo entities — the ONLY mode-defining input: the server owns
 /// everything, so every client applies everything. Every client sees ALL demo
 /// entities (unbounded AOI — the Mode-3 fail-open default).
+#[cfg(not(target_arch = "wasm32"))]
 pub fn build_server_app(transport: Transport, local: PeerId, entity_count: usize) -> App {
-    build_server_app_inner(transport, local, entity_count, None)
+    build_server_app_inner(transport, local, entity_count, None, fresh_signing_key())
 }
 
 /// Like [`build_server_app`], but FOCUSED (ADR-0023 c): each connecting client
 /// gets a server-owned avatar it controls, and its AOI is focused on that avatar
 /// with enter radius `focus_radius` — so a client sees only entities within its
 /// focus (out-of-focus entities are withheld in state AND existence).
+#[cfg(not(target_arch = "wasm32"))]
 pub fn build_server_app_focused(
     transport: Transport,
     local: PeerId,
     entity_count: usize,
     focus_radius: f32,
 ) -> App {
-    build_server_app_inner(transport, local, entity_count, Some(focus_radius))
+    build_server_app_inner(
+        transport,
+        local,
+        entity_count,
+        Some(focus_radius),
+        fresh_signing_key(),
+    )
+}
+
+/// A Mode-2 peer (ADR-0014's thesis, ADR-0051): the SAME app the Mode-3 server runs — the same
+/// systems, the same pump — around `transport`, owning the `entity_count` entities it spawns and
+/// signing with `key`. Only the authority assignment differs from the server: here every peer owns
+/// what it spawned. Builds on every target (the browser client runs it, with a key from
+/// `crypto.getRandomValues`).
+pub fn build_peer_app(
+    transport: Transport,
+    local: PeerId,
+    key: replication::SigningKey,
+    entity_count: usize,
+) -> App {
+    build_server_app_inner(transport, local, entity_count, None, key)
 }
 
 fn build_server_app_inner(
@@ -327,6 +366,7 @@ fn build_server_app_inner(
     local: PeerId,
     entity_count: usize,
     focus_radius: Option<f32>,
+    key: replication::SigningKey,
 ) -> App {
     let mut app = App::new();
     app.add_plugins((
@@ -339,8 +379,7 @@ fn build_server_app_inner(
 
     let world = app.world_mut();
     insert_sim(world, local, (1.0 / TICK_HZ) as f32);
-    let repl = Replication::new(world, fresh_signing_key());
-    // Every demo entity advances in +x — the M3/M4 test predicates observe
+    let repl = Replication::new(world, key); // Every demo entity advances in +x — the M3/M4 test predicates observe
     // proxies in replay order (arbitrary), so ALL entities must move on x.
     // Keep nonzero vel.x if you change these (auditor finding F2).
     for i in 0..entity_count {
@@ -365,6 +404,9 @@ fn build_server_app_inner(
         resync_acc: Duration::ZERO,
         focus_radius,
         avatar_lane: 0,
+        arbitration_window: Duration::ZERO,
+        clock: Duration::ZERO,
+        first_pending: None,
     });
     // `advance_tick` bumps engine_core::Tick (the snapshot time axis, ADR-0022);
     // `count_tick` keeps the server-local TickCount (the 64 Hz evidence test).
@@ -394,8 +436,53 @@ fn build_server_app_inner(
     app
 }
 
+/// Set the coordinator's arbitration window (see `Net`): contending claims that arrive within it of
+/// the first are arbitrated together.
+pub fn set_arbitration_window(world: &mut World, window: Duration) {
+    if let Some(mut net) = world.get_non_send_mut::<Net>() {
+        net.arbitration_window = window;
+    }
+}
+
+/// The coordinator as this peer sees it (ADR-0025 A).
+pub fn coordinator(world: &World) -> Option<PeerId> {
+    let local = world.get_resource::<LocalPeer>()?.0;
+    Some(world.get_non_send::<Net>()?.repl.coordinator_for(local))
+}
+
+/// An entity's network identity (the same on every peer).
+pub fn net_id(world: &World, entity: Entity) -> Option<protocol::NetEntityId> {
+    world.get_non_send::<Net>()?.repl.net_id(entity)
+}
+
+/// How many of this peer's ownership claims have been rejected.
+pub fn rejected_claims(world: &World) -> u64 {
+    world
+        .get_non_send::<Net>()
+        .map_or(0, |net| net.repl.rejected_claims())
+}
+
+/// Claim `entity` (ADR-0025 A): route a `ClaimOwnership` to the coordinator, or record our own claim
+/// when we are the coordinator. Whether a claim was made.
+pub fn claim(world: &mut World, entity: Entity) -> bool {
+    let Some(mut net) = world.remove_non_send::<Net>() else {
+        return false;
+    };
+    let claimed = match net.repl.claim_ownership(world, entity) {
+        Some(msg) => {
+            send_directed(&mut net.transport, vec![msg]);
+            true
+        }
+        None => net.repl.has_pending_arbitration(),
+    };
+    world.insert_non_send(net);
+    claimed
+}
+
 /// Load a content bundle (ADR-0045) from the manifest at `manifest`: verify it, compile its entry
 /// script, and hand every entity this peer owns to the script ([`engine_core::enable_scripts`]).
+/// Native only (it reads the bundle from disk).
+#[cfg(not(target_arch = "wasm32"))]
 pub fn load_content(app: &mut App, manifest: &std::path::Path) -> Result<(), String> {
     let bundle = protocol::bundle::load_bundle_dir(manifest).map_err(|e| e.to_string())?;
     let engine =

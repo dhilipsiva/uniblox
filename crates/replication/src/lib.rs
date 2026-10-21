@@ -433,6 +433,8 @@ pub struct Replication {
     /// Each peer's public key, pinned from its first validly signed event (ADR-0049); a later
     /// event under another key is dropped. Cleared when the peer is untracked.
     peer_keys: HashMap<PeerId, VerifyingKey>,
+    /// How many of our ownership claims the coordinator has rejected (instrumentation).
+    rejected_claims: u64,
 }
 
 impl Replication {
@@ -466,7 +468,30 @@ impl Replication {
             peers: HashSet::new(),
             signer: EventSigner { key, local },
             peer_keys: HashMap::new(),
+            rejected_claims: 0,
         }
+    }
+
+    /// The network identity of a mapped entity (its spawner, index and generation), the same on every
+    /// peer.
+    pub fn net_id(&self, entity: Entity) -> Option<NetEntityId> {
+        self.map.by_entity.get(&entity).map(|r| r.id)
+    }
+
+    /// The coordinator as `local` sees it: the lowest id among the tracked peers and `local`
+    /// (ADR-0025 A).
+    pub fn coordinator_for(&self, local: PeerId) -> PeerId {
+        self.coordinator(local)
+    }
+
+    /// Whether claims or transfer requests wait for this coordinator's arbitration.
+    pub fn has_pending_arbitration(&self) -> bool {
+        !self.pending_claims.is_empty() || !self.pending_transfer_requests.is_empty()
+    }
+
+    /// How many of our ownership claims the coordinator has rejected so far.
+    pub fn rejected_claims(&self) -> u64 {
+        self.rejected_claims
     }
 
     /// Re-read `LocalPeer` (ADR-0049): a host may insert it after [`Self::new`]; every signature
@@ -1420,6 +1445,7 @@ impl Replication {
                 // Our claim did not win (ADR-0025 A-handshake). Nothing to undo — a
                 // claimant never pre-flips its `Owner`. The pump may re-claim.
                 log::debug!("ownership claim for {id:?} rejected");
+                self.rejected_claims += 1;
             }
             NetEvent::TransferRequest { id, to } => {
                 // COORDINATOR side (ADR-0028 sole-minter): a non-coordinator owner

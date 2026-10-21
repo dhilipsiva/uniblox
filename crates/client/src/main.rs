@@ -10,6 +10,10 @@
 //! and the `[uniblox-metrics]` harness. Native main is still a stub — Bevy is a
 //! wasm32-only dependency here; native parity is Phase 14.
 
+/// Mode 2 (P2P) in the browser (ADR-0051), when the page's query asks for it.
+#[cfg(target_arch = "wasm32")]
+mod mode2;
+
 /// The interim two-tab transport demo (wasm only).
 #[cfg(target_arch = "wasm32")]
 mod demo {
@@ -421,6 +425,11 @@ mod render {
 fn main() {
     #[cfg(target_arch = "wasm32")]
     {
+        // `?mode2=<room>&signal=<http base>`: a Mode-2 peer instead of the Mode-1 view (ADR-0051).
+        if let Some(params) = mode2::params() {
+            mode2::start(params);
+            return;
+        }
         // Transport demo + metrics first (spawn_local futures run alongside
         // winit's requestAnimationFrame loop), then the render app — run()
         // does not return on wasm.
