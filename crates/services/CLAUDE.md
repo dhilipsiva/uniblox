@@ -30,7 +30,8 @@ With `auth: Some(JoinTokenKey)` the gate admits only a valid `?token=` for the r
 /64; `ClientIp::ForwardedFor(hops)` behind proxies; bounded table, fail closed), 16 open connections per IP and
 10,000 in total, a 32 KiB WebSocket message/frame cap enforced as fragments arrive, a 60 s idle timeout, a
 per-connection frame bucket (1,024 burst, 100/s; close after 256 net drops), a per-peer outbound queue of 1,024
-messages / 1 MiB whose overflow is charged to the SENDER (never evict the receiver: a sender controls its queue),
+messages / 1 MiB whose overflow is charged to the SENDER (never evict the receiver: a sender controls its queue;
+each sender holds at most a quarter of it in messages AND bytes, and an eighth of each is kept for control events),
 writer-stall detection (no write progress for 10 s disconnects a non-reader), a 1 MiB write buffer, and 64 peers
 per session. The binary refuses
 to start without `UNIBLOX_SIGNALING_SECRET` unless `UNIBLOX_SIGNALING_INSECURE=1`; `services mint-token <room>`.
@@ -55,7 +56,8 @@ cross-node relay is out of scope).** Hermetic test spawns a real `redis-server` 
 
 **TURN credentials (ADR-0050, proposed):** `SignalingConfig::turn` serves `GET /_uniblox/turn?room=&token=`: a
 coturn REST-API credential (`<expiry>:<label>`, base64 HMAC-SHA1 of the shared secret, `turn_credential`) only for a
-valid join token for that room; 404 without TURN or auth. Env: `UNIBLOX_TURN_SECRET`, `UNIBLOX_TURN_URLS`,
+valid join token for that room (label = a hash of the token, expiry rounded down to a half-TTL grid and capped at the
+token's, so one token keeps one username per grid step); 404 without TURN or auth. Env: `UNIBLOX_TURN_SECRET`, `UNIBLOX_TURN_URLS`,
 `UNIBLOX_TURN_TTL_SECS`.
 
 **Registry liveness (ADR-0048, proposed):** each node is alive while its liveness entry (Redis

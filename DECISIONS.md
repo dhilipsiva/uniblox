@@ -1871,7 +1871,8 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
     form would exceed the size cap (re-encoding can grow it). Only a signal that is delivered earns one drop
     back; keep-alives and other frames earn nothing. After [256] drops the connection is closed;
   - each peer's outbound queue [1,024 messages, 1 MiB] and WebSocket write buffer [1 MiB]:
-    - one sending peer may hold at most a quarter of a receiver's queue;
+    - one sending peer may hold at most a quarter of a receiver's queue, in messages and in bytes (a sender
+      holding nothing may always queue one signal, so a small budget cannot shut it out);
     - signals leave an eighth free for control events (`IdAssigned`, `NewPeer`, `PeerLeft`), so a flooded peer
       still learns who comes and goes;
     - a signal that does not fit is dropped and charged to its SENDER, never to the receiver, whose queue any
@@ -1911,18 +1912,24 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   full queue starved the victim of `NewPeer`/`PeerLeft`. It also measured 3.8x growth when a signal is
   re-encoded. Now only delivered signals earn a drop back, each sender has a share, control events have a
   reserve, and the relayed size is capped.
+
+  Its re-review (of a0a780d) found the share counted messages only: one sender could fill the byte budget
+  with 16 KiB signals, then tiny ones, all inside its message share, and shut out every other sender. The
+  share now binds in bytes too. It also found that the tests of the share, the reserve and the release still
+  passed with each removed, because their floods fit in the kernel's socket buffers. Those tests now flood a
+  receiver with a small receive buffer, and each fails with its guard removed.
 - **Known limits:**
   - the per-IP limits are per node, not shared through the Redis registry;
   - a client that rotates through many IPv6 /64s or IPv4 addresses gets a bucket and 16 connections for
     each, and clients behind one NAT share theirs;
-  - several cooperating flooders (four or more, each with its own share) can still fill a victim's signal
-    capacity until their drop counts close them; control events keep their reserve;
+  - four or more cooperating flooders, each holding its share of messages and bytes, can still fill a
+    victim's signal capacity until their drop counts close them; control events keep their reserve;
   - a reader that takes each message within the stall timeout is never disconnected, however slowly it
     drains overall; its memory stays within the queue and write-buffer bounds;
   - the browser client does not fetch tokens yet (its demo room URL is compiled in), so `just browser-e2e`
     runs the open development server. The client's join through the scoped service, with a token from the
     endpoint, is follow-up work.
-- **Consequences:** `tests/auth.rs` (16) covers:
+- **Consequences:** `tests/auth.rs` (25) covers:
   - the token checks and their single spelling;
   - the Done-when refusal of an unauthenticated connection, and the open default;
   - the endpoint on and off, with `no-store`;
@@ -1932,12 +1939,18 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   - the per-IP connection cap;
   - the idle timeout;
   - a non-reading peer disconnected;
+  - a flooder closed while its victim stays, and keep-alives that do not save it;
+  - the queue bounded in bytes, and a relayed signal that would grow past the cap;
+  - control events reaching a peer flooded to its message budget and to its byte budget;
+  - an honest sender's signal through a flood, in messages and in bytes, and a share given back to a peer
+    that reads;
   - the session and `?next` caps.
 
   `tests/binary.rs` (6) covers the secure default, `mint-token` and its refusals, a non-UTF-8 secret, and the
   endpoint without a secret. Unit tests cover the token bucket, the address keys (IPv6 /64, IPv4-mapped,
   forwarded-for hops and forms), the bounded IP table, the refill rounding and the `?next` counter. The
-  existing signaling and Redis tests run unchanged.
+  existing signaling and Redis tests run unchanged. `server.rs` unit tests cover the share in messages and
+  bytes, its release while others stay queued, and the one signal an empty share admits.
 - **Status:** Proposed (2026-10-21) on branch `todo/P4-UNIBLOX-05`, part of a HIGH-risk item: accepted after the
   owner's review.
 
@@ -2058,7 +2071,8 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
     signatures on every non-Ack event, and the public key.
   - The existing suites now sign their hand-crafted events with the sending peer's test key and send ownership
     changes from their minter. T20 now gives each recipient its own copy of a transfer.
-  - `tests/ownership_guards.rs` (6) covers the reserved top rank, the coordinator's overflow-free mint, the
+  - `tests/ownership_guards.rs` (8) covers the reserved top rank, the rank-jump limit (on transfers, on
+    resyncs of an entity the receiver holds, and on orphan resyncs), the coordinator's overflow-free mint, the
     owner-only transfer request, the fresh pin on reconnect, signed rejections, and a late `LocalPeer`.
     `protocol/tests/wire.rs` pins the signed bytes byte for byte.
   - Mutation-tested: ignoring the verification fails half of `signing.rs`.
@@ -2077,8 +2091,7 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
 - **Decision — the credential:** coturn's REST-API scheme (`use-auth-secret`, `static-auth-secret`). The
   username is `<expiry>:<label>` and the password is the standard base64 of HMAC-SHA1(secret, username)
   (`services::turn_credential`). coturn recomputes the password from the shared secret and refuses the
-  credential once the expiry passes, so neither side keeps per-user state. Each credential gets a fresh random
-  label.
+  credential once the expiry passes, so neither side keeps per-user state.
 - **Decision — who gets one:** `SignalingConfig::turn` serves `GET /_uniblox/turn?room=<room>&token=<join token>`.
   It answers only a client whose join token is valid for the room it names (ADR-0047). Otherwise:
   - a missing or invalid token gets `401`;
@@ -2088,8 +2101,10 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   The answer is `{urls, username, credential, ttl}`, with `Cache-Control: no-store`, CORS on refusals too, and
   the same per-IP rate limit as the other endpoints.
   - A credential never outlives the join token that admitted it.
-  - Its label is derived from the token (a hash), so one token is one coturn user: redeeming it again yields
-    the same username, and coturn's per-user quota binds per token.
+  - Its label is derived from the token (a hash), and its expiry is rounded down to a grid of half the TTL.
+    Redeeming a token again within a grid step yields the same username, a token has at most two valid
+    usernames at a time, and coturn's per-user quota binds per token. A credential lasts between half the TTL
+    and the TTL. (Without the rounding, a token that outlives the TTL got a new username every second.)
   - The binary reads `UNIBLOX_TURN_SECRET` (at least 32 bytes, since a credential allows an offline guess at a
     weak secret), `UNIBLOX_TURN_URLS` (`turn:`, `turns:` or `stun:` only) and `UNIBLOX_TURN_TTL_SECS`
     (default an hour, at most a day).
@@ -2105,8 +2120,9 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
     tokens;
   - "paid-only" returns as an entitlement check in this endpoint if a billing path (D10 = B) is ever taken.
 - **Consequences:**
-  - `tests/turn.rs` covers the known-answer vectors, the refusals, a credential that expires in its TTL with a
-    fresh label each time, and the endpoint being off without TURN or auth;
+  - `tests/turn.rs` covers the known-answer vectors, the refusals, a credential that expires within its TTL,
+    one username per token (capped at the token's expiry, and kept by a token that outlives the TTL), CORS on
+    refusals, and the endpoint being off without TURN or auth;
   - `transport/tests/turn_relay.rs` adds a real coturn in `use-auth-secret` mode: a minted credential relays
     data relay-only, and an expired or foreign-secret one is refused. These tests are ignored and run by
     `just test-all` and CI.

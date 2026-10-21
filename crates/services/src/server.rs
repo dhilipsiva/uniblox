@@ -41,13 +41,20 @@ pub(crate) struct Outbound {
     from: Option<PeerId>,
 }
 
+/// What one sending peer holds of a receiver's queue.
+#[derive(Default)]
+struct Held {
+    msgs: usize,
+    bytes: usize,
+}
+
 /// A peer's outbound accounting, shared by its senders and its writer.
 #[derive(Default)]
 struct Budget {
     /// Bytes queued and not yet written.
     bytes: AtomicUsize,
-    /// Messages queued per sending peer (their share of this queue).
-    per_sender: Mutex<HashMap<PeerId, usize>>,
+    /// What each sending peer has queued (its share of this queue, in messages and in bytes).
+    per_sender: Mutex<HashMap<PeerId, Held>>,
 }
 
 impl Budget {
@@ -56,10 +63,11 @@ impl Budget {
         self.bytes.fetch_sub(out.len, Ordering::Relaxed);
         if let Some(from) = out.from
             && let Ok(mut shares) = self.per_sender.lock()
-            && let Some(n) = shares.get_mut(&from)
+            && let Some(held) = shares.get_mut(&from)
         {
-            *n -= 1;
-            if *n == 0 {
+            held.msgs = held.msgs.saturating_sub(1);
+            held.bytes = held.bytes.saturating_sub(out.len);
+            if held.msgs == 0 {
                 shares.remove(&from);
             }
         }
@@ -122,30 +130,37 @@ impl PeerTx {
     }
 
     /// Queue `from`'s signal; whether it was queued. It is dropped when `from` already holds its share
-    /// (a quarter of the queue) or when only the control reserve (an eighth) is left. The relay
-    /// charges a dropped signal to its SENDER, never to this receiver, whose queue a sender can fill
-    /// at will; a receiver that does not read is found by its writer stalling instead.
+    /// (a quarter of the queue's messages, and a quarter of its bytes) or when only the control
+    /// reserve (an eighth of each) is left. A sender holding nothing may always queue one signal, so a
+    /// byte share smaller than a signal cannot shut it out. The relay charges a dropped signal to its
+    /// SENDER, never to this receiver, whose queue a sender can fill at will; a receiver that does not
+    /// read is found by its writer stalling instead.
     pub(crate) fn send_signal(&self, from: PeerId, msg: Message) -> bool {
-        let share = (self.max_msgs / 4).max(1);
+        let share_msgs = (self.max_msgs / 4).max(1);
+        let share_bytes = self.max_bytes / 4;
         let reserve = (self.max_msgs / 8).max(1);
         if self.tx.capacity() <= reserve {
             return false;
         }
+        let len = msg_len(&msg);
         let Ok(mut shares) = self.budget.per_sender.lock() else {
             return false;
         };
-        let held = shares.entry(from).or_insert(0);
-        if *held >= share {
+        let held = shares.entry(from).or_default();
+        if held.msgs >= share_msgs
+            || (held.msgs > 0 && held.bytes.saturating_add(len) > share_bytes)
+        {
             return false;
         }
         let byte_cap = self.max_bytes - self.max_bytes / 8;
         if !self.enqueue(msg, Some(from), byte_cap) {
-            if *held == 0 {
+            if held.msgs == 0 {
                 shares.remove(&from);
             }
             return false;
         }
-        *held += 1;
+        held.msgs += 1;
+        held.bytes += len;
         true
     }
 }
@@ -364,11 +379,16 @@ impl Shared {
             Ok(expiry) => expiry,
             Err(err) => return unauthorized(err),
         };
-        // Never outlive the token that admitted the client.
-        let expiry = (now + turn.ttl.as_secs().clamp(1, MAX_TURN_TTL_SECS)).min(token_expiry);
+        // Round the expiry down to a grid of half the TTL, so a token that outlives the TTL keeps one
+        // username for a grid step (coturn's per-user quota binds per username, and a token then has at
+        // most two valid ones at a time). A credential lasts between half the TTL and the TTL, and never
+        // outlives the token that admitted the client.
+        let ttl_secs = turn.ttl.as_secs().clamp(1, MAX_TURN_TTL_SECS);
+        let step = (ttl_secs / 2).max(1);
+        let expiry = ((now + ttl_secs) / step * step).min(token_expiry);
         let ttl = expiry.saturating_sub(now);
-        // The label is derived from the token: one token is one coturn user, so coturn's per-user
-        // quota binds per token, and redeeming a token again yields the same username.
+        // The label is derived from the token, so redeeming a token again within a grid step yields the
+        // same username, and coturn's per-user quota binds per token.
         let digest = Sha256::digest(token.as_bytes());
         let label: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
         let credential = turn_credential(&turn.secret, &label, expiry);
@@ -672,5 +692,67 @@ pub(crate) fn build(
         addr,
         router,
         listener: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn peer_tx(max_msgs: usize, max_bytes: usize) -> (PeerTx, mpsc::Receiver<Outbound>) {
+        let (tx, rx) = mpsc::channel(max_msgs);
+        let peer = PeerTx {
+            tx,
+            budget: Arc::default(),
+            max_bytes,
+            max_msgs,
+        };
+        (peer, rx)
+    }
+
+    fn text(len: usize) -> Message {
+        Message::Text("x".repeat(len).into())
+    }
+
+    /// A sender's share is a quarter of the queue in messages and in bytes, and writing a message
+    /// gives back both, even while the sender still has others queued (a reading peer never sees
+    /// that state long enough for the integration tests to catch a leak).
+    #[test]
+    fn a_share_binds_in_messages_and_bytes_and_is_given_back() {
+        let a = PeerId(Uuid::from_u128(1));
+        let c = PeerId(Uuid::from_u128(2));
+        // A share of 16 messages and 16 KiB.
+        let (peer, mut rx) = peer_tx(64, 64 * 1024);
+        for _ in 0..4 {
+            assert!(peer.send_signal(a, text(4096)));
+        }
+        assert!(!peer.send_signal(a, text(4096)), "A's byte share is full");
+        assert!(peer.send_signal(c, text(4096)), "C has its own share");
+        let written = rx.try_recv().expect("A's first signal");
+        peer.budget.release(&written);
+        assert!(
+            peer.send_signal(a, text(4096)),
+            "writing gave back its bytes"
+        );
+        for _ in 0..16 {
+            let _ = peer.send_signal(c, text(1));
+        }
+        assert!(!peer.send_signal(c, text(1)), "C's message share is full");
+    }
+
+    /// A sender holding nothing may queue one signal larger than its byte share, so a small budget
+    /// cannot shut a sender out; the overall byte cap still bounds it.
+    #[test]
+    fn an_empty_share_admits_one_signal() {
+        let a = PeerId(Uuid::from_u128(1));
+        // A byte share of 1 KiB; the signal cap is 3.5 KiB.
+        let (peer, _rx) = peer_tx(64, 4096);
+        assert!(peer.send_signal(a, text(2048)));
+        assert!(!peer.send_signal(a, text(10)), "the share is spent");
+        let b = PeerId(Uuid::from_u128(2));
+        assert!(
+            !peer.send_signal(b, text(2048)),
+            "the overall cap still binds"
+        );
     }
 }
