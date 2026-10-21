@@ -265,8 +265,12 @@ async fn the_token_endpoint_issues_working_tokens() {
     let mut ws = connect(addr, &format!("{ROOM}?engine=1&token={token}")).await;
     let _ = assigned_id(&mut ws).await;
 
-    let (status, _) = http_get(addr, TOKEN_PATH).await;
+    let (status, headers, _) = http_get_full(addr, TOKEN_PATH).await;
     assert_eq!(status, 400, "no room");
+    assert!(
+        headers.contains("access-control-allow-origin: *"),
+        "a cross-origin page can read the refusal too: {headers}"
+    );
     let (status, _) = http_get(addr, &format!("{TOKEN_PATH}?room=a%23b")).await;
     assert_eq!(status, 400, "a reserved character");
 }
@@ -463,27 +467,26 @@ async fn an_idle_connection_is_closed() {
 }
 
 /// A peer whose socket is not read cannot make the server queue without bound (the audit's
-/// 1.35 MiB/s per connection): once its outbound queue is full it is disconnected.
+/// 1.35 MiB/s per connection): once its writer makes no progress for the stall timeout, it is
+/// disconnected.
 #[tokio::test]
 async fn a_peer_that_does_not_read_is_disconnected() {
     let (reg, addr) = boot_with(SignalingConfig {
         limits: SignalingLimits {
-            max_outbound_queue: 4,
+            writer_stall_timeout: Duration::from_millis(300),
             signals_burst: 100_000,
             signals_per_sec: 100_000,
+            abuse_close_after: 1_000_000,
             ..SignalingLimits::default()
         },
         ..SignalingConfig::default()
     })
     .await;
     let (mut a, _b, b_id) = pair(addr, &format!("{ROOM}?engine=1")).await;
-    // B never reads. Enough data to fill the kernel's socket buffers and then the queue.
+    // B never reads. Enough data to fill the kernel's socket buffers, so B's writer stalls.
     let payload = "y".repeat(30 * 1024);
     for _ in 0..1000 {
-        if a.send(signal(b_id, &payload)).await.is_err() {
-            break;
-        }
-        if reg.peer_count(ROOM) < 2 {
+        if a.send(signal(b_id, &payload)).await.is_err() || reg.peer_count(ROOM) < 2 {
             break;
         }
     }
@@ -496,6 +499,79 @@ async fn a_peer_that_does_not_read_is_disconnected() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(evicted, "the non-reading peer was disconnected");
+}
+
+/// The re-review's eviction attack: a sender fills another peer's queue. The overflow is dropped and
+/// charged to the SENDER, so the flooder is closed and its victim stays.
+#[tokio::test]
+async fn a_flood_closes_the_flooder_not_its_victim() {
+    let (reg, addr) = boot_with(SignalingConfig {
+        limits: SignalingLimits {
+            max_outbound_queue: 4,
+            signals_burst: 100_000,
+            signals_per_sec: 100_000,
+            abuse_close_after: 20,
+            ..SignalingLimits::default()
+        },
+        ..SignalingConfig::default()
+    })
+    .await;
+    let path = format!("{ROOM}?engine=1");
+    let (mut a, mut b, b_id) = pair(addr, &path).await;
+    // B is slow: it does not read while A floods it.
+    let payload = "z".repeat(16 * 1024);
+    for _ in 0..2000 {
+        if a.send(signal(b_id, &payload)).await.is_err() {
+            break;
+        }
+    }
+    assert!(closed_by_server(&mut a, Duration::from_secs(5)).await, "the flooder is closed");
+    // B is still a member and still served: it drains what it was sent, then sees a newcomer.
+    let mut c = connect(addr, &path).await;
+    let c_id = assigned_id(&mut c).await;
+    let saw_newcomer = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let JsonPeerEvent::NewPeer(id) = next_event(&mut b).await
+                && id == c_id
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .is_ok();
+    assert!(saw_newcomer, "the victim stayed connected");
+    assert_eq!(reg.peer_count(ROOM), 2, "B and C remain");
+}
+
+/// The outbound queue is bounded in bytes as well as messages: a peer fed large signals gets at most
+/// its byte budget queued, the rest dropped (and charged to the sender).
+#[tokio::test]
+async fn the_outbound_queue_is_bounded_in_bytes() {
+    let (reg, addr) = boot_with(SignalingConfig {
+        limits: SignalingLimits {
+            max_outbound_bytes: 64 * 1024,
+            signals_burst: 100_000,
+            signals_per_sec: 100_000,
+            abuse_close_after: 1_000_000,
+            ..SignalingLimits::default()
+        },
+        ..SignalingConfig::default()
+    })
+    .await;
+    let path = format!("{ROOM}?engine=1");
+    let (mut a, mut b, b_id) = pair(addr, &path).await;
+    let payload = "w".repeat(30 * 1024);
+    for _ in 0..200 {
+        if a.send(signal(b_id, &payload)).await.is_err() {
+            break;
+        }
+    }
+    // B was not reading: at most the kernel buffers plus the 64 KiB budget reached it; the rest
+    // was dropped. B is still connected.
+    let got = count_signals(&mut b, Duration::from_millis(500)).await;
+    assert!(got < 200, "some of the 200 were dropped ({got} delivered)");
+    assert_eq!(reg.peer_count(ROOM), 2);
 }
 
 #[tokio::test]
