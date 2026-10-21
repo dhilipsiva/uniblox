@@ -1673,3 +1673,38 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   WebGL2: the WebGPU build and real GPUs are not covered. The `.#browser` shell is Linux-only, and its gate tests
   the system string, so `nix flake check` never imports nixpkgs for another system.
 - **Status:** Proposed (2026-10-21) on branch `todo/P4-UNIBLOX-02`; accepted when merged and green in CI.
+
+## ADR-0045 — Rhai drives owned entities through engine-core; content bundles with per-asset hashes
+- **Context:** the `scripting` crate (ADR-0011) was sandbox-audited but no runtime consumed it, and ADR-0042's
+  library path needs a sample game written in Rhai that runs unchanged in Modes 1, 2 and 3. TODO.md Phase 8 also
+  calls for a publishable bundle manifest: the `{engine, content, schema}` triple, the entry script, and every
+  asset by its own content hash.
+- **Decision — the script API:** `scripting::Agent` is a plain data copy of one entity for one tick: `x`, `y`,
+  `contacts` and `tick` are read-only (getters only), and `vx`, `vy` are read-write. `ScriptEngine::update_agent`
+  calls the content's `update(agent)` like `update_component`: by value, scope rewound after the call, and a
+  non-`Agent` return is an error. The raw engine lacks unary minus for FLOAT, so it is registered as a pure
+  operator. The sandbox settings (`Engine::new_raw`, every `set_max_*`, `eval` disabled) are unchanged.
+- **Decision — where scripts run:** `engine_core::Scripted` marks content-driven entities; it is local, like
+  `Interactable`, and not on the wire. `engine_core::run_entity_scripts` runs the script only for `Scripted`
+  entities this peer owns (`authority_of == Local`), and writes back only the velocity, through `set_if_neq` so an
+  unchanged velocity triggers no replication. NaN and infinities are refused, a script error leaves the entity
+  unchanged, and without a script engine the system is a no-op. It runs just before `simulate`, which still
+  integrates position; in the server chain it runs after `apply_input`. Receivers never run another peer's script:
+  scripts need no cross-platform float determinism, because their result replicates like any owned datum.
+  `engine_core::enable_scripts` inserts the engine and marks every owned entity no player controls.
+- **Decision — bundles:** `protocol::bundle` parses a JSON manifest (`version`, `entry`, `assets[{path, id}]`,
+  unknown fields rejected) and `load_bundle` returns the assets only when every blake3 id matches. Bundles are
+  untrusted content, so a path must be plain and relative: no `..`, `.`, empty segment, backslash, `:`, control
+  character or leading `/`. A missing or duplicate asset, an unlisted entry and a non-UTF-8 entry are errors too.
+  `load_bundle_dir` (native) reads assets beside the manifest. `standalone` and `server` load one from
+  `UNIBLOX_BUNDLE` through `load_content`.
+- **Decision — the sample game:** `content/sample/arena.rhai` keeps every scripted entity inside a 20 x 12 arena by
+  reflecting the outward velocity component at a wall.
+- **Consequences:** `server/tests/scripted_modes.rs` runs the sample bundle unchanged in Mode 1 (the real standalone
+  app, one fixed step per update), Mode 2 (two peers) and Mode 3 (a server and two clients): each entity's owner
+  computes bit-identical positions in all three modes, every replica converges within the quantization tolerance,
+  and without the script the same scene leaves the arena. 26 new tests; the workspace has 272. The browser client
+  now links Rhai (+118 KB / +126 KB brotli, gate PASS) but loads no content yet. Deferred to the sandbox hardening
+  (Phase 12): source and asset size caps before compile, a wall-clock watchdog and a per-frame budget across
+  entities. Deferred to Phase 8: scene data, bundle hot reload, object-storage dedup and known-bad hash matching.
+- **Status:** Proposed (2026-10-21) on branch `todo/P4-UNIBLOX-03`; accepted when merged.

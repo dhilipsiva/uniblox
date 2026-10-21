@@ -16,6 +16,8 @@ description = "The uniblox Mode-1 runtime: the shared simulation with local auth
 [dependencies]
 protocol = { path = "../protocol", version = "0.1.0" }
 engine-core = { path = "../engine-core", version = "0.1.0" }
+# Content scripts (ADR-0045); net-free like everything else here.
+scripting = { path = "../scripting", version = "0.1.0" }
 bevy_app.workspace = true
 bevy_time.workspace = true
 bevy_ecs.workspace = true

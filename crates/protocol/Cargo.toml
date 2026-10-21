@@ -12,3 +12,5 @@ description = "The uniblox wire types: peer and network-entity identity, quantiz
 serde.workspace = true
 postcard.workspace = true
 blake3.workspace = true
+# The content-bundle manifest is JSON (ADR-0045).
+serde_json.workspace = true

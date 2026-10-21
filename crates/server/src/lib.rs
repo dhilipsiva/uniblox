@@ -29,7 +29,8 @@ use bevy_ecs::prelude::*;
 use bevy_time::{Fixed, Time, TimePlugin, Virtual};
 use engine_core::{
     ControlledBy, LocalPeer, PendingInputs, Position, ProcessedInput, SimDt, Velocity,
-    advance_tick, apply_input, insert_sim, resolve_interactions, simulate, spawn_owned,
+    advance_tick, apply_input, insert_sim, resolve_interactions, run_entity_scripts, simulate,
+    spawn_owned,
 };
 use protocol::PeerId;
 use replication::Replication;
@@ -366,6 +367,9 @@ fn build_server_app_inner(
             count_tick,
             advance_tick,
             apply_input,
+            // Content scripts steer the server-owned entities (ADR-0045); a no-op until content
+            // is loaded. After apply_input, so a player-controlled entity keeps its input.
+            run_entity_scripts,
             simulate,
             // Coarse cross-owner interactions (ADR-0027) run AFTER simulate, on the
             // final positions. A no-op until entities carry Interactable+Contacts;
@@ -376,6 +380,16 @@ fn build_server_app_inner(
     );
     app.add_systems(Update, net_pump);
     app
+}
+
+/// Load a content bundle (ADR-0045) from the manifest at `manifest`: verify it, compile its entry
+/// script, and hand every entity this peer owns to the script ([`engine_core::enable_scripts`]).
+pub fn load_content(app: &mut App, manifest: &std::path::Path) -> Result<(), String> {
+    let bundle = protocol::bundle::load_bundle_dir(manifest).map_err(|e| e.to_string())?;
+    let engine =
+        scripting::ScriptEngine::from_source(&bundle.entry_source).map_err(|e| e.to_string())?;
+    engine_core::enable_scripts(app.world_mut(), engine);
+    Ok(())
 }
 
 #[cfg(test)]

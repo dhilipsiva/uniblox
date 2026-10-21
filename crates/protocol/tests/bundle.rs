@@ -24,7 +24,10 @@ fn manifest(entry: &str, assets: &[(&str, String)]) -> String {
 }
 
 fn store(files: &[(&str, &[u8])]) -> HashMap<String, Vec<u8>> {
-    files.iter().map(|(p, b)| (p.to_string(), b.to_vec())).collect()
+    files
+        .iter()
+        .map(|(p, b)| (p.to_string(), b.to_vec()))
+        .collect()
 }
 
 #[test]
@@ -55,7 +58,10 @@ fn a_matching_bundle_loads() {
 #[test]
 fn a_hash_mismatch_is_rejected() {
     let files = store(&[("game.rhai", b"fn update(a) { a.vx = 1e9; a }")]);
-    let json = manifest("game.rhai", &[("game.rhai", content_id(SCRIPT.as_bytes()).to_hex())]);
+    let json = manifest(
+        "game.rhai",
+        &[("game.rhai", content_id(SCRIPT.as_bytes()).to_hex())],
+    );
     let err = load_bundle(&json, |p| files.get(p).cloned()).unwrap_err();
     assert!(
         matches!(err, BundleError::HashMismatch { ref path } if path == "game.rhai"),
@@ -66,17 +72,29 @@ fn a_hash_mismatch_is_rejected() {
 #[test]
 fn a_missing_asset_is_rejected() {
     let files = store(&[]);
-    let json = manifest("game.rhai", &[("game.rhai", content_id(SCRIPT.as_bytes()).to_hex())]);
+    let json = manifest(
+        "game.rhai",
+        &[("game.rhai", content_id(SCRIPT.as_bytes()).to_hex())],
+    );
     let err = load_bundle(&json, |p| files.get(p).cloned()).unwrap_err();
-    assert!(matches!(err, BundleError::MissingAsset(ref p) if p == "game.rhai"), "{err:?}");
+    assert!(
+        matches!(err, BundleError::MissingAsset(ref p) if p == "game.rhai"),
+        "{err:?}"
+    );
 }
 
 #[test]
 fn an_entry_outside_the_asset_list_is_rejected() {
     let files = store(&[("game.rhai", SCRIPT.as_bytes())]);
-    let json = manifest("other.rhai", &[("game.rhai", content_id(SCRIPT.as_bytes()).to_hex())]);
+    let json = manifest(
+        "other.rhai",
+        &[("game.rhai", content_id(SCRIPT.as_bytes()).to_hex())],
+    );
     let err = load_bundle(&json, |p| files.get(p).cloned()).unwrap_err();
-    assert!(matches!(err, BundleError::EntryNotListed(ref p) if p == "other.rhai"), "{err:?}");
+    assert!(
+        matches!(err, BundleError::EntryNotListed(ref p) if p == "other.rhai"),
+        "{err:?}"
+    );
 }
 
 #[test]
@@ -85,15 +103,24 @@ fn a_duplicate_asset_path_is_rejected() {
     let files = store(&[("game.rhai", SCRIPT.as_bytes())]);
     let json = manifest("game.rhai", &[("game.rhai", id.clone()), ("game.rhai", id)]);
     let err = load_bundle(&json, |p| files.get(p).cloned()).unwrap_err();
-    assert!(matches!(err, BundleError::DuplicateAsset(ref p) if p == "game.rhai"), "{err:?}");
+    assert!(
+        matches!(err, BundleError::DuplicateAsset(ref p) if p == "game.rhai"),
+        "{err:?}"
+    );
 }
 
 #[test]
 fn a_malformed_manifest_or_id_is_rejected() {
     let none = |_: &str| None;
-    assert!(matches!(load_bundle("{ not json", none), Err(BundleError::Manifest(_))));
+    assert!(matches!(
+        load_bundle("{ not json", none),
+        Err(BundleError::Manifest(_))
+    ));
     let json = manifest("game.rhai", &[("game.rhai", "not-hex".to_string())]);
-    assert!(matches!(load_bundle(&json, none), Err(BundleError::Manifest(_))));
+    assert!(matches!(
+        load_bundle(&json, none),
+        Err(BundleError::Manifest(_))
+    ));
 }
 
 #[test]

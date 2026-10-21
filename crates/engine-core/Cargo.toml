@@ -10,4 +10,7 @@ description = "The uniblox simulation shared by every mode: ECS components, syst
 
 [dependencies]
 protocol = { path = "../protocol", version = "0.1.0" }
+# Script-driven entity logic (ADR-0045): the Agent value and the script host.
+scripting = { path = "../scripting", version = "0.1.0" }
 bevy_ecs.workspace = true
+log.workspace = true

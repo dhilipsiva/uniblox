@@ -1,22 +1,23 @@
 # uniblox
 
-**Status:** pre-release (0.1.0, nothing published): the netcode core and the Mode-1 and Mode-3 runtimes work and are tested natively; scripting, the platform backend and the native client are not built yet. Details under [Status](#status).
+**Status:** pre-release (0.1.0, nothing published): the netcode core, the Mode-1 and Mode-3 runtimes and Rhai-scripted entities work and are tested natively; the platform backend and the native client are not built yet. Details under [Status](#status).
 
 uniblox is a browser-first Rust engine for multiplayer games, built around one idea, the *authority-swap*: a single per-entity, authoritative state-replication mechanism in which only the assignment of authority differs between modes. The same simulation therefore runs standalone, peer-to-peer and on a server with no fork in the game logic. It is being developed as a netcode library with a hosted demo.
 
-The simulation uses Bevy 0.20's ECS. The transport is WebRTC DataChannels only (matchbox in the browser, str0m natively; no media, no SFU), and the browser build is single-threaded WebAssembly. Game logic is meant to run as sandboxed Rhai scripts.
+The simulation uses Bevy 0.20's ECS. The transport is WebRTC DataChannels only (matchbox in the browser, str0m natively; no media, no SFU), and the browser build is single-threaded WebAssembly. Game logic runs as sandboxed Rhai scripts that steer the entities each peer owns.
 
 ## Status
 
 Implemented and tested natively:
 - the replication protocol, the two-channel transport and the scoped signaling service, with a shared Redis session registry;
 - the Mode-1 (standalone) and Mode-3 (server) runtimes;
-- content-addressed saves.
+- content-addressed saves;
+- Rhai-scripted entities: content bundles (a manifest with per-asset blake3 ids) load with every hash checked, and the sample game in `content/sample` runs unchanged in Modes 1, 2 and 3 (ADR-0045).
 
 In the browser, the client renders the shared simulation in both WebGPU and WebGL2 builds (3.4 MB each, brotli) and saves and reloads the world. `just browser-e2e` checks this in headless Chromium on every CI run: the first frame, a save → reload → load round trip through IndexedDB, and two tabs exchanging packets on both channels.
 
 Not built yet:
-- `scripting`: the Rhai engine is sandbox-tested, but no runtime uses it, so games cannot be scripted yet.
+- Scripting in the browser client: Rhai is linked in, but the client loads no content yet. The sandbox hardening (a wall-clock watchdog, per-frame budgets, size caps) is still to do.
 - `platform`: an 11-line stub.
 - The native client: a stub that prints its name.
 - Mode 2 end to end in a browser.
@@ -29,8 +30,8 @@ Measured on 2026-10-21 with Bevy 0.20 and Rust 1.99.1 (`just wasm`, and the `sli
 
 | What | Result |
 |---|---|
-| WebGL2 build | 16,381,550 bytes after wasm-opt, 3,452,507 bytes brotli |
-| WebGPU build | 16,452,790 bytes after wasm-opt, 3,473,869 bytes brotli |
+| WebGL2 build | 16,797,838 bytes after wasm-opt, 3,570,927 bytes brotli (Rhai is linked in since ADR-0045, +118 KB) |
+| WebGPU build | 16,866,946 bytes after wasm-opt, 3,599,800 bytes brotli (+126 KB) |
 | Size budget (8,000,000 bytes brotli per build) | pass, both builds |
 | State replication, 2 entities at ~20 Hz, native loopback | 879 to 918 B/s per peer over three runs (the pre-update tree measures 881 B/s) |
 | Round trip on the reliable channel, native loopback | 4.0 ms, 0.45 ms jitter (1 ms poll granularity) |
@@ -61,7 +62,7 @@ Modes 2 and 3 run identical systems and differ only in ownership data (ADR-0014)
 | `standalone`, `server` | The Mode-1 and Mode-3 runtimes. |
 | `client` | The browser client, built twice (WebGPU and WebGL2). |
 | `persistence` | Content-addressed saves (blake3 IDs) with in-memory, file and IndexedDB stores. |
-| `scripting` | A locked-down Rhai engine, sandbox-tested; no other crate depends on it yet. |
+| `scripting` | A locked-down Rhai engine, sandbox-tested; the `Agent` value scripts steer an entity through. |
 | `platform` | A placeholder for identity, billing, publishing and moderation. |
 
 ## Build, run and test
@@ -84,6 +85,7 @@ Running it:
 cargo run -p services        # signaling on port 3536 (UNIBLOX_SIGNALING_PORT; UNIBLOX_REDIS_URL for a shared registry)
 cargo run -p server          # Mode 3; joins UNIBLOX_SIGNALING_URL (default ws://127.0.0.1:3536/uniblox-demo)
 cargo run -p standalone      # Mode 1, headless
+UNIBLOX_BUNDLE=content/sample/manifest.json cargo run -p standalone   # the same, driven by the sample game's script (also for -p server)
 scripts/serve.sh             # serve dist/ (after `just wasm`) locally
 ```
 

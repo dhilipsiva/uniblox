@@ -3409,7 +3409,9 @@ name = "engine-core"
 version = "0.1.0"
 dependencies = [
  "bevy_ecs",
+ "log",
  "protocol",
+ "scripting",
 ]
 
 [[package]]
@@ -6069,6 +6071,7 @@ dependencies = [
  "blake3",
  "postcard",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -6876,6 +6879,8 @@ dependencies = [
  "matchbox_signaling",
  "protocol",
  "replication",
+ "scripting",
+ "standalone",
  "tokio",
  "transport",
 ]
@@ -7158,6 +7163,7 @@ dependencies = [
  "bevy_time",
  "engine-core",
  "protocol",
+ "scripting",
 ]
 
 [[package]]

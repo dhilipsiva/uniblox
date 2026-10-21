@@ -11,6 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod bundle;
 mod content;
 pub use content::{ContentId, ContentIdError, VersionTriple, content_id};
 

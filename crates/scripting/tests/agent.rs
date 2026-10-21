@@ -20,9 +20,10 @@ fn agent() -> Agent {
 /// A script steers: it reads the position and rewrites the velocity.
 #[test]
 fn velocity_is_scriptable() {
-    let mut engine =
-        ScriptEngine::from_source("fn update(a) { if a.x > 10.0 && a.vx > 0.0 { a.vx = -a.vx; } a }")
-            .unwrap();
+    let mut engine = ScriptEngine::from_source(
+        "fn update(a) { if a.x > 10.0 && a.vx > 0.0 { a.vx = -a.vx; } a }",
+    )
+    .unwrap();
     let out = engine.update_agent(agent()).unwrap();
     assert_eq!(out.vx, -2.0);
     assert_eq!(out.vy, 0.5);

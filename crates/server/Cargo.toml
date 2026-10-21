@@ -11,6 +11,8 @@ description = "The uniblox Mode-3 runtime: the headless authoritative server tha
 [dependencies]
 protocol = { path = "../protocol", version = "0.1.0" }
 engine-core = { path = "../engine-core", version = "0.1.0" }
+# Content scripts (ADR-0045).
+scripting = { path = "../scripting", version = "0.1.0" }
 replication = { path = "../replication", version = "0.1.0" }
 transport = { path = "../transport", version = "0.1.0" }
 bevy_app.workspace = true
@@ -20,6 +22,8 @@ futures.workspace = true
 log.workspace = true
 
 [dev-dependencies]
+# scripted_modes.rs runs Mode 1 on the real standalone app (ADR-0045).
+standalone = { path = "../standalone", version = "0.1.0" }
 # headless-app tests embed an in-process signaling server + a raw test client
 matchbox_signaling.workspace = true
 tokio = { workspace = true, features = ["time"] }

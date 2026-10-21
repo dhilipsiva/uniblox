@@ -330,6 +330,9 @@ bullets. Remaining Phase-5: the Mode-2 coordinator peer service.
 - **STUN-only connection success rate** — real-network peers (Phase-2 telemetry bullet).
 
 ## Next
+- **Scripting follow-ups (ADR-0045 landed the Rhai-driven entities and bundles):** load content in the
+  browser client for the hosted demo; the Phase-12 sandbox hardening (size caps, a wall-clock watchdog,
+  per-frame budgets).
 - **Phase 5:** the Mode-2 coordinator peer service (MIXED: the election logic needs human review), then the
   deferred registry work (atomic updates, TTL crash cleanup, autoscaling, rate limiting and authentication).
 - **Phase 2 residual:** real-network STUN-only success rate and RTT/jitter, once peers run on real networks.

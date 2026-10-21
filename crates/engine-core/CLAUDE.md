@@ -48,6 +48,11 @@ the server `FixedUpdate` after `simulate`. `interaction_decider = min(owner)` is
 SHARED outcome (recorded once) — a future consumer must only write entities IT owns or emit an event (never a
 cross-owner write). Coarse = positional overlap, not frame-perfect (precise → Mode 3). netcode-audited → MERGE.
 
+**Scripted entities (ADR-0045):** `Scripted` (local marker, not on the wire) + `run_entity_scripts` (owner-only
+via `authority_of`, velocity-only via `set_if_neq`, non-finite results refused, a no-op without a `ScriptEngine`;
+schedule it BEFORE `simulate`) + `enable_scripts` (inserts the engine, marks every owned entity that has no
+`ControlledBy`). A receiver never runs another peer's script.
+
 ## Crate-local invariants
 - **The SAME systems run in all three modes; only authority assignment differs.**
   There must be a single `authority_of(entity)` decision point and **no

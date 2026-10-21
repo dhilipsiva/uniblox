@@ -8,7 +8,9 @@ limits; the thin custom ECS bridge.
 ## Status
 Implemented (initial bridge). `ScriptEngine` — a locked-down `Engine::new_raw()` + all `set_max_*` limits +
 `disable_symbol("eval")` — held as a Bevy **NonSend** resource (ADR-0011), mutating a whitelisted `Health`
-component per tick via `run_scripts`; in-memory + native file-mtime hot-reload. rhai 1.25 (non-sync,
+component per tick via `run_scripts`; in-memory + native file-mtime hot-reload. **ADR-0045:** the `Agent` value (`x`/`y`/`contacts`/`tick` read-only, `vx`/`vy`
+read-write) and `update_agent`, which `engine_core::run_entity_scripts` calls for each owned `Scripted` entity;
+unary minus for FLOAT registered (the raw engine lacks it). rhai 1.25 (non-sync,
 `default-features=false`) + bevy_ecs 0.20. Sandbox-audited; compiles for wasm32.
 **Full hardening (wall-clock watchdog, adversarial matrix, per-frame op budget, source-size cap,
 `unchecked`/`internals` CI assertion) is Phase 12.**

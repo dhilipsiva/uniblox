@@ -7,6 +7,7 @@ use std::time::SystemTime;
 use rhai::packages::Package;
 use rhai::{AST, Engine, EvalAltResult, Scope};
 
+use crate::agent::{Agent, register_agent};
 use crate::component::{Health, register_api};
 use crate::error::ScriptError;
 
@@ -113,6 +114,23 @@ impl ScriptEngine {
         scope.rewind(*scope_template_len);
         out
     }
+
+    /// Run the script's `update(agent)` once for one scripted entity (ADR-0045). Like
+    /// [`Self::update_component`]: the agent goes in by value, the returned copy comes back, and the
+    /// `Scope` is rewound so nothing leaks between entities or ticks. A script that returns anything
+    /// other than an `Agent` is an error.
+    pub fn update_agent(&mut self, a: Agent) -> Result<Agent, Box<EvalAltResult>> {
+        let ScriptEngine {
+            engine,
+            ast,
+            scope,
+            scope_template_len,
+            ..
+        } = self;
+        let out = engine.call_fn::<Agent>(scope, ast, "update", (a,));
+        scope.rewind(*scope_template_len);
+        out
+    }
 }
 
 /// Build the locked-down raw engine: nothing by default, an explicit whitelist,
@@ -142,5 +160,6 @@ fn build_engine() -> Engine {
     engine.set_allow_anonymous_fn(false); // thin scripts; no closures for now
 
     register_api(&mut engine);
+    register_agent(&mut engine);
     engine
 }

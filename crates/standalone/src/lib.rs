@@ -24,8 +24,8 @@ use bevy_app::{App, FixedUpdate, ScheduleRunnerPlugin, TaskPoolPlugin};
 use bevy_ecs::prelude::*;
 use bevy_time::{Fixed, Time, TimePlugin};
 use engine_core::{
-    Position, SimDt, Velocity, advance_tick, insert_sim, resolve_interactions, simulate,
-    spawn_owned,
+    Position, SimDt, Velocity, advance_tick, insert_sim, resolve_interactions, run_entity_scripts,
+    simulate, spawn_owned,
 };
 use protocol::PeerId;
 
@@ -45,11 +45,20 @@ fn sync_sim_dt(time: Res<Time>, mut dt: ResMut<SimDt>) {
 /// reused by the browser-playable client (Item A2): the SAME engine-core systems
 /// the server runs, minus the server-only pieces (`count_tick`, `apply_input`)
 /// and minus `net_pump`. Order matches the server: dt → tick → simulate →
-/// interactions.
+/// interactions, with the content's scripts just before simulate.
 pub fn add_sim_systems(app: &mut App) {
     app.add_systems(
         FixedUpdate,
-        (sync_sim_dt, advance_tick, simulate, resolve_interactions).chain(),
+        (
+            sync_sim_dt,
+            advance_tick,
+            // Content scripts steer owned entities before simulate integrates them (ADR-0045);
+            // a no-op until content is loaded.
+            run_entity_scripts,
+            simulate,
+            resolve_interactions,
+        )
+            .chain(),
     );
 }
 
@@ -87,6 +96,18 @@ pub fn build_standalone_app(local: PeerId, entity_count: usize) -> App {
 
     add_sim_systems(&mut app);
     app
+}
+
+/// Load a content bundle (ADR-0045) from the manifest at `manifest`: verify it, compile its entry
+/// script, and hand every entity this peer owns to the script ([`engine_core::enable_scripts`]).
+/// Native only: it reads the bundle from disk (the browser client embeds or fetches its content).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_content(app: &mut App, manifest: &std::path::Path) -> Result<(), String> {
+    let bundle = protocol::bundle::load_bundle_dir(manifest).map_err(|e| e.to_string())?;
+    let engine =
+        scripting::ScriptEngine::from_source(&bundle.entry_source).map_err(|e| e.to_string())?;
+    engine_core::enable_scripts(app.world_mut(), engine);
+    Ok(())
 }
 
 #[cfg(test)]

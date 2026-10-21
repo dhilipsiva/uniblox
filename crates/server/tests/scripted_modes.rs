@@ -39,7 +39,10 @@ fn demo_spawns() -> Vec<(Position, Velocity)> {
     (0..3)
         .map(|i| {
             let i = i as f32;
-            (Position { x: 0.0, y: 2.0 * i }, Velocity { x: 2.0, y: 0.5 * i })
+            (
+                Position { x: 0.0, y: 2.0 * i },
+                Velocity { x: 2.0, y: 0.5 * i },
+            )
         })
         .collect()
 }
@@ -84,8 +87,9 @@ struct Participant {
 }
 
 /// Modes 2 and 3: the mode_proof harness with the script system added. `owners[i]` is the peer that
-/// spawns (and owns) demo entity i. Returns the participants after TICKS identical rounds.
-fn networked(ids: &[u64], owners: &[u64]) -> Vec<Participant> {
+/// spawns (and owns) demo entity i. Returns the participants after TICKS identical rounds, and for
+/// each demo entity, in spawn order, its owner's index in the participant list and its entity there.
+fn networked(ids: &[u64], owners: &[u64]) -> (Vec<Participant>, Vec<(usize, Entity)>) {
     let engine_src = {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content/sample/manifest.json");
         load_bundle_dir(&path).unwrap().entry_source
@@ -106,12 +110,17 @@ fn networked(ids: &[u64], owners: &[u64]) -> Vec<Participant> {
             }
         })
         .collect();
+    let mut spawned = Vec::new();
     for ((pos, vel), &owner) in demo_spawns().into_iter().zip(owners) {
-        let p = ps.iter_mut().find(|p| p.id == PeerId(owner)).unwrap();
-        spawn_owned(&mut p.world, p.id, pos, vel);
+        let i = ps.iter().position(|p| p.id == PeerId(owner)).unwrap();
+        let p = &mut ps[i];
+        spawned.push((i, spawn_owned(&mut p.world, p.id, pos, vel)));
     }
     for p in ps.iter_mut() {
-        enable_scripts(&mut p.world, ScriptEngine::from_source(&engine_src).unwrap());
+        enable_scripts(
+            &mut p.world,
+            ScriptEngine::from_source(&engine_src).unwrap(),
+        );
     }
     let all: Vec<PeerId> = ps.iter().map(|p| p.id).collect();
     for p in ps.iter_mut() {
@@ -146,10 +155,18 @@ fn networked(ids: &[u64], owners: &[u64]) -> Vec<Participant> {
             }
         }
     }
-    ps
+    (ps, spawned)
 }
 
-/// An owner's entities in spawn order (the order its demo entities were spawned on it).
+/// Each demo entity's authoritative position, read on its owner, in spawn order.
+fn truth(ps: &[Participant], spawned: &[(usize, Entity)]) -> Vec<Position> {
+    spawned
+        .iter()
+        .map(|&(i, e)| *ps[i].world.get::<Position>(e).unwrap())
+        .collect()
+}
+
+/// The positions of the entities a participant owns (any order).
 fn owned_positions(p: &mut Participant) -> Vec<Position> {
     let mut q = p.world.query::<(Entity, &Owner, &Position)>();
     let mut v: Vec<(Entity, Position)> = q
@@ -196,22 +213,24 @@ fn the_sample_game_runs_unchanged_in_all_three_modes() {
     assert_in_arena("mode 1", &m1);
 
     // Mode 2: peer 1 owns entities 0 and 1, peer 2 owns entity 2.
-    let mut m2 = networked(&[1, 2], &[1, 1, 2]);
-    let m2_truth: Vec<Position> = {
-        let mut a = owned_positions(&mut m2[0]);
-        a.extend(owned_positions(&mut m2[1]));
-        a
-    };
-    assert_eq!(m2_truth, m1, "mode 2 owners compute exactly what mode 1 computes");
+    let (mut m2, spawned) = networked(&[1, 2], &[1, 1, 2]);
+    let m2_truth = truth(&m2, &spawned);
+    assert_eq!(
+        m2_truth, m1,
+        "mode 2 owners compute exactly what mode 1 computes"
+    );
     for p in m2.iter_mut() {
         let replicas = all_positions(p);
         assert_converged("mode 2", &replicas, &m2_truth);
     }
 
     // Mode 3: server 0 owns all three; clients 1 and 2 only apply.
-    let mut m3 = networked(&[0, 1, 2], &[0, 0, 0]);
-    let m3_truth = owned_positions(&mut m3[0]);
-    assert_eq!(m3_truth, m1, "the mode 3 server computes exactly what mode 1 computes");
+    let (mut m3, spawned) = networked(&[0, 1, 2], &[0, 0, 0]);
+    let m3_truth = truth(&m3, &spawned);
+    assert_eq!(
+        m3_truth, m1,
+        "the mode 3 server computes exactly what mode 1 computes"
+    );
     for p in m3.iter_mut().skip(1) {
         assert!(owned_positions(p).is_empty(), "mode 3 clients own nothing");
         let replicas = all_positions(p);

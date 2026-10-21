@@ -17,7 +17,9 @@
 use std::collections::{HashMap, VecDeque};
 
 use bevy_ecs::prelude::*;
+use bevy_ecs::system::NonSendMut;
 use protocol::{PeerId, dequantize, quantize};
+use scripting::{Agent, ScriptEngine};
 
 /// 2D position, in world units. Plain `f32` fields (not a math-lib type): the
 /// replication quantizer (fixed-point positions, later in Phase 1) walks these
@@ -308,6 +310,76 @@ pub fn resolve_interactions(
             contacts.0 += 1;
         }
     }
+}
+
+/// Marks an entity whose behaviour the content's script drives (ADR-0045). Content-authored and
+/// LOCAL, like [`Interactable`]: it is not on the wire, and a receiver never runs another peer's
+/// script whether or not its proxy carries the marker.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Scripted;
+
+/// Script-driven entity logic (ADR-0045): for every [`Scripted`] entity THIS peer owns
+/// (`authority_of == Local`), run the content's `update(agent)` and write back the velocity it
+/// returns. Only the authority runs a script, so peers never need identical floats (receivers apply
+/// the replicated result, as for every owned datum); position stays [`simulate`]'s to integrate, so
+/// schedule this BEFORE `simulate`. Without a script engine (no content loaded) this is a no-op. A
+/// script error logs a warning and leaves the entity unchanged; an unchanged velocity is not written,
+/// so it does not trigger replication.
+pub fn run_entity_scripts(
+    engine: Option<NonSendMut<ScriptEngine>>,
+    local: Res<LocalPeer>,
+    tick: Res<Tick>,
+    mut q: Query<(&Owner, &Position, &mut Velocity, Option<&Contacts>), With<Scripted>>,
+) {
+    let Some(mut engine) = engine else {
+        return;
+    };
+    for (owner, pos, mut vel, contacts) in &mut q {
+        if authority_of(owner.0, local.0) != Authority::Local {
+            continue;
+        }
+        let agent = Agent {
+            x: f64::from(pos.x),
+            y: f64::from(pos.y),
+            vx: f64::from(vel.x),
+            vy: f64::from(vel.y),
+            contacts: i64::from(contacts.map_or(0, |c| c.0)),
+            tick: i64::try_from(tick.0).unwrap_or(i64::MAX),
+        };
+        match engine.update_agent(agent) {
+            Ok(next) => {
+                // Narrowing to f32 is the engine's precision; NaN and infinities are refused so a
+                // script cannot poison the simulation or the quantizer.
+                let next_vel = Velocity {
+                    x: next.vx as f32,
+                    y: next.vy as f32,
+                };
+                if next_vel.x.is_finite() && next_vel.y.is_finite() {
+                    vel.set_if_neq(next_vel);
+                } else {
+                    log::warn!("script returned a non-finite velocity; ignored");
+                }
+            }
+            Err(err) => log::warn!("entity script skipped: {err}"),
+        }
+    }
+}
+
+/// Load content for this peer (ADR-0045): insert the script engine and mark every entity this peer
+/// owns that no player controls ([`ControlledBy`]) as [`Scripted`]. Entities spawned later (or
+/// received as replicas) are not marked; content marks its own spawns.
+pub fn enable_scripts(world: &mut World, engine: ScriptEngine) {
+    let local = world.resource::<LocalPeer>().0;
+    let mut q = world.query_filtered::<(Entity, &Owner), Without<ControlledBy>>();
+    let owned: Vec<Entity> = q
+        .iter(world)
+        .filter(|(_, owner)| authority_of(owner.0, local) == Authority::Local)
+        .map(|(e, _)| e)
+        .collect();
+    for e in owned {
+        world.entity_mut(e).insert(Scripted);
+    }
+    scripting::insert_scripting(world, engine);
 }
 
 /// Advance the authoritative sim tick once per sim step (ADR-0022). The server

@@ -6,7 +6,7 @@
 
 use bevy_ecs::prelude::*;
 use engine_core::{
-    Contacts, Owner, Position, Scripted, Velocity, enable_scripts, insert_sim, run_entity_scripts,
+    Contacts, Position, Scripted, Velocity, enable_scripts, insert_sim, run_entity_scripts,
     simulate, spawn_owned,
 };
 use protocol::PeerId;
@@ -26,7 +26,12 @@ fn world_with(engine: Option<ScriptEngine>) -> World {
 }
 
 fn spawn(world: &mut World, owner: PeerId, scripted: bool) -> Entity {
-    let e = spawn_owned(world, owner, Position { x: 0.0, y: 0.0 }, Velocity { x: 1.0, y: 0.0 });
+    let e = spawn_owned(
+        world,
+        owner,
+        Position { x: 0.0, y: 0.0 },
+        Velocity { x: 1.0, y: 0.0 },
+    );
     if scripted {
         world.entity_mut(e).insert(Scripted);
     }
@@ -47,7 +52,11 @@ fn scripts_run_only_for_owned_scripted_entities() {
     let remote_scripted = spawn(&mut world, OTHER, true);
     run(&mut world);
     assert_eq!(world.get::<Velocity>(owned_scripted).unwrap().x, 5.0);
-    assert_eq!(world.get::<Velocity>(owned_plain).unwrap().x, 1.0, "not Scripted");
+    assert_eq!(
+        world.get::<Velocity>(owned_plain).unwrap().x,
+        1.0,
+        "not Scripted"
+    );
     assert_eq!(
         world.get::<Velocity>(remote_scripted).unwrap().x,
         1.0,
@@ -75,7 +84,9 @@ fn the_script_steers_and_simulate_integrates() {
 
 #[test]
 fn an_unchanged_velocity_is_not_marked_changed() {
-    let mut world = world_with(Some(ScriptEngine::from_source("fn update(a) { a }").unwrap()));
+    let mut world = world_with(Some(
+        ScriptEngine::from_source("fn update(a) { a }").unwrap(),
+    ));
     let e = spawn(&mut world, LOCAL, true);
     world.clear_trackers();
     run(&mut world);
@@ -102,8 +113,14 @@ fn a_failing_script_leaves_the_entity_unchanged() {
     let mut world = world_with(Some(engine));
     let e = spawn(&mut world, LOCAL, true);
     run(&mut world);
-    assert_eq!(*world.get::<Velocity>(e).unwrap(), Velocity { x: 1.0, y: 0.0 });
-    assert_eq!(*world.get::<Position>(e).unwrap(), Position { x: 0.0, y: 0.0 });
+    assert_eq!(
+        *world.get::<Velocity>(e).unwrap(),
+        Velocity { x: 1.0, y: 0.0 }
+    );
+    assert_eq!(
+        *world.get::<Position>(e).unwrap(),
+        Position { x: 0.0, y: 0.0 }
+    );
 }
 
 #[test]
@@ -113,7 +130,10 @@ fn enable_scripts_marks_the_owned_entities_and_inserts_the_engine() {
     let remote = spawn(&mut world, OTHER, false);
     enable_scripts(&mut world, ScriptEngine::from_source(SET_VX).unwrap());
     assert!(world.get::<Scripted>(owned).is_some());
-    assert!(world.get::<Scripted>(remote).is_none(), "only entities this peer owns");
+    assert!(
+        world.get::<Scripted>(remote).is_none(),
+        "only entities this peer owns"
+    );
     run(&mut world);
     assert_eq!(world.get::<Velocity>(owned).unwrap().x, 5.0);
 }

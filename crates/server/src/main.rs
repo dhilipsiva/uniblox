@@ -2,7 +2,8 @@
 //! runs the headless fixed-tick App (see lib.rs / ADR-0014).
 //!
 //! Env: `UNIBLOX_SIGNALING_URL` (default `ws://127.0.0.1:3536/uniblox-demo`),
-//! `UNIBLOX_SERVER_ENTITIES` (default 2).
+//! `UNIBLOX_SERVER_ENTITIES` (default 2), `UNIBLOX_BUNDLE` (optional: a content bundle's manifest,
+//! whose script then drives the server-owned entities, ADR-0045).
 
 use std::time::{Duration, Instant};
 
@@ -51,7 +52,15 @@ fn main() {
     let local = PeerId::from_uuid_bytes(*uuid.0.as_bytes());
     println!("[server] up as {local:?}; owning {entities} entities; fixed tick 64 Hz");
 
-    match build_server_app(transport, local, entities).run() {
+    let mut app = build_server_app(transport, local, entities);
+    if let Ok(manifest) = std::env::var("UNIBLOX_BUNDLE") {
+        if let Err(err) = server::load_content(&mut app, std::path::Path::new(&manifest)) {
+            eprintln!("[server] cannot load the bundle {manifest}: {err}");
+            std::process::exit(1);
+        }
+        println!("[server] content loaded from {manifest}");
+    }
+    match app.run() {
         AppExit::Success => {}
         AppExit::Error(code) => std::process::exit(code.get() as i32),
     }
