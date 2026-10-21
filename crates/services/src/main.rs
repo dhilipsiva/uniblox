@@ -50,6 +50,36 @@ fn flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| v == "1")
 }
 
+/// Logging: `RUST_LOG`-filtered (default `warn`), as text, or as JSON lines with
+/// `UNIBLOX_LOG_FORMAT=json` (ADR-0052). In JSON mode tracing events reach the JSON logger through
+/// tracing's `log` bridge.
+fn init_logging() {
+    if std::env::var("UNIBLOX_LOG_FORMAT").is_ok_and(|v| v == "json") {
+        use std::io::Write;
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+            .format(|buf, record| {
+                let line = serde_json::json!({
+                    "ts_ms": std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_millis() as u64),
+                    "level": record.level().as_str(),
+                    "target": record.target(),
+                    "msg": record.args().to_string(),
+                });
+                writeln!(buf, "{line}")
+            })
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+            )
+            .init();
+    }
+}
+
 /// The join-token key from `UNIBLOX_SIGNALING_SECRET` (raw bytes, UTF-8 or not), or exit with the
 /// reason.
 fn key_from_env() -> Option<JoinTokenKey> {
@@ -70,7 +100,7 @@ fn env_number<T: std::str::FromStr + Default + PartialEq>(name: &str) -> Option<
     match value.parse::<T>() {
         Ok(n) if n != T::default() => Some(n),
         _ => {
-            eprintln!("[signaling] {name} must be a positive whole number");
+            tracing::error!("{name} must be a positive whole number");
             std::process::exit(2);
         }
     }
@@ -82,7 +112,7 @@ fn turn_from_env() -> Option<TurnConfig> {
     let secret = std::env::var_os("UNIBLOX_TURN_SECRET")?;
     if secret.len() < MIN_KEY_BYTES {
         // Anyone holding one credential can guess a weak shared secret offline.
-        eprintln!("[signaling] UNIBLOX_TURN_SECRET must be at least {MIN_KEY_BYTES} bytes");
+        tracing::error!("UNIBLOX_TURN_SECRET must be at least {MIN_KEY_BYTES} bytes");
         std::process::exit(2);
     }
     let urls: Vec<String> = std::env::var("UNIBLOX_TURN_URLS")
@@ -93,9 +123,7 @@ fn turn_from_env() -> Option<TurnConfig> {
         .map(str::to_string)
         .collect();
     if urls.is_empty() {
-        eprintln!(
-            "[signaling] UNIBLOX_TURN_SECRET needs UNIBLOX_TURN_URLS (comma-separated turn: URLs)"
-        );
+        tracing::error!("UNIBLOX_TURN_SECRET needs UNIBLOX_TURN_URLS (comma-separated turn: URLs)");
         std::process::exit(2);
     }
     if let Some(bad) = urls.iter().find(|u| {
@@ -103,7 +131,7 @@ fn turn_from_env() -> Option<TurnConfig> {
             .iter()
             .any(|s| u.starts_with(s))
     }) {
-        eprintln!("[signaling] UNIBLOX_TURN_URLS: {bad:?} is not a turn:, turns: or stun: URL");
+        tracing::error!("UNIBLOX_TURN_URLS: {bad:?} is not a turn:, turns: or stun: URL");
         std::process::exit(2);
     }
     let ttl = match std::env::var("UNIBLOX_TURN_TTL_SECS")
@@ -113,8 +141,8 @@ fn turn_from_env() -> Option<TurnConfig> {
         None => 3600,
         Some(Ok(secs)) if (1..=MAX_TURN_TTL_SECS).contains(&secs) => secs,
         Some(_) => {
-            eprintln!(
-                "[signaling] UNIBLOX_TURN_TTL_SECS must be a whole number from 1 to {MAX_TURN_TTL_SECS}"
+            tracing::error!(
+                "UNIBLOX_TURN_TTL_SECS must be a whole number from 1 to {MAX_TURN_TTL_SECS}"
             );
             std::process::exit(2);
         }
@@ -163,23 +191,15 @@ async fn main() {
         mint_token(&args[1..]);
     }
 
-    // RUST_LOG-controlled tracing (e.g. RUST_LOG=matchbox_signaling=debug).
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .init();
+    init_logging();
 
     let auth = key_from_env();
     if auth.is_none() {
         if flag("UNIBLOX_SIGNALING_INSECURE") {
-            eprintln!(
-                "[signaling] WARNING: no UNIBLOX_SIGNALING_SECRET; the gate is OPEN (development only)"
-            );
+            tracing::warn!("no UNIBLOX_SIGNALING_SECRET; the gate is OPEN (development only)");
         } else {
-            eprintln!(
-                "[signaling] refusing to start without UNIBLOX_SIGNALING_SECRET (at least 32 bytes); \
+            tracing::error!(
+                "refusing to start without UNIBLOX_SIGNALING_SECRET (at least 32 bytes); \
                  set UNIBLOX_SIGNALING_INSECURE=1 to run an open server for local development"
             );
             std::process::exit(2);
@@ -187,7 +207,7 @@ async fn main() {
     }
     let issue_tokens = flag("UNIBLOX_ISSUE_TOKENS");
     if issue_tokens && auth.is_none() {
-        eprintln!("[signaling] UNIBLOX_ISSUE_TOKENS=1 needs UNIBLOX_SIGNALING_SECRET");
+        tracing::error!("UNIBLOX_ISSUE_TOKENS=1 needs UNIBLOX_SIGNALING_SECRET");
         std::process::exit(2);
     }
     let client_ip = match std::env::var("UNIBLOX_TRUST_FORWARDED_FOR").ok() {
@@ -195,8 +215,8 @@ async fn main() {
         Some(v) => match v.parse::<usize>() {
             Ok(hops) if hops >= 1 => ClientIp::ForwardedFor(hops),
             _ => {
-                eprintln!(
-                    "[signaling] UNIBLOX_TRUST_FORWARDED_FOR must be the number of trusted proxies (>= 1)"
+                tracing::error!(
+                    "UNIBLOX_TRUST_FORWARDED_FOR must be the number of trusted proxies (>= 1)"
                 );
                 std::process::exit(2);
             }
@@ -205,15 +225,15 @@ async fn main() {
     let turn = turn_from_env();
     if turn.is_some() && issue_tokens && !flag("UNIBLOX_TURN_FOR_OPEN_TOKENS") {
         // The open token endpoint admits anyone, so TURN behind it is an open relay.
-        eprintln!(
-            "[signaling] TURN with UNIBLOX_ISSUE_TOKENS=1 is an open relay (anyone can get a token); \
+        tracing::error!(
+            "TURN with UNIBLOX_ISSUE_TOKENS=1 is an open relay (anyone can get a token); \
              set UNIBLOX_TURN_FOR_OPEN_TOKENS=1 to accept that (and cap it with coturn's quotas)"
         );
         std::process::exit(2);
     }
     if turn.is_some() && auth.is_none() {
-        eprintln!(
-            "[signaling] UNIBLOX_TURN_SECRET needs UNIBLOX_SIGNALING_SECRET (credentials go to authenticated clients only)"
+        tracing::error!(
+            "UNIBLOX_TURN_SECRET needs UNIBLOX_SIGNALING_SECRET (credentials go to authenticated clients only)"
         );
         std::process::exit(2);
     }
@@ -250,7 +270,7 @@ async fn main() {
                 SessionRegistry::with_store(Arc::new(store), node_id)
             }
             Err(err) => {
-                eprintln!("[signaling] cannot connect to UNIBLOX_REDIS_URL ({url}): {err}");
+                tracing::error!("cannot connect to UNIBLOX_REDIS_URL ({url}): {err}");
                 std::process::exit(1);
             }
         },
@@ -261,8 +281,9 @@ async fn main() {
     println!(
         "[signaling] uniblox scoped signaling on ws://{addr}/<mode>~<content>.<schema>~<min>~<lobby>?engine=N[&next=N]"
     );
+    tracing::info!("signaling listening on {addr} (/healthz, /metrics)");
     if let Err(err) = server.serve().await {
-        eprintln!("[signaling] server error: {err}");
+        tracing::error!("server error: {err}");
         std::process::exit(1);
     }
 }

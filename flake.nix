@@ -43,8 +43,39 @@
             (builtins.fromTOML (builtins.readFile ./Cargo.lock)).package
           ).version;
         wasmBindgenCli = pkgs.wasm-bindgen-cli_0_2_129;
+
+        # Deployable binaries (ADR-0052): the Mode-3 server and the signaling service, built with the
+        # pinned toolchain from Cargo.lock (no git sources, so cargoLock needs no output hashes). Only
+        # what cargo reads goes into the source.
+        rustPlatform = pkgs.makeRustPlatform {
+          cargo = rustToolchain;
+          rustc = rustToolchain;
+        };
+        uniblox = rustPlatform.buildRustPackage {
+          pname = "uniblox";
+          version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
+          src = nixpkgs.lib.fileset.toSource {
+            root = ./.;
+            fileset = nixpkgs.lib.fileset.unions [
+              ./Cargo.toml
+              ./Cargo.lock
+              ./crates
+            ];
+          };
+          cargoLock.lockFile = ./Cargo.lock;
+          cargoBuildFlags = [
+            "-p"
+            "server"
+            "-p"
+            "services"
+          ];
+          # The tests run in `just ci`; here only the two binaries are built.
+          doCheck = false;
+          meta.mainProgram = "server";
+        };
       in
-      nixpkgs.lib.recursiveUpdate
+      # The per-system outputs, merged: the shells, the packages, and the Linux-only shell and images.
+      nixpkgs.lib.foldl' nixpkgs.lib.recursiveUpdate { } [
         {
           devShells.default =
             assert pkgs.lib.assertMsg (wasmBindgenCli.version == lockedWasmBindgen)
@@ -75,7 +106,40 @@
               '';
             };
         }
-        # Linux only: nixpkgs builds Chromium for Linux alone.
+        {
+          # `nix build .#server`: both binaries (`bin/server`, the Mode-3 server; `bin/services`, the
+          # signaling service).
+          packages.uniblox = uniblox;
+          packages.server = uniblox;
+          packages.default = uniblox;
+        }
+        # Linux only: nixpkgs builds Chromium for Linux alone, and the images are Linux images.
+        (
+          nixpkgs.lib.optionalAttrs (nixpkgs.lib.hasSuffix "-linux" system) {
+            # OCI images (ADR-0052): `nix build .#server-image && docker load < result`.
+            packages.server-image = pkgs.dockerTools.buildLayeredImage {
+              name = "uniblox-server";
+              tag = uniblox.version;
+              config = {
+                Entrypoint = [ "${uniblox}/bin/server" ];
+                Env = [
+                  "UNIBLOX_SERVER_HTTP_PORT=9100"
+                  "UNIBLOX_LOG_FORMAT=json"
+                ];
+                ExposedPorts."9100/tcp" = { };
+              };
+            };
+            packages.services-image = pkgs.dockerTools.buildLayeredImage {
+              name = "uniblox-services";
+              tag = uniblox.version;
+              config = {
+                Entrypoint = [ "${uniblox}/bin/services" ];
+                Env = [ "UNIBLOX_LOG_FORMAT=json" ];
+                ExposedPorts."3536/tcp" = { };
+              };
+            };
+          }
+        )
         (
           # On the system string, so listing shells never imports nixpkgs for another system.
           nixpkgs.lib.optionalAttrs (nixpkgs.lib.hasSuffix "-linux" system) {
@@ -93,5 +157,6 @@
             };
           }
         )
+      ]
     );
 }

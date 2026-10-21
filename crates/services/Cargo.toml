@@ -18,6 +18,7 @@ uuid.workspace = true                      # per-node id for the shared registry
 tracing.workspace = true                   # best-effort store-mirror failure logs (ADR-0040)
 tokio = { workspace = true, features = ["time", "net", "sync"] }  # the store-mirror timeout (ADR-0040); the server, its queues and timers (ADR-0047)
 tracing-subscriber.workspace = true
+env_logger.workspace = true                 # JSON-lines logs (ADR-0052)
 hmac.workspace = true                      # join tokens (ADR-0047)
 sha2.workspace = true
 sha1.workspace = true                      # TURN credentials (ADR-0050)

@@ -48,6 +48,18 @@ script-cost:
 stack-check:
     cargo run --locked --release -p scripting --example stack_check -- 1024
 
+# The measured inputs of the Mode-3 per-session cost model (docs/cost-model.md, ADR-0052): a real
+# server process per session with 1, 4 and 8 clients. Release build; Linux (it reads /proc).
+session-cost:
+    cargo build --locked --release -p server --bin server --example session_cost
+    "${CARGO_TARGET_DIR:-target}/release/examples/session_cost"
+
+# The deployable binaries and their OCI images (ADR-0052); `docker load < result` loads an image.
+images:
+    nix build .#server
+    nix build .#server-image -o result-server-image
+    nix build .#services-image -o result-services-image
+
 # Mode 1 stays free of the networking stack (ADR-0030).
 net-free:
     scripts/check-net-free.sh

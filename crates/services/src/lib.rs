@@ -256,6 +256,9 @@ pub const TURN_PATH: &str = "/_uniblox/turn";
 /// The query parameter that carries a join token.
 pub const TOKEN_PARAM: &str = "token";
 
+/// Single-segment paths that are endpoints, not rooms (ADR-0052).
+pub const RESERVED_ROOMS: [&str; 2] = ["healthz", "metrics"];
+
 /// The longest room path accepted, in bytes.
 pub const MAX_ROOM_BYTES: usize = 256;
 
@@ -298,6 +301,10 @@ impl Default for SignalingConfig {
 pub fn validate_room(room: &str) -> Result<(), String> {
     if room.is_empty() {
         return Err("missing room".to_string());
+    }
+    // The operations endpoints (ADR-0052) share the single-segment path space.
+    if RESERVED_ROOMS.contains(&room) {
+        return Err(format!("{room:?} is reserved"));
     }
     if room.len() > MAX_ROOM_BYTES {
         return Err(format!("room longer than {MAX_ROOM_BYTES} bytes"));
@@ -569,6 +576,14 @@ impl SessionRegistry {
     /// Active sessions ON THIS NODE. See [`global_session_count`](Self::global_session_count).
     pub fn session_count(&self) -> usize {
         self.local.lock().map(|g| g.sessions.len()).unwrap_or(0)
+    }
+
+    /// Peers in all sessions ON THIS NODE.
+    pub fn local_peer_total(&self) -> usize {
+        self.local
+            .lock()
+            .map(|g| g.sessions.values().map(HashMap::len).sum())
+            .unwrap_or(0)
     }
 
     /// The SHARED registry's sessions across all nodes (from the store).

@@ -2179,3 +2179,39 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   environment-gated measurement.
 - **Status:** Accepted (2026-10-21) on branch `todo/P4-UNIBLOX-06`.
 
+## ADR-0052 — Mode 3 deployable: Nix packages and OCI images, health and metrics, idle teardown, JSON logs, a cost model
+- **Context:** the flake exposed only dev shells. A Mode-3 deployment needs:
+  - runnable artifacts;
+  - health and metrics endpoints for an orchestrator;
+  - sessions that do not run forever;
+  - logs a log pipeline can parse;
+  - a per-session cost the subscription price can be checked against.
+- **Decision — artifacts:**
+  - `nix build .#server` (also `.#uniblox`, the default) builds `bin/server` and `bin/services` with the pinned
+    toolchain from `Cargo.lock`, which has no git sources;
+  - on Linux, `.#server-image` and `.#services-image` are layered OCI images. Each holds only that binary
+    and its store closure; its entrypoint is the binary, with JSON logs and the server's metrics port set;
+  - `just images` builds all three.
+- **Decision — health and metrics:**
+  - the signaling service answers `/healthz` and Prometheus text at `/metrics`: open connections, sessions,
+    peers, dropped frames, refusals, and tokens and TURN credentials issued. `healthz` and `metrics` are
+    reserved room names;
+  - the server serves the same two paths on `UNIBLOX_SERVER_HTTP_PORT`: ticks, peers, entities, idle seconds.
+    It uses a minimal `std` HTTP responder on its own thread, so the Mode-3 binary carries no second web
+    stack.
+- **Decision — idle teardown:** the server exits cleanly once no client has been connected for
+  `UNIBLOX_IDLE_SHUTDOWN_SECS` (default 300; 0 = never), so an orchestrator reclaims the session.
+- **Decision — logs:** both binaries log to stderr, filtered by `RUST_LOG`, and as JSON lines
+  (`ts_ms`, `level`, `target`, `msg`) with `UNIBLOX_LOG_FORMAT=json`. The signaling service's tracing events
+  reach the JSON logger through tracing's `log` bridge, so no new crate enters the lock. The server now
+  installs a logger at all; before, its library logs went nowhere.
+- **Decision — the cost model:** `docs/cost-model.md` combines compute, egress and TURN per session-hour.
+  `just session-cost` measures its inputs with a real server process and replicating clients: about 1 % of a
+  core, 10–11 MiB and 3.6 KB/s per client at 8 entities, from 1 to 8 clients. That makes egress pricing, not
+  compute, the deciding cost on a hyperscaler.
+- **Consequences:** `services/tests/ops.rs` covers health, metrics that track a peer and a refusal, and the
+  reserved names. `server/tests/ops.rs` runs the real binary: `/healthz`, `/metrics`, a JSON log line, and a
+  clean exit when idle. `nix build .#server` and both images build. The Nix-built binaries answer both
+  endpoints on a local run.
+- **Status:** Accepted (2026-10-21) on branch `todo/P4-UNIBLOX-07`.
+

@@ -35,7 +35,10 @@ async fn get(addr: SocketAddr, path: &str) -> (u16, String) {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .expect("status line");
-    let body = text.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
+    let body = text
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_string())
+        .unwrap_or_default();
     (status, body)
 }
 
@@ -102,7 +105,11 @@ async fn a_refused_connection_is_counted() {
     // A malformed scope is refused at the gate.
     let _ = connect_async(format!("ws://{addr}/m9~bad~scope~x?engine=1")).await;
     let (_, body) = get(addr, "/metrics").await;
-    assert_eq!(metric(&body, "uniblox_signaling_refused_total"), Some(1.0), "{body}");
+    assert_eq!(
+        metric(&body, "uniblox_signaling_refused_total"),
+        Some(1.0),
+        "{body}"
+    );
 }
 
 #[test]

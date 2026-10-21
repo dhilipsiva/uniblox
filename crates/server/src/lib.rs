@@ -21,6 +21,8 @@
 //! - Exit: 0.19 buffered events are Messages — `AppExit` is written to
 //!   `Messages<AppExit>` (never `EventWriter`).
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bevy_app::{App, AppExit, FixedUpdate, ScheduleRunnerPlugin, TaskPoolPlugin, Update};
@@ -477,6 +479,152 @@ pub fn claim(world: &mut World, entity: Entity) -> bool {
     };
     world.insert_non_send(net);
     claimed
+}
+
+/// What the server exposes for operations (ADR-0052): read by the `/metrics` endpoint, written each
+/// frame by the system [`enable_ops`] adds.
+#[derive(Debug, Default)]
+pub struct OpsState {
+    pub ticks: AtomicU64,
+    pub peers: AtomicU64,
+    pub entities: AtomicU64,
+    /// Seconds without a connected client (whole seconds, for `/metrics`).
+    pub idle_secs: AtomicU64,
+}
+
+/// The shared [`OpsState`] and the idle-shutdown policy, as an App resource.
+#[derive(Resource)]
+struct Ops {
+    state: Arc<OpsState>,
+    /// Exit once no client has been connected for this long (`None` = never).
+    idle_shutdown: Option<Duration>,
+    idle: Duration,
+}
+
+/// Publish the operations state, and end the app once it has been idle too long (ADR-0052): with no
+/// client connected for `idle_shutdown`, the process exits cleanly so an orchestrator reclaims it.
+fn publish_ops(
+    mut ops: ResMut<Ops>,
+    time: Res<Time<Virtual>>,
+    ticks: Res<TickCount>,
+    net: Option<NonSend<Net>>,
+    entities: Query<(), With<engine_core::Owner>>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    let peers = net.map_or(0, |net| net.transport.connected_peers().count());
+    ops.state.ticks.store(ticks.0, Ordering::Relaxed);
+    ops.state.peers.store(peers as u64, Ordering::Relaxed);
+    ops.state
+        .entities
+        .store(entities.iter().count() as u64, Ordering::Relaxed);
+    if peers == 0 {
+        ops.idle += time.delta();
+    } else {
+        ops.idle = Duration::ZERO;
+    }
+    ops.state
+        .idle_secs
+        .store(ops.idle.as_secs(), Ordering::Relaxed);
+    if let Some(after) = ops.idle_shutdown
+        && ops.idle >= after
+    {
+        log::info!(
+            "[server] idle for {:?} with no client: shutting down",
+            ops.idle
+        );
+        exit.write(AppExit::Success);
+    }
+}
+
+/// Add the operations systems (ADR-0052) and return the state the `/metrics` endpoint reads.
+pub fn enable_ops(app: &mut App, idle_shutdown: Option<Duration>) -> Arc<OpsState> {
+    let state = Arc::new(OpsState::default());
+    app.insert_resource(Ops {
+        state: Arc::clone(&state),
+        idle_shutdown,
+        idle: Duration::ZERO,
+    });
+    app.add_systems(Update, publish_ops.after(net_pump));
+    state
+}
+
+/// The `/metrics` body: Prometheus text.
+pub fn render_metrics(state: &OpsState) -> String {
+    let rows = [
+        (
+            "uniblox_server_ticks_total",
+            "counter",
+            "Fixed ticks simulated.",
+            state.ticks.load(Ordering::Relaxed),
+        ),
+        (
+            "uniblox_server_peers",
+            "gauge",
+            "Connected peers.",
+            state.peers.load(Ordering::Relaxed),
+        ),
+        (
+            "uniblox_server_entities",
+            "gauge",
+            "Entities in the world.",
+            state.entities.load(Ordering::Relaxed),
+        ),
+        (
+            "uniblox_server_idle_seconds",
+            "gauge",
+            "Seconds without a connected client.",
+            state.idle_secs.load(Ordering::Relaxed),
+        ),
+    ];
+    let mut body = String::new();
+    for (name, kind, help, value) in rows {
+        body.push_str(&format!(
+            "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}\n"
+        ));
+    }
+    body
+}
+
+/// Serve `/healthz` and `/metrics` on `listener` until it fails (ADR-0052): a minimal HTTP/1.1
+/// responder, one request per connection, each read bounded in size and time. Run it on its own
+/// thread. Native only.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn serve_ops(listener: std::net::TcpListener, state: Arc<OpsState>) {
+    use std::io::{Read, Write};
+    for stream in listener.incoming() {
+        let Ok(mut stream) = stream else { continue };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+        let mut buf = [0u8; 2048];
+        let mut len = 0;
+        while len < buf.len() {
+            match stream.read(&mut buf[len..]) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    len += n;
+                    if buf[..len].windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+            }
+        }
+        let request = String::from_utf8_lossy(&buf[..len]);
+        let path = request.split_whitespace().nth(1).unwrap_or("");
+        let (status, kind, body) = match path {
+            "/healthz" => ("200 OK", "text/plain", "ok\n".to_string()),
+            "/metrics" => (
+                "200 OK",
+                "text/plain; version=0.0.4",
+                render_metrics(&state),
+            ),
+            _ => ("404 Not Found", "text/plain", "not found\n".to_string()),
+        };
+        let _ = write!(
+            stream,
+            "HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+    }
 }
 
 /// Load a content bundle (ADR-0045) from the manifest at `manifest`: verify it, compile its entry

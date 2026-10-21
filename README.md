@@ -89,9 +89,21 @@ UNIBLOX_BUNDLE=content/sample/manifest.json cargo run -p standalone   # the same
 scripts/serve.sh             # serve dist/ (after `just wasm`) locally
 ```
 
+Deploying Mode 3 (ADR-0052):
+
+```bash
+nix build .#server           # result/bin/server and result/bin/services
+just images                  # the OCI images uniblox-server and uniblox-services; `docker load < result-server-image`
+just session-cost            # the measured inputs of docs/cost-model.md
+```
+
+Both binaries answer `/healthz` and Prometheus `/metrics`: the signaling service on its own port, the server on
+`UNIBLOX_SERVER_HTTP_PORT`. The server exits once no client has been connected for `UNIBLOX_IDLE_SHUTDOWN_SECS`
+(default 300), and `UNIBLOX_LOG_FORMAT=json` makes either log JSON lines.
+
 ## Records
 
-- [DECISIONS.md](DECISIONS.md): the architecture decision log (40 ADRs).
+- [DECISIONS.md](DECISIONS.md): the architecture decision log (52 ADRs).
 - [TODO.md](TODO.md): the phase plan and its acceptance criteria.
 - [PROJECT_STATE.md](PROJECT_STATE.md): current status.
 - [docs/CONTEXT.md](docs/CONTEXT.md): background and the open naming question.

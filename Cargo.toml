@@ -51,7 +51,7 @@ axum               = { version = "0.8" }     # reasoned signaling-gate rejection
 async-trait        = { version = "0.1" }     # custom SignalingTopology impl (ADR-0039); unifies to matchbox's async-trait
 redis              = { version = "1", features = ["tokio-comp"] }  # shared-registry backend (ADR-0040)
 uuid               = { version = "1", features = ["v4"] }             # signaling node id (ADR-0040); already transitive via matchbox_protocol
-tracing            = { version = "0.1" }     # best-effort logging for shared-registry store failures (ADR-0040)
+tracing            = { version = "0.1", features = ["log"] }  # best-effort logging (ADR-0040); `log` bridges events to the JSON logger (ADR-0052)
 futures            = { version = "0.3" }
 tokio              = { version = "1", features = ["macros", "rt-multi-thread"] }
 # native/server WebRTC via sans-IO str0m (ADR-0015). rust-crypto backend: pure

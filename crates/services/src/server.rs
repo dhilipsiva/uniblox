@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -212,8 +212,18 @@ struct Admit {
     slot: ConnSlot,
 }
 
+/// Counters the `/metrics` endpoint reports (ADR-0052).
+#[derive(Default)]
+struct Counters {
+    frames_dropped: AtomicU64,
+    refused: AtomicU64,
+    tokens_issued: AtomicU64,
+    turn_credentials: AtomicU64,
+}
+
 /// Everything the handlers share.
 struct Shared {
+    counters: Counters,
     registry: SessionRegistry,
     auth: Option<JoinTokenKey>,
     issue_tokens: bool,
@@ -335,6 +345,7 @@ impl Shared {
                 .as_secs()
                 .clamp(1, MAX_TOKEN_LIFETIME_SECS);
         let body = serde_json::json!({ "token": key.mint(room, expires), "expires": expires });
+        self.counters.tokens_issued.fetch_add(1, Ordering::Relaxed);
         (
             [
                 (header::CONTENT_TYPE, "application/json"),
@@ -393,6 +404,9 @@ impl Shared {
         let digest = Sha256::digest(token.as_bytes());
         let label: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
         let credential = turn_credential(&turn.secret, &label, expiry);
+        self.counters
+            .turn_credentials
+            .fetch_add(1, Ordering::Relaxed);
         let body = serde_json::json!({
             "urls": turn.urls,
             "username": credential.username,
@@ -420,6 +434,68 @@ async fn turn(
     with_cors(s.turn_credentials(peer, &headers, &query))
 }
 
+/// `GET /healthz`: the server is up and serving.
+async fn healthz() -> &'static str {
+    "ok"
+}
+
+/// `GET /metrics`: Prometheus text (ADR-0052).
+async fn metrics(State(s): State<Arc<Shared>>) -> Response {
+    let connections = s.conns.lock().map(|c| c.total).unwrap_or(0);
+    let c = &s.counters;
+    let rows = [
+        (
+            "uniblox_signaling_connections",
+            "gauge",
+            "Open signaling connections.",
+            connections as u64,
+        ),
+        (
+            "uniblox_signaling_sessions",
+            "gauge",
+            "Sessions on this node.",
+            s.registry.session_count() as u64,
+        ),
+        (
+            "uniblox_signaling_peers",
+            "gauge",
+            "Peers in this node's sessions.",
+            s.registry.local_peer_total() as u64,
+        ),
+        (
+            "uniblox_signaling_frames_dropped_total",
+            "counter",
+            "Frames dropped over a rate, queue or size limit.",
+            c.frames_dropped.load(Ordering::Relaxed),
+        ),
+        (
+            "uniblox_signaling_refused_total",
+            "counter",
+            "Connections the gate refused.",
+            c.refused.load(Ordering::Relaxed),
+        ),
+        (
+            "uniblox_signaling_tokens_issued_total",
+            "counter",
+            "Join tokens the endpoint issued.",
+            c.tokens_issued.load(Ordering::Relaxed),
+        ),
+        (
+            "uniblox_signaling_turn_credentials_total",
+            "counter",
+            "TURN credentials issued.",
+            c.turn_credentials.load(Ordering::Relaxed),
+        ),
+    ];
+    let mut body = String::new();
+    for (name, kind, help, value) in rows {
+        body.push_str(&format!(
+            "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}\n"
+        ));
+    }
+    ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
+}
+
 /// `GET /`: no room. Counted against the attempt rate like any other connection.
 async fn no_room(
     State(s): State<Arc<Shared>>,
@@ -442,7 +518,10 @@ async fn join(
 ) -> Response {
     let admit = match s.gate(origin, &room, &query, &headers) {
         Ok(admit) => admit,
-        Err(refusal) => return refusal,
+        Err(refusal) => {
+            s.counters.refused.fetch_add(1, Ordering::Relaxed);
+            return refusal;
+        }
     };
     let limits = s.limits;
     ws.max_message_size(limits.max_signal_bytes)
@@ -570,6 +649,7 @@ async fn relay(
             Ok(Some(Ok(msg))) => msg,
         };
         let charge = |dropped: &mut u32| {
+            s.counters.frames_dropped.fetch_add(1, Ordering::Relaxed);
             *dropped += 1;
             *dropped >= limits.abuse_close_after
         };
@@ -682,9 +762,12 @@ pub(crate) fn build(
         client_ip: config.client_ip,
         rate: IpLimiter::default(),
         conns: Arc::default(),
+        counters: Counters::default(),
     });
     let router = Router::new()
         .route("/", get(no_room))
+        .route("/healthz", get(healthz))
+        .route("/metrics", get(metrics))
         .route(TOKEN_PATH, get(token))
         .route(TURN_PATH, get(turn))
         .route("/{room}", get(join))
