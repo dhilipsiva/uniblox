@@ -14,7 +14,7 @@ Live status is in `PROJECT_STATE.md` and the reason behind every design choice i
 
 - **Done:** Phase 1 (the vertical slice; the authority-swap gate passed, ADR-0014; the Bevy client renders in the browser, ADR-0017), Phase 2 bar the deploy-gated real-network numbers, the Phase-3 replication core (acked-baseline deltas, interest management, prediction and reconciliation, ownership arbitration, host migration, resync; ADR-0020 to ADR-0029), and Phase 4 (the net-free Mode-1 runtime and content-addressed saves, ADR-0030 to ADR-0036).
 - **Underway:** Phase 5, central services: scoped signaling, the asymmetric version filter, `?next=N` session grouping and a shared Redis registry are done (ADR-0037 to ADR-0040); the Mode-2 coordinator peer service, atomic registry updates, TTL crash cleanup, autoscaling and rate limiting are not.
-- **Not built:** Rhai is sandbox-audited but no crate consumes it; `platform` is a stub; the native client is a stub; browser behaviour is verified by hand only.
+- **Not built:** Rhai is sandbox-audited but no crate consumes it; `platform` is a stub; the native client is a stub. CI checks the browser paths (first frame, save/reload, two-tab exchange) with `just browser-e2e`.
 - **Measured** (2026-10-21, README "Measurements"): ~3.45 MB brotli per WASM build (8 MB gate), ~880–920 B/s per peer at 2 entities and 20 Hz, native ed25519 sign/verify 9.3/18.9 µs (with the opt-level=3 crypto override in `Cargo.toml`).
 
 Design docs (read before non-trivial work — do not relitigate decisions they mark settled):

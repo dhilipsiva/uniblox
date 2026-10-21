@@ -13,7 +13,7 @@ Implemented and tested natively:
 - the Mode-1 (standalone) and Mode-3 (server) runtimes;
 - content-addressed saves.
 
-In the browser, the client renders the shared simulation in both WebGPU and WebGL2 builds (3.4 MB each, brotli) and saves and reloads the world. That browser behaviour is verified by hand; there is no automated browser test yet.
+In the browser, the client renders the shared simulation in both WebGPU and WebGL2 builds (3.4 MB each, brotli) and saves and reloads the world. `just browser-e2e` checks this in headless Chromium on every CI run: the first frame, a save → reload → load round trip through IndexedDB, and two tabs exchanging packets on both channels.
 
 Not built yet:
 - `scripting`: the Rhai engine is sandbox-tested, but no runtime uses it, so games cannot be scripted yet.

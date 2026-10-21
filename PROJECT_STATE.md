@@ -98,9 +98,9 @@ render app (`Camera2d` + a keyboard-driven `Avatar` + drifting NPCs via `insert_
 `standalone::add_sim_systems` on FixedUpdate; `drive_avatar` input→`Velocity` via a native-tested `move_dir`;
 `sync_render` `Position`→`Transform`; no prediction/interp — local authority), replacing the ADR-0017 Bouncer
 demo. Both WASM builds compile; size gate re-checked → PASS (3.39/3.41 MB brotli, ~+10 KB); `client` native test
-2/2, clippy native+wasm32 + fmt clean, workspace green, reviewer → clean. Live in-browser render+keyboard was NOT
-exercisable in this environment (WSL server teardown + no-GPU in-app browser) — flagged for a manual browser
-check. **Item B1 (ADR-0032) DONE — content-addressing:** `ContentId([u8;32])` = the blake3-256 digest of a byte blob
+2/2, clippy native+wasm32 + fmt clean, workspace green, reviewer → clean. Live in-browser render+keyboard was not
+exercisable in that environment (WSL server teardown + no-GPU in-app browser); since ADR-0044 CI checks the first
+frame in headless Chromium (`just browser-e2e`). **Item B1 (ADR-0032) DONE — content-addressing:** `ContentId([u8;32])` = the blake3-256 digest of a byte blob
 (`content_id()`, `to_hex`/`from_hex`, `ContentIdError`, `Ord`) + a reserved `VersionTriple` in `protocol`
 (blake3 pinned `pure` — no C toolchain, wasm-safe; already in the lock via bevy_asset, so ~no new wasm code and
 the client doesn't use it yet). `protocol` tests green incl. a known blake3 empty-vector; clippy native+wasm32 +
@@ -120,13 +120,13 @@ applied). **Item B4 (ADR-0035) DONE — browser durable `IdbStore`:** IndexedDB 
 blob bytes; `put` awaits the tx commit for durability; `open` pins version 1 + propagates a create failure), so a
 browser Mode-1 save survives a page reload. Its IDB code CAN'T be machine-tested here (no wasm-test runner matches
 the `=0.2.121` pin) — verified by compile (both wasm builds) + reviewer (async bridge affirmed correct, 1 LOW
-fixed) + a manual browser self-test in the client (`idb_selftest()`, `[uniblox-idb]` on-load markers, reload flips
-"first session"→"durable"); size gate re-checked → PASS (3.39/3.41 MB, ~+2–3 KB). **Item C1 (ADR-0036) DONE — PHASE 4 COMPLETE.** The client gains opt-in save/load keybinds: `K` saves the live
+fixed) + an in-client self-test (`idb_selftest()`, `[uniblox-idb]` on-load markers, reload flips
+"first session"→"durable"); since ADR-0044 CI checks a save → reload → load round trip (`just browser-e2e`); size gate re-checked → PASS (3.39/3.41 MB, ~+2–3 KB). **Item C1 (ADR-0036) DONE — PHASE 4 COMPLETE.** The client gains opt-in save/load keybinds: `K` saves the live
 world (`save_world` → `spawn_local` → browser `IdbStore` + a localStorage "latest" pointer), `L` loads it (pointer
 → `IdbStore::get` → a `LoadInbox` NonSend `Rc<RefCell>` bridge → an exclusive `apply_load` runs
 `load_world_verified` + re-clothes the reconstructed entities with `Sprite`/`Transform`+`Avatar`, since the
 authoritative save omits render/control roles). Verified by compile (both WASM builds) + reviewer (clean) + a
-manual browser check (move → K → reload → L restores the world, also B4's end-to-end proof); size gate PASS
+K → reload → L round trip that restores the world (also B4's end-to-end proof), automated in CI since ADR-0044; size gate PASS
 (3.40/3.42 MB). **Phase 4 delivered:** the Mode-1 Standalone runtime (A1 net-free `standalone` + A2
 browser-playable) and the full content-addressed save (B1 `ContentId`/blake3 → B2 `save_world`/`load_world` +
 `MemoryStore` → B3 native `FileStore` → B4 browser `IdbStore` → C1 client keybinds).
@@ -185,12 +185,12 @@ bullets. Remaining Phase-5: the Mode-2 coordinator peer service.
   authority-swap demonstrated at the unit level before transport exists. netcode-audited; wasm32-clean.
 - **matchbox two-channel transport core** (ADR-0012) — `crates/transport` (matchbox 0.14; state=0
   unreliable, events=1 reliable), `crates/services` full-mesh signaling binary, hermetic native↔native
-  two-peer datachannel test green, wasm client demo + `scripts/e2e-two-tab.mjs`. The nibli prior-art note
+  two-peer datachannel test green, wasm client demo (two-tab check: `scripts/browser-e2e.py`, ADR-0044). The nibli prior-art note
   was resolved obsolete (repo repurposed). **Browser-tab run VERIFIED (2026-07-11):** two tabs of a
   desktop-class Chromium on the Windows host (WSL2 mirrored networking; services in WSL2) each logged the
   other peer Connected plus `[STATE]`+`[EVENT]` receipts — real P2P WebRTC, data on both channels, webgpu
-  build. The WSL2-HEADLESS limitation (ICE gathering never completes; matchbox wasm waits on it) still
-  applies to headless CI — `scripts/e2e-two-tab.mjs` needs a non-WSL host.
+  build. The WSL2-headless limitation (ICE gathering never completes; matchbox wasm waits on it) does not
+  apply on Linux: CI runs the two-tab exchange headlessly (`just browser-e2e`, ADR-0044).
 - **The custom replication protocol** (ADR-0013, HIGH) — `protocol` wire format (postcard, spawner-stable
   `NetEntityId`, quantized `QVec2`, reserved signature field) + `replication` (authority-gated cached-
   `SystemState` sender, newest-seq LWW receiver, current-Owner validity, `transfer_ownership`, late-join

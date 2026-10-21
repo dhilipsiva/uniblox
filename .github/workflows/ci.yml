@@ -37,9 +37,9 @@ jobs:
         run: nix develop --extra-experimental-features 'nix-command flakes' --command just ci
 
   build-wasm:
-    name: WASM builds and the 8 MB brotli size gate
+    name: WASM builds, the 8 MB brotli size gate and the browser checks
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 90
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -50,7 +50,9 @@ jobs:
       - name: Cache the Nix store
         uses: DeterminateSystems/magic-nix-cache-action@84c0677f58dcedf3b91f8223ce36a9ea5b3c84b7 # v15
       - name: Build both variants and apply the size gate
-        run: nix develop --extra-experimental-features 'nix-command flakes' --command just wasm
+        run: nix develop .#browser --extra-experimental-features 'nix-command flakes' --command just wasm
+      - name: Browser checks (first frame, IndexedDB save and reload, two-tab exchange)
+        run: nix develop .#browser --extra-experimental-features 'nix-command flakes' --command just browser-e2e
 
   flake:
     name: nix flake check

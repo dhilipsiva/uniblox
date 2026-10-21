@@ -1652,3 +1652,24 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
 - **Consequences:** naming is closed for the library path once the owner confirms. It reopens with a commercial
   platform, or if the owner renames before the first crates.io publish.
 - **Status:** Proposed (2026-10-21) on branch `todo/P4-UNIBLOX-01`; accepted when the owner confirms the name.
+
+## ADR-0044 — browser acceptance in CI: headless Chromium over WebDriver, replacing the manual checks
+- **Context:** three browser paths were verified only by hand: the Mode-1 first frame (ADR-0031), the
+  IndexedDB save → reload → load (ADR-0035, ADR-0036), and the two-tab exchange on both channels (ADR-0012).
+  `scripts/e2e-two-tab.mjs` covered only the last, needed Playwright from npm with no lockfile, and timed out
+  under WSL2 headless, where ICE gathering never completes.
+- **Decision:** `scripts/browser-e2e.py` (standard-library Python, W3C WebDriver) runs in the Linux-only
+  `nix develop .#browser` shell: nixpkgs' Chromium and the chromedriver of the same nixpkgs (155.0.8059.84 on
+  2026-10-21). It starts the signaling service, a static server for `dist/` and chromedriver, then checks, in
+  headless Chromium with WebGL2 through SwiftShader and WebRTC loopback enabled:
+  1. `[uniblox-metrics] first-frame` appears;
+  2. K logs `[uniblox-save] saved <id>`, and after a reload L logs `[uniblox-save] loaded <id>` with the same id;
+  3. two browser sessions in the signaling room each log `[uniblox-demo][STATE] from` and `[EVENT] from`.
+  `just browser-e2e` runs it after `just wasm`; the CI `build-wasm` job runs both. `scripts/e2e-two-tab.mjs` is
+  deleted.
+- **Consequences:** the three paths are machine-checked on every CI run. Locally: three runs passed, each
+  about 45 s; a negative control (a page without the client) fails all three checks and exits 1. The checks
+  read the client's console markers, so renaming a marker breaks the test on purpose. Rendering is SwiftShader's
+  WebGL2: the WebGPU build and real GPUs are not covered. The `.#browser` shell is Linux-only, and its gate tests
+  the system string, so `nix flake check` never imports nixpkgs for another system.
+- **Status:** Proposed (2026-10-21) on branch `todo/P4-UNIBLOX-02`; accepted when merged and green in CI.

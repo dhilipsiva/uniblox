@@ -43,5 +43,10 @@ net-free:
 wasm:
     scripts/build-wasm.sh
 
+# Browser acceptance (inside `nix develop .#browser`, after `just wasm`): the first frame, an IndexedDB
+# save -> reload -> load, and two tabs exchanging both channels, in headless Chromium.
+browser-e2e:
+    python3 scripts/browser-e2e.py
+
 # The local gate: what CI checks, except the WASM builds (`just wasm`, its own CI job).
 ci: lint test-all doc deny net-free

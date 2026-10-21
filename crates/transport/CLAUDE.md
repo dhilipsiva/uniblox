@@ -87,8 +87,8 @@ candidate classification is a follow-up.
   `protocol::PeerId`; the mapping is a session-layer concern (replication/join).
 - matchbox 0.14 wasm sends its offer only after ICE-gathering-COMPLETE (non-trickle,
   upstream TODO) — under WSL2 HEADLESS Chrome gathering never completes with any
-  iceServers set, so headless browser E2E (`scripts/e2e-two-tab.mjs`) must run on a
-  non-WSL host. The two-tab DESKTOP run itself is verified (2026-07-11): Windows-host
+  iceServers set. On Linux it does: the headless two-tab check (`scripts/browser-e2e.py`,
+  `just browser-e2e`, ADR-0044) runs in CI. The two-tab DESKTOP run itself is verified (2026-07-11): Windows-host
   Chromium tabs against the WSL2-hosted services (mirrored networking) exchanged
   `[STATE]`+`[EVENT]` receipts both ways.
 
