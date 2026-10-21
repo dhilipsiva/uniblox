@@ -6,6 +6,9 @@
 //! `#[ignore]`d: a plain `cargo test` reports them as ignored, and `just test-all`
 //! and CI run them with `--include-ignored` inside the flake devShell.
 
+#[path = "support/ttl_scenario.rs"]
+mod ttl_scenario;
+
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -178,3 +181,21 @@ async fn redis_store_records_and_prunes() {
     assert_eq!(store.session_count().await.unwrap(), 0); // de-indexed once empty
     assert!(store.list().await.unwrap().is_empty());
 }
+
+/// The registry-liveness crash scenario (ADR-0048) against a real Redis, plus the keys a sweep leaves.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs redis-server on PATH; run with --include-ignored in nix develop (just test-all, CI)"]
+async fn redis_crash_cleanup() {
+    let (_redis, url) = spawn_redis();
+    let store = connect_store(&url).await.with_node_ttl(ttl_scenario::TTL);
+    ttl_scenario::a_crashed_nodes_members_expire_and_are_swept(&store).await;
+    // Nothing of the dead node is left in Redis.
+    let client = redis::Client::open(url.as_str()).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let keys: Vec<String> = redis::cmd("KEYS").arg("uniblox:*").query_async(&mut conn).await.unwrap();
+    assert!(
+        keys.iter().all(|k| !k.contains("dead")),
+        "the sweep removed the dead node's keys: {keys:?}"
+    );
+}
+
