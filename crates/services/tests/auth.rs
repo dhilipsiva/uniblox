@@ -158,10 +158,7 @@ fn a_token_verifies_only_for_its_room_and_lifetime() {
     assert_eq!(key.verify(&token, ROOM, now + 61), Err(TokenError::Expired));
     // Another key's token, a tampered expiry and a tampered tag are all invalid.
     let other = JoinTokenKey::new(b"another-secret-that-is-32-bytes!").unwrap();
-    assert_eq!(
-        other.verify(&token, ROOM, now),
-        Err(TokenError::Invalid)
-    );
+    assert_eq!(other.verify(&token, ROOM, now), Err(TokenError::Invalid));
     let later = token.replacen(&(now + 60).to_string(), &(now + 120).to_string(), 1);
     assert_eq!(key.verify(&later, ROOM, now), Err(TokenError::Invalid));
     let mut flipped = token.clone().into_bytes();
@@ -173,7 +170,11 @@ fn a_token_verifies_only_for_its_room_and_lifetime() {
     let forever = key.mint(ROOM, now + 400 * 24 * 3600);
     assert_eq!(key.verify(&forever, ROOM, now), Err(TokenError::TooLong));
     for junk in ["", "v1", "v1.x.y", "v2.1.00", "v1.123.zz", "v1..", "v1.123"] {
-        assert_eq!(key.verify(junk, ROOM, now), Err(TokenError::Malformed), "{junk:?}");
+        assert_eq!(
+            key.verify(junk, ROOM, now),
+            Err(TokenError::Malformed),
+            "{junk:?}"
+        );
     }
 }
 
@@ -204,7 +205,10 @@ async fn an_unauthenticated_signaling_connection_is_refused() {
     ] {
         let (status, body) = refused(addr, &format!("{ROOM}{query}")).await;
         assert_eq!(status, 401, "{query}: {body}");
-        assert!(body.contains("token"), "{query}: the reason names the token: {body}");
+        assert!(
+            body.contains("token"),
+            "{query}: the reason names the token: {body}"
+        );
     }
     let mut ws = connect(addr, &format!("{ROOM}?engine=1&token={good}")).await;
     let _ = assigned_id(&mut ws).await;
@@ -285,9 +289,15 @@ async fn token_requests_share_the_per_ip_limit() {
     })
     .await;
     for _ in 0..2 {
-        assert_eq!(http_get(addr, &format!("{TOKEN_PATH}?room={ROOM}")).await.0, 200);
+        assert_eq!(
+            http_get(addr, &format!("{TOKEN_PATH}?room={ROOM}")).await.0,
+            200
+        );
     }
-    assert_eq!(http_get(addr, &format!("{TOKEN_PATH}?room={ROOM}")).await.0, 429);
+    assert_eq!(
+        http_get(addr, &format!("{TOKEN_PATH}?room={ROOM}")).await.0,
+        429
+    );
 }
 
 #[tokio::test]
@@ -309,7 +319,10 @@ async fn a_signal_flood_is_dropped_and_then_closed() {
         }
     }
     let got = count_signals(&mut b, Duration::from_millis(800)).await;
-    assert!((1..=7).contains(&got), "the burst passes, the flood does not: {got}");
+    assert!(
+        (1..=7).contains(&got),
+        "the burst passes, the flood does not: {got}"
+    );
     // The flooding socket is closed by the server.
     let closed = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -338,7 +351,11 @@ async fn an_oversized_signal_is_dropped() {
     a.send(signal(b_id, "small")).await.unwrap();
     match next_event(&mut b).await {
         JsonPeerEvent::Signal { data, .. } => {
-            assert_eq!(data, serde_json::json!({ "Offer": "small" }), "the big one was dropped");
+            assert_eq!(
+                data,
+                serde_json::json!({ "Offer": "small" }),
+                "the big one was dropped"
+            );
         }
         other => panic!("expected the small signal, got {other:?}"),
     }

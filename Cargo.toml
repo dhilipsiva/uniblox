@@ -75,6 +75,9 @@ web-time = { version = "1" }   # a wasm-safe Instant for the script watchdog (AD
 filetime = { version = "0.2" }
 ed25519-dalek = { version = "3" }   # slice instrumentation (sign/verify cost); op-signing itself is Phase 6
 serde_json = { version = "1" }
+# signaling join tokens (ADR-0047): HMAC-SHA256, the versions already in the lock
+hmac = { version = "0.12" }
+sha2 = { version = "0.10" }
 # TURN-relay tests (ADR-0016): raw webrtc-rs peers under Relay-only ICE policy
 # prove the coturn relay path. Same version matchbox_socket pins (no dup build).
 webrtc = { version = "0.17" }

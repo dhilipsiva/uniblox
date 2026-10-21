@@ -196,7 +196,13 @@ def main():
             subprocess.Popen(
                 cmd,
                 cwd=root,
-                env={**os.environ, "UNIBLOX_SIGNALING_PORT": str(SIGNALING_PORT)},
+                # The browser client does not fetch join tokens yet, so this local run is the open
+                # development server (ADR-0047).
+                env={
+                    **os.environ,
+                    "UNIBLOX_SIGNALING_PORT": str(SIGNALING_PORT),
+                    "UNIBLOX_SIGNALING_INSECURE": "1",
+                },
             )
         )
         web_port = free_port()

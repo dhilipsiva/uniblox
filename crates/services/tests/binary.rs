@@ -41,7 +41,11 @@ fn mint_token_prints_a_token_for_the_room() {
         .args(["mint-token", room, "120"])
         .output()
         .expect("run the binary");
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let token = String::from_utf8(out.stdout).unwrap();
     let key = JoinTokenKey::new(SECRET.as_bytes()).unwrap();
     assert_eq!(key.verify(token.trim(), room, unix_now()), Ok(()));

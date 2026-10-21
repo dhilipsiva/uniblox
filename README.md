@@ -82,7 +82,7 @@ The three TURN-relay and two shared-registry tests start `turnserver` and `redis
 Running it:
 
 ```bash
-cargo run -p services        # signaling on port 3536 (UNIBLOX_SIGNALING_PORT; UNIBLOX_REDIS_URL for a shared registry)
+UNIBLOX_SIGNALING_INSECURE=1 cargo run -p services   # open signaling on port 3536 for local development (UNIBLOX_SIGNALING_PORT; UNIBLOX_REDIS_URL for a shared registry; a public server sets UNIBLOX_SIGNALING_SECRET instead, ADR-0047)
 cargo run -p server          # Mode 3; joins UNIBLOX_SIGNALING_URL (default ws://127.0.0.1:3536/uniblox-demo)
 cargo run -p standalone      # Mode 1, headless
 UNIBLOX_BUNDLE=content/sample/manifest.json cargo run -p standalone   # the same, driven by the sample game's script (also for -p server)

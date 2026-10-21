@@ -25,6 +25,15 @@ refills). The topology can't see the query, so `?next` is stashed by the gate (`
 `Mutex`, drop it, then `try_send`. `parse_scope`/`parse_engine`/`parse_next` + `Scope`/`Mode` (signaling-local tag).
 Binary = thin wrapper (port `UNIBLOX_SIGNALING_PORT`/3536, `RUST_LOG` tracing). 5 unit + 16 raw-WS integration tests.
 
+**Authentication and limits (ADR-0047, proposed):** `build_signaling_server_with(addr, registry, SignalingConfig)`.
+With `auth: Some(JoinTokenKey)` the gate admits only a valid `?token=` for the requested room path (HMAC-SHA256
+`v1.<expiry>.<tag>`, at most a day, 401 with a reason otherwise); `issue_tokens` serves `GET /_uniblox/token?room=`.
+`SignalingLimits`: a per-IP bucket for connection attempts and token requests (429; IPv6 per /64; `ClientIp::
+ForwardedFor` behind a proxy; bounded table, fail closed), a per-connection bucket over every frame plus a 32 KiB
+frame cap (drop; close after 100 drops), and 64 peers per session (503; `?next` above it is 400). The binary refuses
+to start without `UNIBLOX_SIGNALING_SECRET` unless `UNIBLOX_SIGNALING_INSECURE=1`; `services mint-token <room>`.
+`build_signaling_server` (no config) stays open for tests and local development.
+
 **Trust model:** `?engine` + path `min` are self-declared — desync defense for HONEST clients, not anti-cheat (a
 modified client can lie, but can't lie into a *stricter* room with an old engine: a different `min` is a different
 room).
@@ -49,10 +58,9 @@ cross-node relay is out of scope).** Hermetic test spawns a real `redis-server` 
   `RegistryStore` split + `RedisRegistryStore` (two stateless nodes share one Redis registry). The relay is
   re-implemented from FullMesh's contract — the ADR-0037/0038 tests double as its regression on the unbounded path.
 - **DEFERRED (later Phase-5 / Phase-11):** the Mode-2 coordinator peer service; cross-node relay (sticky routing
-  assumed); atomic `MULTI`/Lua store ops + TTL/heartbeat crash-cleanup + autoscale-under-load; rate-limit +
-  authenticate room join (signaling-DoS, Phase 11).
-- Scoping is structural ISOLATION, not access control (no room secret; a client may name any path — auth is
-  the deferred bullet).
+  assumed); atomic `MULTI`/Lua store ops + TTL/heartbeat crash-cleanup + autoscale-under-load.
+- Scoping is structural ISOLATION; access control is the join token (ADR-0047), a bearer credential for one room
+  until its expiry, not an identity.
 
 ## Rules
 Inherit all root invariants and always-do rules from `../../CLAUDE.md`.

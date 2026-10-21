@@ -1827,3 +1827,50 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   margin, one wasted refused call per spent frame) are fixed or recorded here.
 - **Status:** Proposed (2026-10-21) on branch `todo/P4-UNIBLOX-04`. This is the HIGH-risk pass the repository
   reserves for a human owner (TODO.md "Staged next steps" 4): accepted only after the owner's review.
+
+## ADR-0047 — signaling authentication and rate limits: join tokens, per-IP and per-connection limits, session caps
+- **Context:** before any public demo, the signaling service must not be open to anyone for any room, nor to
+  a flood. Until now any client could join any room path, send signals without limit and grow a session
+  without bound.
+- **Decision — join tokens:** `services::JoinTokenKey` holds the signaling secret (at least 32 bytes). A token
+  is `v1.<expiry>.<tag>`, where the tag is HMAC-SHA256 over a domain string, the room path and the expiry (unix
+  seconds), as 64 hex digits; it is URL-safe as is and checked in constant time. A token binds one room path, so
+  it cannot be used for another room; it may live at most a day (`MAX_TOKEN_LIFETIME_SECS`). With a key in the
+  `SignalingConfig`, the gate refuses a missing, malformed, wrong-room, expired or over-long token with `401` and
+  the reason. A token is a bearer credential: it records the issuer's decision to admit someone to a room until
+  the expiry, not who they are, and it may be reused until then.
+- **Decision — who mints:** whoever holds the secret. `SignalingConfig::issue_tokens` serves
+  `GET /_uniblox/token?room=<room>` (two path segments, so never a room), which mints a ten-minute token for any
+  valid room to anyone within the per-IP limit: for a hosted demo, where it buys expiring, room-bound admission
+  plus the rate limits rather than identity. A deployment with accounts turns it off and mints in its own
+  backend. `services mint-token <room> [secs]` prints one for an operator (e.g. inside a Mode-3 server's
+  `UNIBLOX_SIGNALING_URL`).
+- **Decision — secure by default:** the binary refuses to start without `UNIBLOX_SIGNALING_SECRET` unless
+  `UNIBLOX_SIGNALING_INSECURE=1` says it is a development server. The library's `build_signaling_server` stays
+  open for in-process tests and local development; `build_signaling_server_with` takes the config.
+- **Decision — limits** (`SignalingLimits`, defaults in brackets):
+  - connection attempts and token requests per client IP, one shared token bucket [burst 30, one more every
+    2 s]; `429` past it. IPv6 counts per /64. The client IP is the TCP peer, or the right-most
+    `X-Forwarded-For` entry with `ClientIp::ForwardedFor` (only behind a proxy that sets it). The table holds at
+    most [100,000] IPs; when it is full of clients still limited, a new IP is refused (fail closed);
+  - signal messages per connection, a token bucket over every frame [burst 200, 50/s]; a frame over it is dropped;
+  - the size of a signal frame [32 KiB]; a larger one is dropped;
+  - after [100] dropped frames the server closes the connection;
+  - peers per session [64]: the gate refuses a full unbounded session with `503`, and `?next` above the cap
+    with `400`; `join_local` enforces the cap again against a race.
+- **Also fixed:** a joining peer's state machine kept clones of the earlier members' senders for its whole
+  connection, so a server-side close of an earlier member could not complete while the later one stayed. It now
+  drops them right after announcing itself.
+- **Known limits:** the per-IP limit is per node, not shared through the Redis registry. axum's WebSocket
+  message limit is matchbox's default (64 MiB), so an oversized frame is buffered before it is dropped; the
+  per-IP limit bounds how many such connections one client holds. The browser client does not fetch tokens yet
+  (its demo room URL is compiled in), so `just browser-e2e` runs the open development server; the client's join
+  through the scoped service, with a token from the endpoint, is follow-up work.
+- **Consequences:** `tests/auth.rs` (11: the token checks, the Done-when refusal of an unauthenticated
+  connection, the open default, the endpoint on and off, the per-IP limit for connections and token requests,
+  the flood dropped then closed, the size cap, the session and `?next` caps), `tests/binary.rs` (the secure
+  default and `mint-token`) and unit tests for the token bucket, the IPv6 /64 key, the forwarded-for parse and the
+  bounded IP table. The existing signaling tests run unchanged on the open default.
+- **Status:** Proposed (2026-10-21) on branch `todo/P4-UNIBLOX-05`, part of a HIGH-risk item: accepted after the
+  owner's review.
+

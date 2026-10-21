@@ -4,7 +4,7 @@
 //! BROWSER matchbox interop on a desktop browser (ADR-0015).
 //!
 //! Run (inside the flake env):
-//!   cargo run -p services                                    # signaling :3536
+//!   UNIBLOX_SIGNALING_INSECURE=1 cargo run -p services       # open signaling :3536
 //!   cargo run -p transport --example str0m_browser_demo      # this peer
 //! then open the wasm demo (scripts/serve.sh, http://localhost:8080/) in a
 //! desktop browser tab. Each side should log `[STATE]` and `[EVENT]` receipts
