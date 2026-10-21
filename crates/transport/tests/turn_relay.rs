@@ -29,6 +29,8 @@ use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy
 const TURN_USER: &str = "uniblox";
 const TURN_PASS: &str = "relaysecret";
 const TURN_REALM: &str = "uniblox.test";
+/// The shared secret of coturn's REST-API mode (ADR-0050).
+const TURN_SHARED_SECRET: &str = "turn-shared-secret";
 const DEADLINE: Duration = Duration::from_secs(120); // bounds hangs, not CPU contention
 
 /// A locally spawned coturn, killed on drop.
@@ -45,6 +47,22 @@ impl Drop for Turnserver {
 }
 
 fn spawn_turnserver() -> Turnserver {
+    spawn_turnserver_with(&[
+        "--lt-cred-mech",
+        "--user",
+        &format!("{TURN_USER}:{TURN_PASS}"),
+    ])
+}
+
+/// coturn in its REST-API mode (ADR-0050): time-limited credentials derived from a shared secret.
+fn spawn_turnserver_rest() -> Turnserver {
+    spawn_turnserver_with(&[
+        "--use-auth-secret",
+        &format!("--static-auth-secret={TURN_SHARED_SECRET}"),
+    ])
+}
+
+fn spawn_turnserver_with(auth: &[&str]) -> Turnserver {
     // Reserve an ephemeral port, then hand it to coturn (small race window,
     // acceptable in tests).
     let probe = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("probe bind");
@@ -62,9 +80,9 @@ fn spawn_turnserver() -> Turnserver {
             &port.to_string(),
             "--realm",
             TURN_REALM,
-            "--lt-cred-mech",
-            "--user",
-            &format!("{TURN_USER}:{TURN_PASS}"),
+        ])
+        .args(auth)
+        .args([
             "--no-tls",
             "--no-dtls",
             "--no-cli",
@@ -391,3 +409,74 @@ async fn transport_connects_with_turn_ice_config() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
+
+/// Open a relay-only data channel between two peers using `user`/`pass`; whether it carried data.
+async fn relay_carries(port: u16, user: &str, pass: &str, expect_relay: bool) -> bool {
+    let offerer = relay_only_peer(port, user, pass).await;
+    let answerer = relay_only_peer(port, user, pass).await;
+    let (received_tx, mut received_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+    answerer.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
+        let received_tx = received_tx.clone();
+        Box::pin(async move {
+            dc.on_message(Box::new(move |msg| {
+                let received_tx = received_tx.clone();
+                let data = msg.data.to_vec();
+                Box::pin(async move {
+                    let _ = received_tx.send(data).await;
+                })
+            }));
+        })
+    }));
+    let dc = offerer
+        .create_data_channel("rest-credential", None)
+        .await
+        .expect("create data channel");
+    {
+        let dc_on_open = Arc::clone(&dc);
+        dc.on_open(Box::new(move || {
+            Box::pin(async move {
+                let _ = dc_on_open.send_text("via a minted credential").await;
+            })
+        }));
+    }
+    connect_non_trickle(&offerer, &answerer, expect_relay).await;
+    let window = if expect_relay { DEADLINE } else { Duration::from_secs(8) };
+    let carried = matches!(
+        tokio::time::timeout(window, received_rx.recv()).await,
+        Ok(Some(data)) if data == b"via a minted credential"
+    );
+    let _ = offerer.close().await;
+    let _ = answerer.close().await;
+    carried
+}
+
+/// A credential minted by the signaling service (`services::turn_credential`) allocates on a coturn
+/// running `use-auth-secret` with the same secret, and carries data relay-only (ADR-0050).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs turnserver (coturn) on PATH; run with --include-ignored in nix develop (just test-all, CI)"]
+async fn a_minted_turn_credential_relays() {
+    let turn = spawn_turnserver_rest();
+    let c = services::turn_credential(
+        TURN_SHARED_SECRET.as_bytes(),
+        "peer-a",
+        services::unix_now() + 600,
+    );
+    assert!(relay_carries(turn.port, &c.username, &c.credential, true).await);
+}
+
+/// An expired credential (or one under another secret) is refused by coturn: no allocation, so the
+/// relay-only channel never opens.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs turnserver (coturn) on PATH; run with --include-ignored in nix develop (just test-all, CI)"]
+async fn an_expired_or_foreign_turn_credential_is_refused() {
+    let turn = spawn_turnserver_rest();
+    let expired = services::turn_credential(
+        TURN_SHARED_SECRET.as_bytes(),
+        "peer-a",
+        services::unix_now() - 1,
+    );
+    assert!(!relay_carries(turn.port, &expired.username, &expired.credential, false).await);
+    let foreign = services::turn_credential(b"another-secret", "peer-a", services::unix_now() + 600);
+    assert!(!relay_carries(turn.port, &foreign.username, &foreign.credential, false).await);
+}
+

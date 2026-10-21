@@ -27,4 +27,6 @@ matchbox_signaling.workspace = true
 tokio = { workspace = true, features = ["time"] }
 # TURN-relay proof (ADR-0016): raw webrtc-rs peers with ice_transport_policy=Relay
 webrtc.workspace = true
+# the coturn REST-credential proof mints with the signaling service (ADR-0050)
+services = { path = "../services", version = "0.1.0" }
 env_logger.workspace = true
