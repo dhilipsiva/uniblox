@@ -116,10 +116,39 @@ async fn an_authenticated_client_gets_a_time_limited_credential() {
         credential,
         turn_credential(TURN_SECRET, label, expiry).credential
     );
-    // Two requests get two distinct usernames.
-    let (_, _, again) = get(addr, &format!("{TURN_PATH}?room={ROOM}&token={token}")).await;
-    let again: serde_json::Value = serde_json::from_str(&again).unwrap();
-    assert_ne!(again["username"], json["username"]);
+}
+
+/// A credential never outlives the join token it was issued for, and one token always gets the same
+/// username, so coturn's per-user quota binds per token; another token gets another username.
+#[tokio::test]
+async fn a_credential_is_bound_to_its_token() {
+    let addr = boot(configured()).await;
+    let key = JoinTokenKey::new(SECRET).unwrap();
+    let token_expiry = unix_now() + 60;
+    let token = key.mint(ROOM, token_expiry);
+    let fetch = |token: String| async move {
+        let (status, _, body) = get(addr, &format!("{TURN_PATH}?room={ROOM}&token={token}")).await;
+        assert_eq!(status, 200, "{body}");
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()
+    };
+    let first = fetch(token.clone()).await;
+    let username = first["username"].as_str().unwrap().to_string();
+    let (expiry, label) = username.split_once(':').unwrap();
+    assert!(expiry.parse::<u64>().unwrap() <= token_expiry, "capped at the token's expiry");
+    assert!(first["ttl"].as_u64().unwrap() <= 60);
+    let again = fetch(token.clone()).await;
+    assert_eq!(again["username"], first["username"], "the same token, the same username");
+    let other = fetch(key.mint(ROOM, unix_now() + 61)).await;
+    let other_label = other["username"].as_str().unwrap().split_once(':').unwrap().1.to_string();
+    assert_ne!(other_label, label, "another token, another username");
+}
+
+#[tokio::test]
+async fn turn_refusals_carry_cors() {
+    let addr = boot(configured()).await;
+    let (status, headers, _) = get(addr, &format!("{TURN_PATH}?room={ROOM}")).await;
+    assert_eq!(status, 401);
+    assert!(headers.contains("access-control-allow-origin: *"), "{headers}");
 }
 
 #[tokio::test]

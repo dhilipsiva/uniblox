@@ -577,6 +577,141 @@ async fn the_outbound_queue_is_bounded_in_bytes() {
     assert_eq!(reg.peer_count(ROOM), 2);
 }
 
+/// The review's counter bypass: interleaving keep-alives with overflowing signals must not keep a
+/// flooder alive. Only a delivered signal earns back a drop.
+#[tokio::test]
+async fn keepalives_do_not_save_a_flooder() {
+    let (_reg, addr) = boot_with(SignalingConfig {
+        limits: SignalingLimits {
+            max_outbound_queue: 8,
+            signals_burst: 100_000,
+            signals_per_sec: 100_000,
+            abuse_close_after: 20,
+            ..SignalingLimits::default()
+        },
+        ..SignalingConfig::default()
+    })
+    .await;
+    let (mut a, _b, b_id) = pair(addr, &format!("{ROOM}?engine=1")).await;
+    let payload = "k".repeat(16 * 1024);
+    let keepalive = Message::text(JsonPeerRequest::KeepAlive.to_string());
+    for _ in 0..2000 {
+        if a.send(signal(b_id, &payload)).await.is_err() || a.send(keepalive.clone()).await.is_err() {
+            break;
+        }
+    }
+    assert!(closed_by_server(&mut a, Duration::from_secs(5)).await, "the flooder is closed");
+}
+
+/// A flooded peer still learns who joins: control events have capacity a sender cannot take.
+#[tokio::test]
+async fn a_flooded_peer_still_learns_of_newcomers() {
+    let (_reg, addr) = boot_with(SignalingConfig {
+        limits: SignalingLimits {
+            max_outbound_queue: 64,
+            signals_burst: 100_000,
+            signals_per_sec: 100_000,
+            abuse_close_after: 1_000_000,
+            ..SignalingLimits::default()
+        },
+        ..SignalingConfig::default()
+    })
+    .await;
+    let path = format!("{ROOM}?engine=1");
+    let (mut a, mut b, b_id) = pair(addr, &path).await;
+    let payload = "n".repeat(16 * 1024);
+    for _ in 0..500 {
+        if a.send(signal(b_id, &payload)).await.is_err() {
+            break;
+        }
+    }
+    let mut c = connect(addr, &path).await;
+    let c_id = assigned_id(&mut c).await;
+    let learned = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let JsonPeerEvent::NewPeer(id) = next_event(&mut b).await
+                && id == c_id
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .is_ok();
+    assert!(learned, "B was told about C despite A's flood");
+}
+
+/// One sender gets only a share of a receiver's queue: an honest sender's signal still reaches a
+/// peer another sender floods, and the honest sender is not charged.
+#[tokio::test]
+async fn an_honest_sender_keeps_its_share_during_a_flood() {
+    let (_reg, addr) = boot_with(SignalingConfig {
+        limits: SignalingLimits {
+            max_outbound_queue: 64,
+            signals_burst: 100_000,
+            signals_per_sec: 100_000,
+            abuse_close_after: 1_000_000,
+            ..SignalingLimits::default()
+        },
+        ..SignalingConfig::default()
+    })
+    .await;
+    let path = format!("{ROOM}?engine=1");
+    let (mut a, mut b, b_id) = pair(addr, &path).await;
+    let mut c = connect(addr, &path).await;
+    let _ = assigned_id(&mut c).await;
+    let payload = "f".repeat(16 * 1024);
+    for _ in 0..500 {
+        if a.send(signal(b_id, &payload)).await.is_err() {
+            break;
+        }
+    }
+    c.send(signal(b_id, "from-c")).await.unwrap();
+    let got_c = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let JsonPeerEvent::Signal { data, .. } = next_event(&mut b).await
+                && data == serde_json::json!({ "Offer": "from-c" })
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .is_ok();
+    assert!(got_c, "C's signal reached B through A's flood");
+}
+
+/// Relaying re-encodes a signal; one that would come out larger than the cap (the review measured
+/// 3.8x growth from number formatting) is not relayed.
+#[tokio::test]
+async fn a_signal_that_grows_past_the_cap_is_not_relayed() {
+    let (_reg, addr) = boot_with(SignalingConfig {
+        limits: SignalingLimits {
+            max_signal_bytes: 16 * 1024,
+            ..SignalingLimits::default()
+        },
+        ..SignalingConfig::default()
+    })
+    .await;
+    let (mut a, mut b, b_id) = pair(addr, &format!("{ROOM}?engine=1")).await;
+    let template = JsonPeerRequest::Signal {
+        receiver: b_id,
+        data: serde_json::json!("X"),
+    }
+    .to_string();
+    let numbers = vec!["9e15"; 2500].join(",");
+    let grows = template.replacen("\"X\"", &format!("[{numbers}]"), 1);
+    assert!(grows.len() < 16 * 1024, "the request itself is under the cap");
+    a.send(Message::text(grows)).await.unwrap();
+    a.send(signal(b_id, "small")).await.unwrap();
+    match next_event(&mut b).await {
+        JsonPeerEvent::Signal { data, .. } => {
+            assert_eq!(data, serde_json::json!({ "Offer": "small" }), "the grown one was dropped");
+        }
+        other => panic!("expected the small signal, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn sessions_are_capped() {
     let (reg, addr) = boot_with(SignalingConfig {

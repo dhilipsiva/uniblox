@@ -1,5 +1,6 @@
 //! Ownership guards from the ADR-0049 netcode audit (HIGH). A rank at the top of its range is
-//! refused, so no forged rank can overflow the coordinator's next mint. A transfer request is
+//! refused, and no rank may jump far above the one held, so no forged rank can overflow the
+//! coordinator's next mint or park an entity where no honest rank can follow. A transfer request is
 //! honoured only from the entity's owner. A reconnecting peer gets a fresh key pin. Every event the
 //! coordinator sends is signed, `ClaimRejected` included. A `LocalPeer` set after construction is the
 //! sender the signatures name. Written before the implementation.
@@ -118,52 +119,80 @@ fn a_saturated_rank_is_refused() {
     }
 }
 
-/// The coordinator never mints past the range: with an entity at the highest accepted rank, the
-/// next claim is rejected, not overflowed (a panic in debug, a silent wrap in release).
+/// The review's rank lock: no rank may jump more than 2^32 above the one held, so a forger cannot
+/// park an entity at the top of the range (where no honest rank could follow). An honest +1 applies.
 #[test]
-fn the_coordinator_never_overflows_a_rank() {
+fn a_rank_cannot_jump_to_the_top() {
     let mut owner = Peer::new(2);
     let mut coord = Peer::new(1);
     let id = announce(&mut owner, &mut coord);
     coord.repl.track_peer(owner.id);
+    let transfer = |seq: u64| {
+        signed(
+            PeerId(2),
+            PeerId(1),
+            NetEvent::OwnershipTransfer {
+                id,
+                new_owner: PeerId(6),
+                seq: OwnerSeq {
+                    seq,
+                    coordinator: PeerId(2),
+                },
+            },
+        )
+    };
+    for far in [TOP - 1, (1 << 32) + 1] {
+        coord.repl.apply_events(&mut coord.world, owner.id, &transfer(far));
+        assert_eq!(coord.owner(), owner.id, "a jump to {far} is refused");
+    }
+    coord.repl.apply_events(&mut coord.world, owner.id, &transfer(1));
+    assert_eq!(coord.owner(), PeerId(6), "an honest next rank applies");
+    // The coordinator then mints normally: a claim commits at the next rank.
     let claimant = PeerId(5);
     coord.repl.track_peer(claimant);
-    // The owner (legitimately, as far as the coordinator can tell) hands it off at the highest
-    // rank a receiver accepts.
-    let high = signed(
-        owner.id,
-        coord.id,
-        NetEvent::OwnershipTransfer {
+    let claim = signed(claimant, coord.id, NetEvent::ClaimOwnership { id });
+    coord.repl.apply_events(&mut coord.world, claimant, &claim);
+    let minted: Vec<NetEvent> = coord
+        .repl
+        .drain_commits(&mut coord.world)
+        .iter()
+        .map(|(_, b)| decode_event(b).unwrap().event)
+        .collect();
+    assert!(
+        minted.iter().any(|e| matches!(
+            e,
+            NetEvent::OwnershipCommit { seq: OwnerSeq { seq: 2, .. }, .. }
+        )),
+        "{minted:?}"
+    );
+}
+
+/// A resync may not create an orphan proxy at an implausible rank either.
+#[test]
+fn an_orphan_resync_at_an_implausible_rank_is_refused() {
+    let mut b = Peer::new(4);
+    let m = PeerId(3);
+    let id = NetEntityId {
+        spawner: PeerId(9),
+        index: 1,
+        generation: 0,
+    };
+    let resync = signed(
+        m,
+        b.id,
+        NetEvent::ResyncSpawn {
             id,
-            new_owner: PeerId(6),
+            pos: QVec2 { x: 0, y: 0 },
+            vel: QVec2 { x: 0, y: 0 },
             seq: OwnerSeq {
-                seq: TOP - 1,
-                coordinator: owner.id,
+                seq: (1 << 32) + 1,
+                coordinator: m,
             },
         },
     );
-    coord.repl.apply_events(&mut coord.world, owner.id, &high);
-    assert_eq!(coord.owner(), PeerId(6));
-    let claim = signed(claimant, coord.id, NetEvent::ClaimOwnership { id });
-    coord.repl.apply_events(&mut coord.world, claimant, &claim);
-    let out = coord.repl.drain_commits(&mut coord.world);
-    let events: Vec<NetEvent> = out
-        .iter()
-        .map(|(_, bytes)| decode_event(bytes).unwrap().event)
-        .collect();
-    assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, NetEvent::ClaimRejected { .. })),
-        "the claim is rejected: {events:?}"
-    );
-    assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e, NetEvent::OwnershipCommit { .. })),
-        "nothing is minted past the range: {events:?}"
-    );
-    assert_eq!(coord.owner(), PeerId(6));
+    b.repl.apply_events(&mut b.world, m, &resync);
+    let mut q = b.world.query::<&Owner>();
+    assert_eq!(q.iter(&b.world).count(), 0, "no phantom proxy at an implausible rank");
 }
 
 /// The coordinator honours a `TransferRequest` only from the entity's current owner (the rule the

@@ -110,3 +110,36 @@ fn issuing_tokens_needs_a_secret() {
         .expect("run the binary");
     assert_eq!(out.status.code(), Some(2));
 }
+
+/// TURN behind the open token endpoint would be an open relay: refused unless the operator says so.
+#[test]
+fn turn_with_open_tokens_needs_an_explicit_opt_in() {
+    let out = services()
+        .env("UNIBLOX_SIGNALING_SECRET", SECRET)
+        .env("UNIBLOX_ISSUE_TOKENS", "1")
+        .env("UNIBLOX_TURN_SECRET", "0123456789abcdef0123456789abcdef-turn")
+        .env("UNIBLOX_TURN_URLS", "turn:127.0.0.1:3478")
+        .output()
+        .expect("run the binary");
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("UNIBLOX_TURN_FOR_OPEN_TOKENS"), "{stderr}");
+}
+
+/// A weak TURN secret or a URL that is not a TURN or STUN URL is a configuration error.
+#[test]
+fn turn_config_is_checked() {
+    for (secret, urls) in [
+        ("short", "turn:127.0.0.1:3478"),
+        ("0123456789abcdef0123456789abcdef-turn", "http://example.com"),
+    ] {
+        let out = services()
+            .env("UNIBLOX_SIGNALING_SECRET", SECRET)
+            .env("UNIBLOX_TURN_SECRET", secret)
+            .env("UNIBLOX_TURN_URLS", urls)
+            .output()
+            .expect("run the binary");
+        assert_eq!(out.status.code(), Some(2), "{secret} {urls}");
+    }
+}
+
