@@ -63,6 +63,8 @@ pub enum BundleError {
     HashMismatch { path: String },
     /// The entry script is not UTF-8.
     EntryNotUtf8(String),
+    /// A file on disk is larger than the loader reads.
+    TooLarge { path: String, limit: u64 },
 }
 
 impl fmt::Display for BundleError {
@@ -79,6 +81,9 @@ impl fmt::Display for BundleError {
                 write!(f, "asset {path:?} does not match its listed id")
             }
             BundleError::EntryNotUtf8(p) => write!(f, "entry {p:?} is not UTF-8"),
+            BundleError::TooLarge { path, limit } => {
+                write!(f, "{path:?} is larger than the {limit}-byte limit")
+            }
         }
     }
 }
@@ -100,17 +105,33 @@ struct RawAsset {
     id: String,
 }
 
-/// A plain relative path inside the bundle: `/`-separated, every segment non-empty and neither `.`
-/// nor `..`, no backslash, no `:` (drive or scheme prefixes), no control characters, not absolute.
+/// Windows device names, reserved in any directory and with any extension (`aux.rhai` opens `AUX`).
+const WINDOWS_DEVICES: &[&str] = &[
+    "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+    "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+];
+
+/// One path segment that is safe on every platform: non-empty, not `.` or `..`, not ending in a
+/// dot or a space (Windows strips them), and not a Windows device name.
+fn plain_segment(seg: &str) -> bool {
+    let stem = seg.split('.').next().unwrap_or("").to_ascii_lowercase();
+    !seg.is_empty()
+        && seg != "."
+        && seg != ".."
+        && !seg.ends_with('.')
+        && !seg.ends_with(' ')
+        && !WINDOWS_DEVICES.contains(&stem.as_str())
+}
+
+/// A plain relative path inside the bundle: `/`-separated plain segments ([`plain_segment`]), no
+/// backslash, no `:` (drive or scheme prefixes), no control characters, not absolute.
 fn check_path(path: &str) -> Result<(), BundleError> {
     let bad = path.is_empty()
         || path.starts_with('/')
         || path.contains('\\')
         || path.contains(':')
         || path.chars().any(char::is_control)
-        || path
-            .split('/')
-            .any(|seg| seg.is_empty() || seg == "." || seg == "..");
+        || !path.split('/').all(plain_segment);
     if bad {
         Err(BundleError::BadPath(path.to_string()))
     } else {
@@ -152,11 +173,19 @@ pub fn load_bundle(
     manifest_json: &str,
     mut read: impl FnMut(&str) -> Option<Vec<u8>>,
 ) -> Result<Bundle, BundleError> {
+    load_with(manifest_json, |path| {
+        read(path).ok_or_else(|| BundleError::MissingAsset(path.to_string()))
+    })
+}
+
+fn load_with(
+    manifest_json: &str,
+    mut read: impl FnMut(&str) -> Result<Vec<u8>, BundleError>,
+) -> Result<Bundle, BundleError> {
     let manifest = BundleManifest::parse(manifest_json)?;
     let mut assets = BTreeMap::new();
     for asset in &manifest.assets {
-        let bytes =
-            read(&asset.path).ok_or_else(|| BundleError::MissingAsset(asset.path.clone()))?;
+        let bytes = read(&asset.path)?;
         if content_id(&bytes) != asset.id {
             return Err(BundleError::HashMismatch {
                 path: asset.path.clone(),
@@ -177,15 +206,75 @@ pub fn load_bundle(
     })
 }
 
+/// The most [`load_bundle_dir`] reads for one asset (64 MiB) and for the manifest (1 MiB).
+pub const MAX_ASSET_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+
+/// Read one regular file, refusing symlinks, special files (FIFOs, devices), anything that resolves
+/// outside `root`, and anything over `limit` bytes. Any refusal except size reads as missing.
+#[cfg(not(target_arch = "wasm32"))]
+fn read_regular(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    label: &str,
+    limit: u64,
+) -> Result<Vec<u8>, BundleError> {
+    use std::io::Read;
+    let missing = || BundleError::MissingAsset(label.to_string());
+    // `symlink_metadata` does not follow a final symlink; `canonicalize` resolves every one, so a
+    // symlinked parent directory cannot lead the read outside the bundle either.
+    let meta = std::fs::symlink_metadata(path).map_err(|_| missing())?;
+    if !meta.file_type().is_file() {
+        return Err(missing());
+    }
+    let real = path.canonicalize().map_err(|_| missing())?;
+    if !real.starts_with(root) {
+        return Err(missing());
+    }
+    if meta.len() > limit {
+        return Err(BundleError::TooLarge {
+            path: label.to_string(),
+            limit,
+        });
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(&real)
+        .map_err(|_| missing())?
+        .take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| missing())?;
+    if bytes.len() as u64 > limit {
+        return Err(BundleError::TooLarge {
+            path: label.to_string(),
+            limit,
+        });
+    }
+    Ok(bytes)
+}
+
 /// Native convenience: load the bundle whose manifest is the file at `manifest_path`, reading assets
-/// relative to the manifest's directory. The path checks in [`BundleManifest::parse`] keep every read
-/// inside that directory.
+/// relative to the manifest's directory. Only regular files that resolve inside that directory are
+/// read (no symlinks, FIFOs or devices), each at most [`MAX_ASSET_BYTES`]; the manifest itself at most
+/// [`MAX_MANIFEST_BYTES`].
 #[cfg(not(target_arch = "wasm32"))]
 pub fn load_bundle_dir(manifest_path: &std::path::Path) -> Result<Bundle, BundleError> {
-    let json = std::fs::read_to_string(manifest_path)
-        .map_err(|e| BundleError::Manifest(format!("{}: {e}", manifest_path.display())))?;
+    let manifest_err =
+        |e: &dyn fmt::Display| BundleError::Manifest(format!("{}: {e}", manifest_path.display()));
     let dir = manifest_path.parent().unwrap_or(std::path::Path::new("."));
-    load_bundle(&json, |rel| std::fs::read(dir.join(rel)).ok())
+    let root = dir.canonicalize().map_err(|e| manifest_err(&e))?;
+    let json =
+        read_regular(&root, manifest_path, "manifest", MAX_MANIFEST_BYTES).map_err(
+            |e| match e {
+                BundleError::MissingAsset(_) => {
+                    manifest_err(&"not a readable regular file in the bundle")
+                }
+                other => other,
+            },
+        )?;
+    let json = String::from_utf8(json).map_err(|e| manifest_err(&e))?;
+    load_with(&json, |rel| {
+        read_regular(&root, &dir.join(rel), rel, MAX_ASSET_BYTES)
+    })
 }
 
 #[cfg(test)]

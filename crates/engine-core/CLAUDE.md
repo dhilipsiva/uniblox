@@ -49,9 +49,11 @@ SHARED outcome (recorded once) — a future consumer must only write entities IT
 cross-owner write). Coarse = positional overlap, not frame-perfect (precise → Mode 3). netcode-audited → MERGE.
 
 **Scripted entities (ADR-0045):** `Scripted` (local marker, not on the wire) + `run_entity_scripts` (owner-only
-via `authority_of`, velocity-only via `set_if_neq`, non-finite results refused, a no-op without a `ScriptEngine`;
-schedule it BEFORE `simulate`) + `enable_scripts` (inserts the engine, marks every owned entity that has no
-`ControlledBy`). A receiver never runs another peer's script.
+via `authority_of`, velocity-only via `set_if_neq`, non-finite results refused, clamped to `MAX_SCRIPT_SPEED`, a
+no-op without a `ScriptEngine`; it also marks every later sim entity, replicas included, so the new owner after a
+handoff or migration runs the script; schedule it BEFORE `simulate`) + `enable_scripts` (inserts the engine, marks
+the owned entities for the first tick). `Controlled`, `ControlledBy` and `Unscripted` entities are never scripted.
+A receiver never runs another peer's script.
 
 ## Crate-local invariants
 - **The SAME systems run in all three modes; only authority assignment differs.**

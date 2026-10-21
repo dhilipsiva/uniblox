@@ -268,7 +268,12 @@ fn peers(ids: &[u64], owners: &[u64], src: &str) -> (Vec<Participant>, Vec<(usiz
             let mut schedule = Schedule::default();
             schedule.add_systems((advance_tick, run_entity_scripts, simulate).chain());
             let repl = Replication::new(&mut world);
-            Participant { id: PeerId(id), world, schedule, repl }
+            Participant {
+                id: PeerId(id),
+                world,
+                schedule,
+                repl,
+            }
         })
         .collect();
     let mut spawned = Vec::new();
@@ -347,9 +352,9 @@ fn a_handed_off_entity_keeps_running_its_script() {
         round(&mut ps, &live);
     }
     let (owner, e) = spawned[0];
-    ps[owner]
-        .repl
-        .transfer_ownership(&mut ps[owner].world, e, PeerId(2))
+    let p = &mut ps[owner];
+    p.repl
+        .transfer_ownership(&mut p.world, e, PeerId(2))
         .expect("peer 1 owns it");
     for _ in 200..TICKS {
         round(&mut ps, &live);
@@ -367,7 +372,9 @@ fn a_migrated_entity_keeps_running_its_script() {
     }
     let survivor = &mut ps[1];
     survivor.repl.untrack_peer(PeerId(1));
-    let moved = survivor.repl.reassign_orphans(&mut survivor.world, PeerId(1));
+    let moved = survivor
+        .repl
+        .reassign_orphans(&mut survivor.world, PeerId(1));
     assert_eq!(moved.len(), 2, "peer 2 inherits peer 1's two entities");
     for _ in 200..TICKS {
         round(&mut ps, &[false, true]);
@@ -403,7 +410,11 @@ fn receivers_never_run_scripts_on_replicas() {
     let (e, _) = q.iter(&client.world).next().unwrap();
     client.world.get_mut::<Velocity>(e).unwrap().x = -7.0;
     client.schedule.run(&mut client.world);
-    assert_eq!(client.world.get::<Velocity>(e).unwrap().x, -7.0, "the client did not run it");
+    assert_eq!(
+        client.world.get::<Velocity>(e).unwrap().x,
+        -7.0,
+        "the client did not run it"
+    );
 }
 
 /// `standalone::load_content` loads the sample bundle and refuses a missing one.
@@ -413,7 +424,10 @@ fn standalone_load_content_loads_the_sample_and_refuses_a_missing_bundle() {
     let good = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content/sample/manifest.json");
     standalone::load_content(&mut app, &good).expect("the sample bundle loads");
     let world = app.world_mut();
-    assert_eq!(world.query::<&engine_core::Scripted>().iter(world).count(), 3);
+    assert_eq!(
+        world.query::<&engine_core::Scripted>().iter(world).count(),
+        3
+    );
     let mut app = standalone::build_standalone_app(PeerId(1), 3);
     assert!(standalone::load_content(&mut app, Path::new("/nonexistent/manifest.json")).is_err());
 }

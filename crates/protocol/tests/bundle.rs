@@ -157,7 +157,16 @@ fn the_sample_bundle_loads_from_disk() {
 /// Reserved Windows device names and segments ending in a dot or space are not plain paths.
 #[test]
 fn windows_device_names_are_rejected() {
-    for bad in ["CON", "nul", "aux.rhai", "art/COM1.txt", "lpt9", "a.", "a ", "..."] {
+    for bad in [
+        "CON",
+        "nul",
+        "aux.rhai",
+        "art/COM1.txt",
+        "lpt9",
+        "a.",
+        "a ",
+        "...",
+    ] {
         let json = manifest(bad, &[(bad, content_id(b"x").to_hex())]);
         let err = load_bundle(&json, |_| Some(b"x".to_vec())).unwrap_err();
         assert!(matches!(err, BundleError::BadPath(_)), "{bad:?}: {err:?}");
@@ -187,7 +196,11 @@ mod on_disk {
         let secret = b"SECRET OUTSIDE THE BUNDLE";
         std::fs::write(outside.path().join("secret.txt"), secret).unwrap();
         let dir = bundle_dir("leak.txt", secret);
-        symlink(outside.path().join("secret.txt"), dir.path().join("leak.txt")).unwrap();
+        symlink(
+            outside.path().join("secret.txt"),
+            dir.path().join("leak.txt"),
+        )
+        .unwrap();
         let err = load_bundle_dir(&dir.path().join("manifest.json")).unwrap_err();
         assert!(matches!(err, BundleError::MissingAsset(_)), "{err:?}");
     }

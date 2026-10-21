@@ -1686,25 +1686,42 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   operator. The sandbox settings (`Engine::new_raw`, every `set_max_*`, `eval` disabled) are unchanged.
 - **Decision — where scripts run:** `engine_core::Scripted` marks content-driven entities; it is local, like
   `Interactable`, and not on the wire. `engine_core::run_entity_scripts` runs the script only for `Scripted`
-  entities this peer owns (`authority_of == Local`), and writes back only the velocity, through `set_if_neq` so an
-  unchanged velocity triggers no replication. NaN and infinities are refused, a script error leaves the entity
-  unchanged, and without a script engine the system is a no-op. It runs just before `simulate`, which still
-  integrates position; in the server chain it runs after `apply_input`. Receivers never run another peer's script:
-  scripts need no cross-platform float determinism, because their result replicates like any owned datum.
-  `engine_core::enable_scripts` inserts the engine and marks every owned entity no player controls.
+  entities this peer owns (`authority_of == Local`), and writes back only the velocity: NaN and infinities are
+  refused, each component is clamped to `MAX_SCRIPT_SPEED` (1024 units/s, so a position stays finite and the
+  quantizer never sees infinity), `set_if_neq` skips an unchanged value, a script error leaves the entity
+  unchanged, and without a script engine the system is a no-op. Once content is loaded, the same system also
+  marks every sim entity that appears later (a replica, a reloaded save, a new spawn) on every peer, so after a
+  handoff or a host migration the new owner runs the script; the authority check keeps a receiver from running
+  it. Entities a player drives (`Controlled`, `ControlledBy`) and entities with the `Unscripted` opt-out (the
+  browser client's Mode-1 avatar) are never scripted. It runs just before `simulate`, which still integrates
+  position. Scripts need no cross-platform float determinism, because their result replicates like any owned
+  datum. `engine_core::enable_scripts` inserts the engine and marks the owned entities for the first tick.
 - **Decision — bundles:** `protocol::bundle` parses a JSON manifest (`version`, `entry`, `assets[{path, id}]`,
   unknown fields rejected) and `load_bundle` returns the assets only when every blake3 id matches. Bundles are
   untrusted content, so a path must be plain and relative: no `..`, `.`, empty segment, backslash, `:`, control
-  character or leading `/`. A missing or duplicate asset, an unlisted entry and a non-UTF-8 entry are errors too.
-  `load_bundle_dir` (native) reads assets beside the manifest. `standalone` and `server` load one from
+  character, leading `/`, Windows device name (`CON`, `aux.rhai`, `COM1`...) or segment ending in a dot or space. A
+  missing or duplicate asset, an unlisted entry and a non-UTF-8 entry are errors too. `load_bundle_dir` (native)
+  reads assets beside the manifest, and only regular files that resolve inside the bundle directory: symlinks
+  (of a file or of a directory on the way), FIFOs and devices read as missing, and reads are bounded
+  (`MAX_ASSET_BYTES` 64 MiB, `MAX_MANIFEST_BYTES` 1 MiB). `standalone` and `server` load one from
   `UNIBLOX_BUNDLE` through `load_content`.
 - **Decision — the sample game:** `content/sample/arena.rhai` keeps every scripted entity inside a 20 x 12 arena by
   reflecting the outward velocity component at a wall.
 - **Consequences:** `server/tests/scripted_modes.rs` runs the sample bundle unchanged in Mode 1 (the real standalone
   app, one fixed step per update), Mode 2 (two peers) and Mode 3 (a server and two clients): each entity's owner
   computes bit-identical positions in all three modes, every replica converges within the quantization tolerance,
-  and without the script the same scene leaves the arena. 26 new tests; the workspace has 272. The browser client
+  and without the script the same scene leaves the arena. The same file covers a Mode-2 handoff and a host
+  migration (the new owner keeps the entity in the arena), receivers never running scripts on replicas (a probe
+  velocity plus a control), and `standalone::load_content`. 38 new tests; the workspace has 284. The browser client
   now links Rhai (+118 KB / +126 KB brotli, gate PASS) but loads no content yet. Deferred to the sandbox hardening
   (Phase 12): source and asset size caps before compile, a wall-clock watchdog and a per-frame budget across
   entities. Deferred to Phase 8: scene data, bundle hot reload, object-storage dedup and known-bad hash matching.
+- **Review:** an independent sandbox and netcode audit (2026-10-21) found the sandbox surface clean (only `std`
+  enabled for rhai on every target, the `Agent` setters limited to `vx`/`vy`, every limit applying, the scope
+  rewound) and returned REQUEST CHANGES for three MEDIUM findings: the script stopped after a handoff or host
+  migration (the marker was set once, on the original owner only), a finite huge velocity drove a position to
+  infinity and made the quantizer panic in debug builds, and `load_bundle_dir` followed symlinks out of the
+  bundle and blocked on a FIFO. Three LOW findings: Windows device names, player avatars outside Mode 3 not
+  excluded, and a mode proof that could not see a script running on a receiver. Regression tests came first
+  (751d7eb), then the fixes described above.
 - **Status:** Proposed (2026-10-21) on branch `todo/P4-UNIBLOX-03`; accepted when merged.

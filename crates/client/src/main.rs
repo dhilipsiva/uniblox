@@ -157,7 +157,7 @@ mod render {
 
     use bevy::ecs as bevy_ecs;
     use bevy::prelude::*;
-    use engine_core::{Position, Velocity, insert_sim, spawn_owned};
+    use engine_core::{Position, Unscripted, Velocity, insert_sim, spawn_owned};
     use persistence::{IdbStore, load_world_verified, save_world};
     use protocol::{ContentId, PeerId};
     use wasm_bindgen_futures::spawn_local;
@@ -213,6 +213,8 @@ mod render {
             Sprite::from_color(Color::srgb(0.9, 0.4, 0.1), Vec2::splat(48.0)),
             Transform::default(),
             Avatar,
+            // The keyboard drives the avatar; content scripts never do (ADR-0045).
+            Unscripted,
         ));
 
         // A few locally-owned NPCs drifting in +x — visible evidence the sim runs.
@@ -362,7 +364,7 @@ mod render {
                 Transform::default(),
             ));
             if is_avatar {
-                world.entity_mut(e).insert(Avatar);
+                world.entity_mut(e).insert((Avatar, Unscripted));
             }
         }
         log(&format!("[uniblox-save] loaded {}", id.to_hex()));

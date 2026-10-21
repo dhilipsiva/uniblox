@@ -313,27 +313,67 @@ pub fn resolve_interactions(
 }
 
 /// Marks an entity whose behaviour the content's script drives (ADR-0045). Content-authored and
-/// LOCAL, like [`Interactable`]: it is not on the wire, and a receiver never runs another peer's
-/// script whether or not its proxy carries the marker.
+/// LOCAL, like [`Interactable`]: it is not on the wire. Once content is loaded,
+/// [`run_entity_scripts`] marks every sim entity that no player controls, on every peer, replicas
+/// included, so that whichever peer owns an entity (after a handoff or host migration too) runs its
+/// script; the authority check keeps a receiver from running it.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Scripted;
+
+/// Opts an entity out of content scripts (ADR-0045), for example a Mode-1 player avatar that the
+/// client drives without [`Controlled`]. Entities with [`Controlled`] or [`ControlledBy`] are never
+/// scripted either: the player's input owns their velocity.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Unscripted;
+
+/// The largest speed, per axis and in world units per second, a script may set (ADR-0045). A
+/// finite but huge velocity would drive a position to infinity, which the quantizer refuses; at
+/// this speed a position stays finite for any session length. Arena bounds are the content's job.
+pub const MAX_SCRIPT_SPEED: f32 = 1024.0;
 
 /// Script-driven entity logic (ADR-0045): for every [`Scripted`] entity THIS peer owns
 /// (`authority_of == Local`), run the content's `update(agent)` and write back the velocity it
 /// returns. Only the authority runs a script, so peers never need identical floats (receivers apply
 /// the replicated result, as for every owned datum); position stays [`simulate`]'s to integrate, so
-/// schedule this BEFORE `simulate`. Without a script engine (no content loaded) this is a no-op. A
-/// script error logs a warning and leaves the entity unchanged; an unchanged velocity is not written,
-/// so it does not trigger replication.
+/// schedule this BEFORE `simulate`. Without a script engine (no content loaded) this is a no-op.
+///
+/// It also marks, through deferred commands, every sim entity that appeared since (a replica, a
+/// reloaded save, a later spawn) and that no player controls, so ownership moving to this peer
+/// later finds the entity scripted. A script error logs a warning and leaves the entity unchanged;
+/// NaN and infinities are refused, a finite velocity is clamped to [`MAX_SCRIPT_SPEED`], and an
+/// unchanged velocity is not written.
+#[allow(clippy::type_complexity)]
 pub fn run_entity_scripts(
     engine: Option<NonSendMut<ScriptEngine>>,
     local: Res<LocalPeer>,
     tick: Res<Tick>,
-    mut q: Query<(&Owner, &Position, &mut Velocity, Option<&Contacts>), With<Scripted>>,
+    mut commands: Commands,
+    unmarked: Query<
+        Entity,
+        (
+            With<Owner>,
+            Without<Scripted>,
+            Without<Unscripted>,
+            Without<Controlled>,
+            Without<ControlledBy>,
+        ),
+    >,
+    mut q: Query<
+        (&Owner, &Position, &mut Velocity, Option<&Contacts>),
+        (
+            With<Scripted>,
+            Without<Unscripted>,
+            Without<Controlled>,
+            Without<ControlledBy>,
+        ),
+    >,
 ) {
     let Some(mut engine) = engine else {
         return;
     };
+    for e in &unmarked {
+        commands.entity(e).insert(Scripted);
+    }
     for (owner, pos, mut vel, contacts) in &mut q {
         if authority_of(owner.0, local.0) != Authority::Local {
             continue;
@@ -347,30 +387,30 @@ pub fn run_entity_scripts(
             tick: i64::try_from(tick.0).unwrap_or(i64::MAX),
         };
         match engine.update_agent(agent) {
-            Ok(next) => {
-                // Narrowing to f32 is the engine's precision; NaN and infinities are refused so a
-                // script cannot poison the simulation or the quantizer.
-                let next_vel = Velocity {
-                    x: next.vx as f32,
-                    y: next.vy as f32,
-                };
-                if next_vel.x.is_finite() && next_vel.y.is_finite() {
-                    vel.set_if_neq(next_vel);
-                } else {
-                    log::warn!("script returned a non-finite velocity; ignored");
-                }
+            Ok(next) if next.vx.is_finite() && next.vy.is_finite() => {
+                // Narrowing to f32 can overflow to infinity; the clamp brings it back.
+                let clamp = |v: f64| (v as f32).clamp(-MAX_SCRIPT_SPEED, MAX_SCRIPT_SPEED);
+                vel.set_if_neq(Velocity {
+                    x: clamp(next.vx),
+                    y: clamp(next.vy),
+                });
             }
+            Ok(_) => log::warn!("script returned a non-finite velocity; ignored"),
             Err(err) => log::warn!("entity script skipped: {err}"),
         }
     }
 }
 
 /// Load content for this peer (ADR-0045): insert the script engine and mark every entity this peer
-/// owns that no player controls ([`ControlledBy`]) as [`Scripted`]. Entities spawned later (or
-/// received as replicas) are not marked; content marks its own spawns.
+/// owns that no player controls as [`Scripted`], so the first tick already runs them.
+/// [`run_entity_scripts`] marks everything that appears later, replicas included.
 pub fn enable_scripts(world: &mut World, engine: ScriptEngine) {
     let local = world.resource::<LocalPeer>().0;
-    let mut q = world.query_filtered::<(Entity, &Owner), Without<ControlledBy>>();
+    let mut q = world.query_filtered::<(Entity, &Owner), (
+        Without<Unscripted>,
+        Without<Controlled>,
+        Without<ControlledBy>,
+    )>();
     let owned: Vec<Entity> = q
         .iter(world)
         .filter(|(_, owner)| authority_of(owner.0, local) == Authority::Local)

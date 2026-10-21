@@ -368,7 +368,8 @@ fn build_server_app_inner(
             advance_tick,
             apply_input,
             // Content scripts steer the server-owned entities (ADR-0045); a no-op until content
-            // is loaded. After apply_input, so a player-controlled entity keeps its input.
+            // is loaded. Player avatars (ControlledBy) are never scripted, so apply_input alone
+            // drives them whatever the order.
             run_entity_scripts,
             simulate,
             // Coarse cross-owner interactions (ADR-0027) run AFTER simulate, on the

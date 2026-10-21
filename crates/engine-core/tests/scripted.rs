@@ -143,7 +143,8 @@ fn enable_scripts_marks_the_owned_entities_and_inserts_the_engine() {
 /// A finite but huge velocity is clamped, so position stays finite and replication never sees inf.
 #[test]
 fn a_huge_velocity_is_clamped_to_the_maximum_speed() {
-    let engine = ScriptEngine::from_source("fn update(a) { a.vx = 3.0e38; a.vy = -3.0e38; a }").unwrap();
+    let engine =
+        ScriptEngine::from_source("fn update(a) { a.vx = 3.0e38; a.vy = -3.0e38; a }").unwrap();
     let mut world = world_with(Some(engine));
     let e = spawn(&mut world, LOCAL, true);
     let mut schedule = Schedule::default();
@@ -152,7 +153,13 @@ fn a_huge_velocity_is_clamped_to_the_maximum_speed() {
         schedule.run(&mut world);
     }
     let vel = *world.get::<Velocity>(e).unwrap();
-    assert_eq!(vel, Velocity { x: MAX_SCRIPT_SPEED, y: -MAX_SCRIPT_SPEED });
+    assert_eq!(
+        vel,
+        Velocity {
+            x: MAX_SCRIPT_SPEED,
+            y: -MAX_SCRIPT_SPEED
+        }
+    );
     assert!(world.get::<Position>(e).unwrap().x.is_finite());
 }
 
@@ -166,8 +173,15 @@ fn entities_appearing_after_load_are_scripted_on_whichever_peer_owns_them() {
     let later_proxy = spawn(&mut world, OTHER, false);
     run(&mut world);
     run(&mut world);
-    assert!(world.get::<Scripted>(later_proxy).is_some(), "proxies are marked");
-    assert_eq!(world.get::<Velocity>(later_proxy).unwrap().x, 1.0, "but not run");
+    assert!(
+        world.get::<Scripted>(later_proxy).is_some(),
+        "proxies are marked"
+    );
+    assert_eq!(
+        world.get::<Velocity>(later_proxy).unwrap().x,
+        1.0,
+        "but not run"
+    );
     assert_eq!(world.get::<Velocity>(later_owned).unwrap().x, 5.0);
     // Ownership arrives at this peer (a handoff or host migration): now it runs here.
     world.entity_mut(later_proxy).insert(Owner(LOCAL));
@@ -191,6 +205,10 @@ fn player_controlled_and_opted_out_entities_are_never_scripted() {
     run(&mut world);
     run(&mut world);
     for e in [by, here, opted_out, forced] {
-        assert_eq!(world.get::<Velocity>(e).unwrap().x, 1.0, "{e:?} was scripted");
+        assert_eq!(
+            world.get::<Velocity>(e).unwrap().x,
+            1.0,
+            "{e:?} was scripted"
+        );
     }
 }
