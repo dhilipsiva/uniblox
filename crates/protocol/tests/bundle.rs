@@ -7,7 +7,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use protocol::bundle::{BundleError, load_bundle, load_bundle_dir};
+use protocol::bundle::{
+    BundleError, MAX_BUNDLE_BYTES, load_bundle, load_bundle_dir, load_bundle_dir_limited,
+};
 use protocol::{VersionTriple, content_id};
 
 const SCRIPT: &str = "fn update(a) { a }";
@@ -303,3 +305,35 @@ fn a_bare_relative_manifest_path_loads() {
         .unwrap();
     assert!(status.success());
 }
+
+/// The loader caps the total it reads across all assets, not only each asset (ADR-0046 follow-up):
+/// a manifest may list many assets, each under the per-asset cap.
+#[test]
+fn the_total_across_assets_is_capped() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = vec![b'a'; 60];
+    let b = vec![b'b'; 60];
+    std::fs::write(dir.path().join("game.rhai"), SCRIPT).unwrap();
+    std::fs::write(dir.path().join("a.bin"), &a).unwrap();
+    std::fs::write(dir.path().join("b.bin"), &b).unwrap();
+    let json = manifest(
+        "game.rhai",
+        &[
+            ("game.rhai", content_id(SCRIPT.as_bytes()).to_hex()),
+            ("a.bin", content_id(&a).to_hex()),
+            ("b.bin", content_id(&b).to_hex()),
+        ],
+    );
+    let path = dir.path().join("bundle.json");
+    std::fs::write(&path, json).unwrap();
+    let total = (SCRIPT.len() + 120) as u64;
+    assert!(load_bundle_dir_limited(&path, total).is_ok(), "exactly at the cap");
+    let err = load_bundle_dir_limited(&path, total - 1).unwrap_err();
+    assert!(
+        matches!(err, BundleError::TotalTooLarge { limit } if limit == total - 1),
+        "{err:?}"
+    );
+    assert!(load_bundle_dir(&path).is_ok());
+    assert_eq!(MAX_BUNDLE_BYTES, 256 * 1024 * 1024);
+}
+
