@@ -123,6 +123,8 @@ Rough, solo, order-of-magnitude, low-confidence (scope-dependent):
 
 ## 7. Naming state
 
+**Closed for the library path (2026-10-21), pending the owner's confirmation: DECISIONS.md ADR-0043.** The name stays `uniblox` for the open-source library and the hosted demo, as the owner ruled (decision D10). The US trademark screen in ADR-0043 found no UNIBLOX record, but a pending UNIBOX application for game software and a pattern of Roblox oppositions against "-BLOX" game marks; a formal clearance by a trademark attorney is recommended before any commercial game-platform launch, paid service or filing, and may lead to a rename. The candidates below are the record of the earlier search and the fallbacks; they have not been screened.
+
 Constraints were: ≤8 chars, one pronounceable word, coined/inventable, and — critically — free `.com` + crates.io + GitHub org. That combination is nearly unsatisfiable; short pronounceable `.com`s are almost universally squatted, and short GitHub handles are almost all claimed.
 
 - **`skeinia`** — the only candidate free on all three including `.com`. (Skein = a coil of woven thread *and* the word for a flock of geese in V-formation — threads-in-a-mesh + flocking-without-a-center. Reads as a clean brandable coinage.)

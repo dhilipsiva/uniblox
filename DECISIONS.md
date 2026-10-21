@@ -1577,3 +1577,78 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   behaviour changes above and corrections to this record. `just ci` re-run green; transport, replication and
   server tests 12 runs, 0 failures.
 - **Status:** Proposed (2026-10-21) on branch `todo/P2-UNIBLOX-01`; accepted when merged.
+
+## ADR-0042 — the product path: a netcode library plus a hosted demo (D10 = A)
+- **Context:** the 2026-10-20 portfolio assessment asked which of two paths uniblox takes: (A) a netcode library
+  plus a hosted tech demo, or (B) the full 14-phase UGC platform this repository was designed as (TODO.md,
+  "Phased build sequence"). The owner ruled on 2026-10-21, decision D10 in the owner's portfolio decision log
+  (github.com/dhilipsiva/products, DECISIONS.md): "(A) with the name kept, as recommended; the trademark screen
+  runs ... before anything is published."
+- **Decision:** the next public step is the library: `protocol`, `replication`, `transport` and `services` on
+  crates.io at 0.x, with Rhai wired in for a sample game and a hosted two-tab demo. The platform phases stay in
+  TODO.md as the design record, not as planned work, and `platform` stays a placeholder. The portfolio plan (not
+  the ruling itself) adds two conditions before anything is published: an independent human review of the
+  replication and ownership-arbitration core, and authentication, rate limiting and signed ownership events on
+  the signaling path.
+- **Consequences:** the architecture (ADR-0001 to ADR-0041) is unchanged; this decides what ships, not how it
+  works. The work this path draws from the phase plan:
+  - Phase 5: Mode 2 end to end in the browser, and the registry's TTL crash cleanup.
+  - Phase 6: only the device keypair and reliable-channel signing, which make ownership events unforgeable.
+  - Phase 8: only the bundle manifest and loader, for the Rhai sample game.
+  - Phase 9: a deployable Mode 3 (images or a NixOS module, idle-session teardown, a per-session cost model)
+    and time-limited TURN credentials. Phase 9 ties TURN credentials to payment, which this path does not
+    build, so their gate is decided when that work starts.
+  - Phase 11: signaling authentication and rate limiting. The Mode-2 plausibility checks are not scheduled.
+  - Phase 12: the sandbox hardening.
+  - Phase 14: only health and metrics endpoints and structured logs.
+  Not on this path: OAuth accounts and billing (Phase 6), the platform's Postgres schema and object storage
+  (Phase 7), the publish pipeline and moderation (Phase 8), fleet orchestration (Phase 9), hot update and native
+  distribution (Phase 10), social and trust & safety (Phase 13), and native parity, browser audio and autoscaling
+  (Phase 14).
+- **Status:** Accepted (2026-10-21, owner ruling D10).
+
+## ADR-0043 — the name: keep uniblox for the library and the demo, pending the owner's confirmation
+- **Context:** docs/CONTEXT.md section 7 left naming open, with the unscreened coinages `skeinia` and `manifld`.
+  D10 kept `uniblox` and ordered a trademark screen before anything is published. This is that screen, run on
+  2026-10-21. It is informal, not legal clearance, and covers the United States only: USPTO's trademark search,
+  TTABVue, Trademarkia, RDAP, crates.io, npm and GitHub were reachable; WIPO's Global Brand Database and TSDR
+  were not.
+- **Screen result:**
+  - The exact mark: USPTO has no UNIBLOX record. The nearest is UNIBLOXX (serial 86289245, Class 20 furniture,
+    abandoned 2015).
+  - The name in use: UniBlox, a Seattle insurance-software company founded in 2022 (a no-code platform for
+    selling insurance), which also holds the GitHub organisation `uniblox` (uniblox.io); and a Roblox experience,
+    "UniBlox Donation [ALPHA]" (created 2022, under 100 visits).
+  - Nearby US marks:
+    - UNIBOX, application 99915172, filed 2026-06-30 by Eden Creative Studio Inc. (Montréal), not yet examined.
+      It covers Classes 9, 41 and 42, including downloadable video game software and a platform for game
+      development: our market.
+    - UNIBOX, registration 76183066, a modular packaging system for electronics (Class 9 hardware, registered
+      2002, renewed).
+    - UNIBLOC, registrations 1969508 (Class 7 pumps, renewed) and 3202426 (Class 9 sensors).
+    - UNIBOBLX, registration 7660729 (Class 28 bobblehead dolls, registered 2025).
+    - u-blox (GNSS chips), which sounds alike.
+  - Roblox Corporation opposes "-BLOX" marks systematically. TTABVue lists about two dozen Roblox
+    proceedings, among them:
+    - HOT BLOX, opposition 91289835, filed 2024-02-16 on its ROBLOX, BLOXY and BLOX PARTY marks; sustained
+      by default on 2024-05-17, and the application was abandoned.
+    - TNXBLOX, opposition 91302516, sustained 2026-02-26.
+    - XPLORABLOX, opposition 91310549, filed 2026-09-22 and pending.
+    - Earlier cases against BLOXEEZ (2019) and BLOXI (2020).
+  - Availability, checked 2026-10-21:
+    - Free: the crates.io names `uniblox`, `uniblox-protocol`, `uniblox-replication`, `uniblox-transport` and
+      `uniblox-services`, and npm `uniblox`.
+    - Taken: uniblox.com, registered by another party since 2012.
+- **Verdict:** the screen does not fail the name for an open-source library and demo. Nothing registered or
+  applied for is UNIBLOX, and the exact-name user sells insurance software. It does find a material risk for
+  any game-platform product under this name. Two facts sit in our market: an unexamined UNIBOX application for
+  game software, and Roblox's opposition record against "-BLOX" game marks.
+- **Proposed decision:** keep `uniblox` for the library and the demo, publishing the crates under the
+  `uniblox-*` names above (re-check on release day). This reads D10's "rename only if a public product follows"
+  as meaning a commercial game platform; a crates.io release with a demo is arguably a public product too, so
+  this reading is the owner's to confirm. Recommended, not ruled: get a formal clearance from a trademark
+  attorney before any commercial platform, paid service or trademark filing. The Roblox record makes a rename
+  likely at that point. That is an inference, and `skeinia` and `manifld` remain unscreened fallbacks.
+- **Consequences:** naming is closed for the library path once the owner confirms. It reopens with a commercial
+  platform, or if the owner renames before the first crates.io publish.
+- **Status:** Proposed (2026-10-21) on branch `todo/P4-UNIBLOX-01`; accepted when the owner confirms the name.
