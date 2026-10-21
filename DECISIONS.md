@@ -1735,7 +1735,7 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   - A hard link to an outside file is read; its bytes must still match the listed id.
   - A writer racing the loader inside the bundle directory could still swap in a FIFO between the checks
     and `open`, which is outside this local loader's threat model.
-  - There is no total cap across assets (Phase 12).
+  - All assets together are capped at 256 MiB (`MAX_BUNDLE_BYTES`, added in the ADR-0046 pass).
   - The opt-out markers (`Unscripted`, `Controlled`, `ControlledBy`) are local, so a player avatar handed
     off or migrated in Mode 2 would be scripted on its new owner. No live path does that yet; it needs
     a wire-level control marker when Mode-2 avatars exist.
@@ -1776,7 +1776,8 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   measured in wasm; measuring it is due when the browser client first loads content. A wasm stack overflow
   traps and ends the player's own tab, not the machine.
 - **Decision — budgets:** `ScriptLimits` (defaults in brackets):
-  - a source cap checked before compile [256 KiB], with `from_file` and hot reload reading bounded;
+  - a source cap checked before compile [256 KiB], with `from_file` and hot reload reading bounded, and a
+    total cap across a content bundle's assets [256 MiB] in `protocol::bundle::load_bundle_dir`;
   - a wall-clock watchdog per call through `on_progress` [50 ms], checked every 64 operations on
     `web_time::Instant` (std's natively, the browser clock on wasm32). It catches a host function that blocks
     at the script's next operation; it cannot interrupt one that never returns;

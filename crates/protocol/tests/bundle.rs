@@ -327,7 +327,10 @@ fn the_total_across_assets_is_capped() {
     let path = dir.path().join("bundle.json");
     std::fs::write(&path, json).unwrap();
     let total = (SCRIPT.len() + 120) as u64;
-    assert!(load_bundle_dir_limited(&path, total).is_ok(), "exactly at the cap");
+    assert!(
+        load_bundle_dir_limited(&path, total).is_ok(),
+        "exactly at the cap"
+    );
     let err = load_bundle_dir_limited(&path, total - 1).unwrap_err();
     assert!(
         matches!(err, BundleError::TotalTooLarge { limit } if limit == total - 1),
@@ -336,4 +339,3 @@ fn the_total_across_assets_is_capped() {
     assert!(load_bundle_dir(&path).is_ok());
     assert_eq!(MAX_BUNDLE_BYTES, 256 * 1024 * 1024);
 }
-

@@ -65,6 +65,8 @@ pub enum BundleError {
     EntryNotUtf8(String),
     /// A file on disk is larger than the loader reads.
     TooLarge { path: String, limit: u64 },
+    /// The assets together are larger than the loader reads in total.
+    TotalTooLarge { limit: u64 },
 }
 
 impl fmt::Display for BundleError {
@@ -83,6 +85,12 @@ impl fmt::Display for BundleError {
             BundleError::EntryNotUtf8(p) => write!(f, "entry {p:?} is not UTF-8"),
             BundleError::TooLarge { path, limit } => {
                 write!(f, "{path:?} is larger than the {limit}-byte limit")
+            }
+            BundleError::TotalTooLarge { limit } => {
+                write!(
+                    f,
+                    "the assets together are larger than the {limit}-byte limit"
+                )
             }
         }
     }
@@ -222,9 +230,11 @@ fn load_with(
     })
 }
 
-/// The most [`load_bundle_dir`] reads for one asset (64 MiB) and for the manifest (1 MiB).
+/// The most [`load_bundle_dir`] reads for one asset (64 MiB), for the manifest (1 MiB) and for all
+/// assets together (256 MiB).
 pub const MAX_ASSET_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+pub const MAX_BUNDLE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Read one regular file, refusing symlinks, special files (FIFOs, devices), anything that resolves
 /// outside `root`, and anything over `limit` bytes. Any refusal except size reads as missing.
@@ -276,11 +286,20 @@ fn read_regular(
 /// Native convenience: load the bundle whose manifest is the file at `manifest_path`, reading assets
 /// relative to the manifest's directory. Only regular files that resolve inside that directory are
 /// read (no symlinks, FIFOs or devices), each at most [`MAX_ASSET_BYTES`]; the manifest itself at most
-/// [`MAX_MANIFEST_BYTES`]. A hard link to a file outside the bundle cannot be told apart by path and is
-/// read; its bytes must still match the listed id. There is no total cap across assets yet (TODO.md
-/// Phase 12).
+/// [`MAX_MANIFEST_BYTES`], and all assets together at most [`MAX_BUNDLE_BYTES`]. A hard link to a file
+/// outside the bundle cannot be told apart by path and is read; its bytes must still match the listed
+/// id.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn load_bundle_dir(manifest_path: &std::path::Path) -> Result<Bundle, BundleError> {
+    load_bundle_dir_limited(manifest_path, MAX_BUNDLE_BYTES)
+}
+
+/// [`load_bundle_dir`] with an explicit total cap across all assets, in bytes.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_bundle_dir_limited(
+    manifest_path: &std::path::Path,
+    max_total_bytes: u64,
+) -> Result<Bundle, BundleError> {
     let manifest_err =
         |e: &dyn fmt::Display| BundleError::Manifest(format!("{}: {e}", manifest_path.display()));
     // A bare file name has an empty parent: that is the current directory.
@@ -299,8 +318,22 @@ pub fn load_bundle_dir(manifest_path: &std::path::Path) -> Result<Bundle, Bundle
             },
         )?;
     let json = String::from_utf8(json).map_err(|e| manifest_err(&e))?;
+    let mut used: u64 = 0;
     load_with(&json, |rel| {
-        read_regular(&root, &dir.join(rel), rel, MAX_ASSET_BYTES)
+        let left = max_total_bytes.saturating_sub(used);
+        let bytes = read_regular(&root, &dir.join(rel), rel, MAX_ASSET_BYTES.min(left)).map_err(
+            |e| match e {
+                // Over what the total has left, but within the per-asset cap: the total is the limit.
+                BundleError::TooLarge { limit, .. } if limit < MAX_ASSET_BYTES => {
+                    BundleError::TotalTooLarge {
+                        limit: max_total_bytes,
+                    }
+                }
+                other => other,
+            },
+        )?;
+        used += bytes.len() as u64;
+        Ok(bytes)
     })
 }
 
