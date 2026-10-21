@@ -14,3 +14,7 @@ postcard.workspace = true
 blake3.workspace = true
 # The content-bundle manifest is JSON (ADR-0045).
 serde_json.workspace = true
+
+[dev-dependencies]
+# bundle.rs builds bundle directories with symlinks and FIFOs (ADR-0045).
+tempfile.workspace = true

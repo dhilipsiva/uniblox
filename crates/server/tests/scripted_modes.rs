@@ -255,3 +255,165 @@ fn without_the_script_the_entities_leave_the_arena() {
     let mut q = world.query::<&Position>();
     assert!(q.iter(&world).any(|p| p.x.abs() > ARENA.0));
 }
+
+// ── Audit follow-ups (2026-10-21): ownership moves, receivers, load_content ──
+
+/// The mode_proof harness as a stepper, so a test can move ownership mid-run.
+fn peers(ids: &[u64], owners: &[u64], src: &str) -> (Vec<Participant>, Vec<(usize, Entity)>) {
+    let mut ps: Vec<Participant> = ids
+        .iter()
+        .map(|&id| {
+            let mut world = World::new();
+            insert_sim(&mut world, PeerId(id), DT);
+            let mut schedule = Schedule::default();
+            schedule.add_systems((advance_tick, run_entity_scripts, simulate).chain());
+            let repl = Replication::new(&mut world);
+            Participant { id: PeerId(id), world, schedule, repl }
+        })
+        .collect();
+    let mut spawned = Vec::new();
+    for ((pos, vel), &owner) in demo_spawns().into_iter().zip(owners) {
+        let i = ps.iter().position(|p| p.id == PeerId(owner)).unwrap();
+        let p = &mut ps[i];
+        spawned.push((i, spawn_owned(&mut p.world, p.id, pos, vel)));
+    }
+    for p in ps.iter_mut() {
+        enable_scripts(&mut p.world, ScriptEngine::from_source(src).unwrap());
+    }
+    let all: Vec<PeerId> = ps.iter().map(|p| p.id).collect();
+    for p in ps.iter_mut() {
+        for &other in &all {
+            if other != p.id {
+                p.repl.track_peer(other);
+            }
+        }
+    }
+    (ps, spawned)
+}
+
+/// One round over the participants that are still `live`.
+fn round(ps: &mut [Participant], live: &[bool]) {
+    for (p, &on) in ps.iter_mut().zip(live) {
+        if on {
+            p.schedule.run(&mut p.world);
+        }
+    }
+    let outboxes: Vec<_> = ps
+        .iter_mut()
+        .zip(live)
+        .filter(|(_, on)| **on)
+        .map(|(p, _)| (p.id, p.repl.collect_all(&mut p.world)))
+        .collect();
+    for (p, &on) in ps.iter_mut().zip(live) {
+        if !on {
+            continue;
+        }
+        for (from, outs) in &outboxes {
+            if *from == p.id {
+                continue;
+            }
+            let Some(out) = outs.iter().find(|(t, _)| *t == p.id).map(|(_, o)| o) else {
+                continue;
+            };
+            for ev in &out.events {
+                p.repl.apply_events(&mut p.world, *from, ev);
+            }
+            if let Some(state) = &out.state {
+                p.repl.apply_state(&mut p.world, *from, state);
+            }
+        }
+    }
+}
+
+fn sample_src() -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content/sample/manifest.json");
+    load_bundle_dir(&path).unwrap().entry_source
+}
+
+/// Every entity a participant owns is inside the arena, and it owns `expected` of them.
+fn assert_owner_keeps_them_in_arena(label: &str, p: &mut Participant, expected: usize) {
+    let owned = owned_positions(p);
+    assert_eq!(owned.len(), expected, "{label}: owned entity count");
+    assert_in_arena(label, &owned);
+}
+
+/// Mode 2: peer 1 (the coordinator) hands an entity to peer 2 mid-game; peer 2 runs its script from
+/// then on, so it stays in the arena.
+#[test]
+fn a_handed_off_entity_keeps_running_its_script() {
+    let (mut ps, spawned) = peers(&[1, 2], &[1, 1, 1], &sample_src());
+    let live = [true, true];
+    for _ in 0..200 {
+        round(&mut ps, &live);
+    }
+    let (owner, e) = spawned[0];
+    ps[owner]
+        .repl
+        .transfer_ownership(&mut ps[owner].world, e, PeerId(2))
+        .expect("peer 1 owns it");
+    for _ in 200..TICKS {
+        round(&mut ps, &live);
+    }
+    assert_owner_keeps_them_in_arena("peer 2 after the handoff", &mut ps[1], 1);
+    assert_owner_keeps_them_in_arena("peer 1 after the handoff", &mut ps[0], 2);
+}
+
+/// Mode 2: peer 1 leaves; peer 2 inherits its entities by host migration and runs their script.
+#[test]
+fn a_migrated_entity_keeps_running_its_script() {
+    let (mut ps, _) = peers(&[1, 2], &[1, 1, 2], &sample_src());
+    for _ in 0..200 {
+        round(&mut ps, &[true, true]);
+    }
+    let survivor = &mut ps[1];
+    survivor.repl.untrack_peer(PeerId(1));
+    let moved = survivor.repl.reassign_orphans(&mut survivor.world, PeerId(1));
+    assert_eq!(moved.len(), 2, "peer 2 inherits peer 1's two entities");
+    for _ in 200..TICKS {
+        round(&mut ps, &[false, true]);
+    }
+    assert_owner_keeps_them_in_arena("peer 2 after migration", &mut ps[1], 3);
+}
+
+/// Receivers carry the marker on their replicas but never run another peer's script: a probe
+/// script that sets an impossible velocity never shows up on a Mode-3 client.
+#[test]
+fn receivers_never_run_scripts_on_replicas() {
+    let (mut ps, _) = peers(&[0, 1, 2], &[0, 0, 0], "fn update(a) { a.vx = 123.0; a }");
+    for _ in 0..20 {
+        round(&mut ps, &[true, true, true]);
+    }
+    for p in ps.iter_mut().skip(1) {
+        let mut q = p.world.query::<(&engine_core::Scripted, &Velocity)>();
+        assert_eq!(q.iter(&p.world).count(), 3, "client replicas are marked");
+        // Run the client's sim once more WITHOUT applying the server's state: a receiver that ran
+        // scripts would now show the probe velocity on its replicas.
+        p.schedule.run(&mut p.world);
+        let mut q = p.world.query::<(&Owner, &Velocity)>();
+        for (owner, vel) in q.iter(&p.world) {
+            assert_eq!(owner.0, PeerId(0));
+            assert_eq!(vel.x, 123.0, "the server's scripted velocity replicates");
+        }
+    }
+    // The control that makes the check above meaningful: with no state applied, a client's replica
+    // velocity changes only if the client itself ran the script. Prove that by giving one replica a
+    // different velocity and running the client again.
+    let client = &mut ps[1];
+    let mut q = client.world.query::<(Entity, &Velocity)>();
+    let (e, _) = q.iter(&client.world).next().unwrap();
+    client.world.get_mut::<Velocity>(e).unwrap().x = -7.0;
+    client.schedule.run(&mut client.world);
+    assert_eq!(client.world.get::<Velocity>(e).unwrap().x, -7.0, "the client did not run it");
+}
+
+/// `standalone::load_content` loads the sample bundle and refuses a missing one.
+#[test]
+fn standalone_load_content_loads_the_sample_and_refuses_a_missing_bundle() {
+    let mut app = standalone::build_standalone_app(PeerId(1), 3);
+    let good = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content/sample/manifest.json");
+    standalone::load_content(&mut app, &good).expect("the sample bundle loads");
+    let world = app.world_mut();
+    assert_eq!(world.query::<&engine_core::Scripted>().iter(world).count(), 3);
+    let mut app = standalone::build_standalone_app(PeerId(1), 3);
+    assert!(standalone::load_content(&mut app, Path::new("/nonexistent/manifest.json")).is_err());
+}

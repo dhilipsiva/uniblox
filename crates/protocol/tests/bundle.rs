@@ -151,3 +151,87 @@ fn the_sample_bundle_loads_from_disk() {
     assert_eq!(bundle.entry, "arena.rhai");
     assert!(bundle.entry_source.contains("fn update(a)"));
 }
+
+// ── Audit follow-ups (2026-10-21): the on-disk loader, Windows names ──
+
+/// Reserved Windows device names and segments ending in a dot or space are not plain paths.
+#[test]
+fn windows_device_names_are_rejected() {
+    for bad in ["CON", "nul", "aux.rhai", "art/COM1.txt", "lpt9", "a.", "a ", "..."] {
+        let json = manifest(bad, &[(bad, content_id(b"x").to_hex())]);
+        let err = load_bundle(&json, |_| Some(b"x".to_vec())).unwrap_err();
+        assert!(matches!(err, BundleError::BadPath(_)), "{bad:?}: {err:?}");
+    }
+}
+
+#[cfg(unix)]
+mod on_disk {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    /// A bundle directory with `manifest.json` listing `name` with the id of `secret`.
+    fn bundle_dir(name: &str, secret: &[u8]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("manifest.json"),
+            manifest(name, &[(name, content_id(secret).to_hex())]),
+        )
+        .unwrap();
+        dir
+    }
+
+    /// A symlinked asset pointing outside the bundle is not read, even when its hash matches.
+    #[test]
+    fn a_symlink_to_a_file_outside_the_bundle_is_not_followed() {
+        let outside = tempfile::tempdir().unwrap();
+        let secret = b"SECRET OUTSIDE THE BUNDLE";
+        std::fs::write(outside.path().join("secret.txt"), secret).unwrap();
+        let dir = bundle_dir("leak.txt", secret);
+        symlink(outside.path().join("secret.txt"), dir.path().join("leak.txt")).unwrap();
+        let err = load_bundle_dir(&dir.path().join("manifest.json")).unwrap_err();
+        assert!(matches!(err, BundleError::MissingAsset(_)), "{err:?}");
+    }
+
+    /// A symlinked directory inside the bundle does not let a path escape through it.
+    #[test]
+    fn a_symlinked_directory_is_not_followed() {
+        let outside = tempfile::tempdir().unwrap();
+        let secret = b"through the link";
+        std::fs::write(outside.path().join("f.txt"), secret).unwrap();
+        let dir = bundle_dir("root/f.txt", secret);
+        symlink(outside.path(), dir.path().join("root")).unwrap();
+        let err = load_bundle_dir(&dir.path().join("manifest.json")).unwrap_err();
+        assert!(matches!(err, BundleError::MissingAsset(_)), "{err:?}");
+    }
+
+    /// A FIFO (or any non-regular file) is refused at once instead of blocking the loader.
+    #[test]
+    fn a_fifo_is_refused_without_blocking() {
+        let dir = bundle_dir("pipe", b"x");
+        let fifo = dir.path().join("pipe");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        if !made.is_ok_and(|s| s.success()) {
+            eprintln!("SKIPPED: mkfifo is unavailable");
+            return;
+        }
+        let path = dir.path().join("manifest.json");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(load_bundle_dir(&path).is_err());
+        });
+        let refused = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the loader blocked on a FIFO");
+        assert!(refused);
+    }
+
+    /// A regular file inside the bundle still loads.
+    #[test]
+    fn a_regular_file_in_a_subdirectory_loads() {
+        let dir = bundle_dir("art/a.rhai", b"fn update(a) { a }");
+        std::fs::create_dir(dir.path().join("art")).unwrap();
+        std::fs::write(dir.path().join("art/a.rhai"), b"fn update(a) { a }").unwrap();
+        let bundle = load_bundle_dir(&dir.path().join("manifest.json")).unwrap();
+        assert_eq!(bundle.entry_source, "fn update(a) { a }");
+    }
+}
