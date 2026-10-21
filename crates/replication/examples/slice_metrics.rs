@@ -274,7 +274,10 @@ async fn main() {
     let path = "target/slice-metrics.json";
     match serde_json::to_string_pretty(&json) {
         Ok(body) => {
-            if let Err(err) = std::fs::write(path, body) {
+            // `target/` is absent when cargo builds elsewhere (CARGO_TARGET_DIR).
+            if let Err(err) =
+                std::fs::create_dir_all("target").and_then(|()| std::fs::write(path, body))
+            {
                 eprintln!("[slice-metrics] could not write {path}: {err}");
                 std::process::exit(1);
             }

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **uniblox** — a browser-first, native-secondary, Rust→WASM platform for user-generated multiplayer games. The one novel, load-bearing idea is the **authority-swap**: a *single* per-entity authoritative state-replication mechanism where **only the authority assignment varies by mode**, so the same authored simulation runs Standalone (Mode 1), P2P Hybrid (Mode 2), and Full-Server (Mode 3) with **no logic fork**.
 
-Engine: **Bevy 0.19** (ECS) on wgpu · UGC logic in sandboxed **Rhai** · transport is **WebRTC DataChannels only** (matchbox in-browser, str0m native/server).
+Engine: **Bevy 0.20** (ECS) on wgpu · UGC logic in sandboxed **Rhai** · transport is **WebRTC DataChannels only** (matchbox in-browser, str0m native/server).
 
 ## Current state (read this first)
 
@@ -15,7 +15,7 @@ Live status is in `PROJECT_STATE.md` and the reason behind every design choice i
 - **Done:** Phase 1 (the vertical slice; the authority-swap gate passed, ADR-0014; the Bevy client renders in the browser, ADR-0017), Phase 2 bar the deploy-gated real-network numbers, the Phase-3 replication core (acked-baseline deltas, interest management, prediction and reconciliation, ownership arbitration, host migration, resync; ADR-0020 to ADR-0029), and Phase 4 (the net-free Mode-1 runtime and content-addressed saves, ADR-0030 to ADR-0036).
 - **Underway:** Phase 5, central services: scoped signaling, the asymmetric version filter, `?next=N` session grouping and a shared Redis registry are done (ADR-0037 to ADR-0040); the Mode-2 coordinator peer service, atomic registry updates, TTL crash cleanup, autoscaling and rate limiting are not.
 - **Not built:** Rhai is sandbox-audited but no crate consumes it; `platform` is a stub; the native client is a stub; browser behaviour is verified by hand only.
-- **Measured:** ~3.4 MB brotli per WASM build (8 MB gate), 742 B/s per peer at 2 entities and 20 Hz, native ed25519 sign/verify 13.4/25.7 µs (with the opt-level=3 crypto override in `Cargo.toml`).
+- **Measured** (2026-10-21, README "Measurements"): ~3.45 MB brotli per WASM build (8 MB gate), ~880–920 B/s per peer at 2 entities and 20 Hz, native ed25519 sign/verify 9.3/18.9 µs (with the opt-level=3 crypto override in `Cargo.toml`).
 
 Design docs (read before non-trivial work — do not relitigate decisions they mark settled):
 - `docs/final-buildspec.md` — **the what/how**: resolved technical verdicts, stack table, risk register, phased build sequence.
@@ -66,7 +66,7 @@ direnv exec . cargo fmt
 
 `just ci` is the gate CI runs (fmt, clippy, every test including the `#[ignore]`d coturn/redis ones, rustdoc with `-D warnings`, `cargo deny`, the Mode-1 net-free check); `just --list` shows the rest.
 
-Do **not** run `cargo test --release` — `[profile.release]` sets `panic="abort"`, which the test harness cannot use; plain `cargo test` builds under the dev/test profile (unwind). Toolchain is edition-2024-capable (flake pins Rust ≥ 1.85; currently 1.96).
+Do **not** run `cargo test --release` — `[profile.release]` sets `panic="abort"`, which the test harness cannot use; plain `cargo test` builds under the dev/test profile (unwind). The flake pins Rust 1.99.1 exactly, equal to `rust-version` (Bevy 0.20 needs ≥ 1.97.1).
 
 The **two-WASM-build pipeline** is `scripts/build-wasm.sh` (with `scripts/slice-check.sh`, `scripts/serve.sh`, and the capability-detection page `crates/client/web/index.html`), invoked by the `/build-wasm` and `/slice-check` slash commands. It runs two separate `cargo build --target wasm32-unknown-unknown` invocations — the WebGPU build enables the `webgpu` feature and needs `RUSTFLAGS=--cfg=web_sys_unstable_apis`; the WebGL2 build is the default — each followed by `wasm-bindgen`, then `wasm-opt -Oz --converge` (with the explicit BASELINE wasm-feature flags — never `-all`, which emits encodings stable browsers reject, ADR-0017), then brotli; the optimized artifact takes the `client_bg.wasm` name `client.js` fetches. **The Bevy client renders (ADR-0017)** and the sizes are REAL: ~15.6 MB wasm-opt → **3.38/3.40 MB brotli** per build (2d-pruned, no assets) — size-budget gate PASS (≤ ~8 MB). The size-optimized release profile is `opt-level="z"`, `lto=true`, `codegen-units=1`, `strip=true`, `panic="abort"`.
 

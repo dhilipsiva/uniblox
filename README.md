@@ -4,7 +4,7 @@
 
 uniblox is a browser-first Rust engine for multiplayer games, built around one idea, the *authority-swap*: a single per-entity, authoritative state-replication mechanism in which only the assignment of authority differs between modes. The same simulation therefore runs standalone, peer-to-peer and on a server with no fork in the game logic. It is being developed as a netcode library with a hosted demo.
 
-The simulation uses Bevy 0.19's ECS. The transport is WebRTC DataChannels only (matchbox in the browser, str0m natively; no media, no SFU), and the browser build is single-threaded WebAssembly. Game logic is meant to run as sandboxed Rhai scripts.
+The simulation uses Bevy 0.20's ECS. The transport is WebRTC DataChannels only (matchbox in the browser, str0m natively; no media, no SFU), and the browser build is single-threaded WebAssembly. Game logic is meant to run as sandboxed Rhai scripts.
 
 ## Status
 
@@ -22,6 +22,22 @@ Not built yet:
 - Mode 2 end to end in a browser.
 - Real-network numbers, such as the STUN-only connection rate.
 - Published crates.
+
+## Measurements
+
+Measured on 2026-10-21 with Bevy 0.20 and Rust 1.99.1 (`just wasm`, and the `slice_metrics` example of `replication`), on one Linux workstation:
+
+| What | Result |
+|---|---|
+| WebGL2 build | 16,381,550 bytes after wasm-opt, 3,452,507 bytes brotli |
+| WebGPU build | 16,452,790 bytes after wasm-opt, 3,473,869 bytes brotli |
+| Size budget (8,000,000 bytes brotli per build) | pass, both builds |
+| State replication, 2 entities at ~20 Hz, native loopback | 879 to 918 B/s per peer over three runs (the pre-update tree measures 881 B/s) |
+| Round trip on the reliable channel, native loopback | 4.0 ms, 0.45 ms jitter (1 ms poll granularity) |
+| ed25519 sign / verify, native | 9.3 / 18.9 µs |
+| STUN-only connection success, real-network RTT | not measured yet: needs peers on real networks |
+
+The browser figures in `scripts/slice-check.sh` (cold load, in-browser ed25519) were recorded on 2026-07-11 and have not been re-measured since.
 
 ## Modes
 
@@ -50,7 +66,7 @@ Modes 2 and 3 run identical systems and differ only in ownership data (ADR-0014)
 
 ## Build, run and test
 
-The toolchain (Rust 1.96 with the wasm32 target, wasm-bindgen, wasm-opt, brotli, node, coturn and redis) comes from the Nix flake:
+The toolchain (Rust 1.99.1 with the wasm32 target, wasm-bindgen, wasm-opt, brotli, node, coturn and redis) comes from the Nix flake:
 
 ```bash
 nix develop                  # or `direnv allow` once; .envrc uses the flake

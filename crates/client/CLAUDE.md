@@ -4,7 +4,7 @@
 **Risk tier:** standard.
 
 ## Status
-**Bevy 0.19 renders (ADR-0017)** — wasm32-ONLY dependency (native Bevy would
+**Bevy 0.20 renders (ADR-0017; 0.19 → 0.20 in ADR-0041)** — wasm32-ONLY dependency (native Bevy would
 drag alsa/udev/X11 into the devShell; native parity is Phase 14), pruned to
 `["2d", "bevy_winit", "webgl2"]` (+`bevy/webgpu` via the crate's `webgpu`
 feature for the second build). **Mode-1 (Standalone) playable view (ADR-0031):**

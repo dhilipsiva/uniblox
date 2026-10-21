@@ -172,7 +172,7 @@ bullets. Remaining Phase-5: the Mode-2 coordinator peer service.
   client renders (ADR-0017).
 - **`.mcp.json`** scaffold (github, read-only postgres, docs/Context7, playwright).
 - **Nix flake devShell + direnv** (ADR-0010) — `flake.nix`/`flake.lock`/`.envrc` provide a pinned
-  Rust toolchain (1.96.1, wasm32 target) + `wasm-bindgen`/`wasm-opt`/`brotli`/`twiggy`/`node`,
+  Rust toolchain (1.99.1 since ADR-0041, wasm32 target) + `wasm-bindgen`/`wasm-opt`/`brotli`/`twiggy`/`node`,
   auto-activated on `cd` and via `direnv exec .`. Cargo/tool scripts self-activate.
 - **Rhai ↔ Bevy-ECS bridge** (ADR-0011, first real deps — rhai 1.25 non-sync + bevy_ecs 0.19) —
   locked-down `new_raw()` engine + all `set_max_*` limits + `eval` disabled, held as a NonSend resource,
@@ -338,7 +338,7 @@ bullets. Remaining Phase-5: the Mode-2 coordinator peer service.
 - Phase 3 depth beyond the core and Phase 12 (sandbox hardening) each need a human-owned HIGH pass.
 
 ## Toolchain notes
-**The toolchain comes from the Nix flake devShell** (ADR-0010): pinned Rust 1.96.1 (edition 2024, wasm32
+**The toolchain comes from the Nix flake devShell** (ADR-0010): pinned Rust 1.99.1 (edition 2024, wasm32
 target) + `wasm-bindgen`/`wasm-opt`/`brotli`/`twiggy`/`node`/`coturn`/`redis`. Run `direnv allow` once per
 clone, or work inside `nix develop`. Interactive `cd` auto-activates; in non-interactive shells prefix
 cargo/WASM-tool/npx commands with `direnv exec .` (compound chains: `direnv exec . bash -c '<a && b>'`).

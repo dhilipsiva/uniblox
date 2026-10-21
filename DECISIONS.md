@@ -1521,3 +1521,39 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   deferred; `session_count`'s transient `SCARD` disagreement is documented + MULTI/Lua-deferred). **Re-review of the
   fix delta → fixes sound, no HIGH/MEDIUM, no regressions.**
 - **Status:** Accepted (2026-07-13).
+
+## ADR-0041 — dependency currency (2026-10-21): Bevy 0.20, str0m 0.24, redis 1.6, Rust 1.99.1; three pins kept
+- **Context:** the 2026-10-20 portfolio assessment found the workspace behind its main dependencies (Bevy 0.19 vs
+  0.20, str0m 0.21 vs 0.24, redis 0.27 vs 1.x, webrtc 0.17 vs 0.21), the `wasm-bindgen` crate and CLI agreeing
+  only because the nixpkgs revision happened to ship 0.2.121, and `cargo deny` failing on 15 advisory hits, a
+  yanked crate and wildcard path dependencies. The safety net is the 246-test suite, the coturn and Redis tests
+  included.
+- **Decision — moved:** `nix flake update` (nixpkgs 2026-10-20, rust-overlay 2026-10-21) with the toolchain pinned
+  EXACTLY to Rust 1.99.1 instead of `stable.latest`, and `rust-version` 1.96 → 1.99 (Bevy 0.20 needs ≥ 1.97.1);
+  Bevy 0.19 → 0.20 (no code changes in engine-core, replication, server, standalone or the client, both wasm
+  variants included); str0m 0.21 → 0.24.1 (no code changes; its 0.22–0.24 changelog is mostly media, and the
+  data-channel entries are fixes); redis 0.27 → 1.6 (no code changes); async-trait 0.1.92 (clippy's
+  `double_must_use` on newer Rust); rustls 0.23.46, rustls-webpki 0.103.16 and spin 0.10.1 through
+  semver-compatible updates; the internal path dependencies gained `version = "0.1.0"` (the wildcard bans).
+- **Decision — wasm-bindgen pinned together:** the crate pin moves `=0.2.121` → `=0.2.129` together with the
+  flake's CLI, now the versioned `wasm-bindgen-cli_0_2_129` attribute, so a nixpkgs bump cannot move it; `flake.nix`
+  reads the crate version from Cargo.lock and refuses to evaluate the dev shell when the two differ.
+- **Decision — kept, with reasons:**
+  - `webrtc` 0.17 (the transport tests' dev-dependency) stays at the version `matchbox_socket` 0.14 uses, so the
+    TURN relay proof keeps running on the webrtc-rs that matchbox native is built on. Moving it alone to 0.21
+    would test a library matchbox does not use.
+  - `tungstenite` / `tokio-tungstenite` 0.29 stay unified with axum 0.8.9 under `matchbox_signaling`.
+  - matchbox 0.14.0 is the latest release, so its async-tls 0.13 → rustls 0.21 / rustls-webpki 0.101 /
+    webpki-roots 0.22 stack stays: 7 advisories, reachable only when a native peer dials signaling over `wss://`
+    (the defaults are `ws://`). quick-xml 0.39 (2 advisories) stays under Bevy 0.20's winit and wayland-scanner,
+    at build time only. All 9 are dated ignores in `deny.toml` (expiring 2027-01-19), to close through a
+    matchbox release, a `[patch]`, or a newer winit.
+- **Consequences:** `cargo deny check advisories bans licenses sources` passes with those 9 ignores and no other
+  exception; `just ci` (fmt, clippy, 246 tests, rustdoc, deny, net-free) passes on Rust 1.99.1; both WASM builds
+  succeed after the flake update (3,452,507 / 3,473,869 bytes brotli, +1.5% on Bevy 0.19, gate PASS) and the
+  client renders in headless Chrome (WebGL2 via SwiftShader: the avatar and NPCs draw). Native measurements,
+  recorded in README "Measurements": replication 879–918 B/s per peer at 2 entities and ~20 Hz over three runs
+  (the pre-update tree measures 881 B/s, so the bump changed nothing on the wire; the 742 B/s in the Phase-1
+  notes was measured on an earlier tree), loopback RTT 4.0 ms, ed25519 sign/verify 9.3/18.9 µs. The
+  `slice_metrics` example now creates `target/` before writing its JSON.
+- **Status:** Proposed (2026-10-21) on branch `todo/P2-UNIBLOX-01`; accepted when merged.

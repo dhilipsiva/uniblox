@@ -33,7 +33,7 @@ direnv exec . <CMD>
 Toolchain notes (these differ from nibli — do not copy nibli's habits):
 
 - **The toolchain comes from a Nix flake devShell** (`flake.nix`, `DECISIONS.md` ADR-0010): pinned Rust
-  (cargo/rustc/clippy/rustfmt, wasm32 target, currently 1.96) + `wasm-bindgen`/`wasm-opt`/`brotli`/`twiggy`/
+  (cargo/rustc/clippy/rustfmt, wasm32 target, currently 1.99.1) + `wasm-bindgen`/`wasm-opt`/`brotli`/`twiggy`/
   `node`, all pinned by `flake.lock`. Run **`direnv allow`** once per clone. Interactive `cd` auto-activates
   (direnv + nix-direnv); non-interactive shells enter it via the `direnv exec .` prefix above.
   Without it, an ambient rustup may resolve cargo instead, so keep the prefix. The local gate is

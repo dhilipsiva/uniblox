@@ -10,7 +10,7 @@ Implemented. matchbox 0.14 two-channel wrapper (ADR-0012): `Transport::connect`
 builds `CHANNEL_STATE`(0, unreliable/unordered) + `CHANNEL_EVENTS`(1,
 reliable/ordered); `connect_hermetic` (native-only — browsers reject empty ICE
 entries) for offline tests; proven by a hermetic native↔native two-peer test.
-**`Str0mPeer` (ADR-0015, native-only `str0m_peer` module)**: sans-IO str0m 0.21
+**`Str0mPeer` (ADR-0015, native-only `str0m_peer` module)**: sans-IO str0m 0.24
 peer speaking matchbox's signaling protocol (via `matchbox_protocol` +
 blocking tungstenite) with one connection thread per remote peer; interop
 proven hermetically str0m↔native-matchbox (both role directions) and
