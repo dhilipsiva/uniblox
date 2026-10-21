@@ -17,6 +17,11 @@
 //! e.g. a Mode-3 server's `UNIBLOX_SIGNALING_URL`). Warnings are logged unless `RUST_LOG` says
 //! otherwise.
 //!
+//! TURN (ADR-0050): with `UNIBLOX_TURN_SECRET` (coturn's `static-auth-secret`) and `UNIBLOX_TURN_URLS`
+//! (comma-separated `turn:` URLs), `GET /_uniblox/turn?room=<room>&token=<join token>` hands a client
+//! with a valid join token a credential valid for `UNIBLOX_TURN_TTL_SECS` (default 3600, at most a
+//! day). It needs the signaling secret.
+//!
 //! Horizontal scale (ADR-0040): set `UNIBLOX_REDIS_URL` to back the session
 //! registry with a shared Redis so multiple stateless nodes share one listing
 //! (peers of a session must land on the same node — sticky routing). Unset ⇒ a
@@ -28,8 +33,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use services::{
-    ClientIp, JoinTokenKey, MAX_TOKEN_LIFETIME_SECS, RedisRegistryStore, SessionRegistry,
-    SignalingConfig, build_signaling_server_with, unix_now, validate_room,
+    ClientIp, JoinTokenKey, MAX_TOKEN_LIFETIME_SECS, MAX_TURN_TTL_SECS, RedisRegistryStore,
+    SessionRegistry, SignalingConfig, TurnConfig, build_signaling_server_with, unix_now,
+    validate_room,
 };
 
 /// matchbox's conventional signaling port.
@@ -50,6 +56,47 @@ fn key_from_env() -> Option<JoinTokenKey> {
             std::process::exit(2);
         }
     }
+}
+
+/// The TURN relay from `UNIBLOX_TURN_SECRET`, `UNIBLOX_TURN_URLS` and `UNIBLOX_TURN_TTL_SECS`, or exit
+/// with the reason. `None` without a TURN secret.
+fn turn_from_env() -> Option<TurnConfig> {
+    let secret = std::env::var_os("UNIBLOX_TURN_SECRET")?;
+    if secret.is_empty() {
+        eprintln!("[signaling] UNIBLOX_TURN_SECRET is empty");
+        std::process::exit(2);
+    }
+    let urls: Vec<String> = std::env::var("UNIBLOX_TURN_URLS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .map(str::to_string)
+        .collect();
+    if urls.is_empty() {
+        eprintln!(
+            "[signaling] UNIBLOX_TURN_SECRET needs UNIBLOX_TURN_URLS (comma-separated turn: URLs)"
+        );
+        std::process::exit(2);
+    }
+    let ttl = match std::env::var("UNIBLOX_TURN_TTL_SECS")
+        .ok()
+        .map(|s| s.parse::<u64>())
+    {
+        None => 3600,
+        Some(Ok(secs)) if (1..=MAX_TURN_TTL_SECS).contains(&secs) => secs,
+        Some(_) => {
+            eprintln!(
+                "[signaling] UNIBLOX_TURN_TTL_SECS must be a whole number from 1 to {MAX_TURN_TTL_SECS}"
+            );
+            std::process::exit(2);
+        }
+    };
+    Some(TurnConfig {
+        secret: secret.as_encoded_bytes().to_vec(),
+        urls,
+        ttl: Duration::from_secs(ttl),
+    })
 }
 
 /// `services mint-token <room> [lifetime-secs]`: print a join token for `room`.
@@ -128,10 +175,18 @@ async fn main() {
             }
         },
     };
+    let turn = turn_from_env();
+    if turn.is_some() && auth.is_none() {
+        eprintln!(
+            "[signaling] UNIBLOX_TURN_SECRET needs UNIBLOX_SIGNALING_SECRET (credentials go to authenticated clients only)"
+        );
+        std::process::exit(2);
+    }
     let config = SignalingConfig {
         auth,
         issue_tokens,
         token_lifetime: Duration::from_secs(600),
+        turn,
         client_ip,
         ..SignalingConfig::default()
     };

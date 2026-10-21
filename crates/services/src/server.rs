@@ -22,9 +22,10 @@ use uuid::Uuid;
 
 use crate::limits::{IpLimiter, TokenBucket, per_second};
 use crate::{
-    ClientIp, JoinTokenKey, MAX_TOKEN_LIFETIME_SECS, SCOPE_SEP, SessionRegistry, SignalingConfig,
-    SignalingLimits, TOKEN_PARAM, TOKEN_PATH, bad_request, engine_too_old, parse_engine,
-    parse_next, parse_scope, unix_now, validate_room,
+    ClientIp, JoinTokenKey, MAX_TOKEN_LIFETIME_SECS, MAX_TURN_TTL_SECS, SCOPE_SEP, SessionRegistry,
+    SignalingConfig, SignalingLimits, TOKEN_PARAM, TOKEN_PATH, TURN_PATH, TurnConfig, bad_request,
+    engine_too_old, parse_engine, parse_next, parse_scope, turn_credential, unix_now,
+    validate_room,
 };
 
 /// How long a closing peer's writer may take to flush before it is cut off.
@@ -112,6 +113,7 @@ struct Shared {
     auth: Option<JoinTokenKey>,
     issue_tokens: bool,
     token_lifetime: Duration,
+    turn: Option<TurnConfig>,
     limits: SignalingLimits,
     client_ip: ClientIp,
     rate: IpLimiter,
@@ -241,6 +243,67 @@ impl Shared {
         )
             .into_response()
     }
+}
+
+impl Shared {
+    /// A time-limited TURN credential (ADR-0050), only for a client with a valid join token for the
+    /// room it names. 404 without TURN or auth configured.
+    fn turn_credentials(
+        &self,
+        peer: SocketAddr,
+        headers: &HeaderMap,
+        query: &HashMap<String, String>,
+    ) -> Response {
+        let (Some(turn), Some(key)) = (&self.turn, &self.auth) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        if !self
+            .rate
+            .allow(self.client_ip.key(peer, headers), &self.limits)
+        {
+            return too_many_requests();
+        }
+        let Some(room) = query.get("room") else {
+            return bad_request("missing room");
+        };
+        if let Err(reason) = validate_room(room) {
+            return bad_request(reason);
+        }
+        let Some(token) = query.get(TOKEN_PARAM) else {
+            return unauthorized("missing join token");
+        };
+        if let Err(err) = key.verify(token, room, unix_now()) {
+            return unauthorized(err);
+        }
+        let ttl = turn.ttl.as_secs().clamp(1, MAX_TURN_TTL_SECS);
+        // A fresh label per credential: coturn needs no state, and two clients never share one.
+        let label = Uuid::new_v4().simple().to_string();
+        let credential = turn_credential(&turn.secret, &label, unix_now() + ttl);
+        let body = serde_json::json!({
+            "urls": turn.urls,
+            "username": credential.username,
+            "credential": credential.credential,
+            "ttl": ttl,
+        });
+        (
+            [
+                (header::CONTENT_TYPE, "application/json"),
+                (header::CACHE_CONTROL, "no-store"),
+                (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+            ],
+            body.to_string(),
+        )
+            .into_response()
+    }
+}
+
+async fn turn(
+    State(s): State<Arc<Shared>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    s.turn_credentials(peer, &headers, &query)
 }
 
 /// `GET /`: no room. Counted against the attempt rate like any other connection.
@@ -456,6 +519,7 @@ pub(crate) fn build(
         auth: config.auth,
         issue_tokens: config.issue_tokens,
         token_lifetime: config.token_lifetime,
+        turn: config.turn,
         limits: config.limits,
         client_ip: config.client_ip,
         rate: IpLimiter::default(),
@@ -464,6 +528,7 @@ pub(crate) fn build(
     let router = Router::new()
         .route("/", get(no_room))
         .route(TOKEN_PATH, get(token))
+        .route(TURN_PATH, get(turn))
         .route("/{room}", get(join))
         .with_state(shared);
     SignalingServer {

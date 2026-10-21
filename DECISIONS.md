@@ -2005,3 +2005,37 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
 - **Status:** Proposed (2026-10-21) on branch `todo/P4-UNIBLOX-05`, part of a HIGH-risk item. The authorization
   section waits on the owner's decision.
 
+## ADR-0050 — time-limited TURN credentials for authenticated clients
+- **Context:** a TURN relay carries every relayed byte, so it must not be open to anyone. The repository's plan
+  (Phases 9 and 11) asks for coturn's time-limited REST-API credentials, "paid-only" and entitlement-gated.
+  On the library-and-demo path (D10 = A) there is no billing, so the gate is authentication instead of payment.
+- **Decision — the credential:** coturn's REST-API scheme (`use-auth-secret`, `static-auth-secret`). The
+  username is `<expiry>:<label>` and the password is the standard base64 of HMAC-SHA1(secret, username)
+  (`services::turn_credential`). coturn recomputes the password from the shared secret and refuses the
+  credential once the expiry passes, so neither side keeps per-user state. Each credential gets a fresh random
+  label.
+- **Decision — who gets one:** `SignalingConfig::turn` serves `GET /_uniblox/turn?room=<room>&token=<join token>`.
+  It answers only a client whose join token is valid for the room it names (ADR-0047). Otherwise:
+  - a missing or invalid token gets `401`;
+  - a bad room gets `400`;
+  - the endpoint is off (`404`) without TURN or a signaling key.
+  
+  The answer is `{urls, username, credential, ttl}`, with `Cache-Control: no-store` and the same per-IP rate
+  limit as the other endpoints. The binary reads `UNIBLOX_TURN_SECRET`, `UNIBLOX_TURN_URLS` and
+  `UNIBLOX_TURN_TTL_SECS` (default an hour, at most a day). It refuses to start with TURN but no signaling
+  secret.
+- **Known limits:**
+  - a credential is a bearer credential until it expires: whoever holds it can relay through the TURN server.
+    Quotas per user or session are coturn's own settings (`user-quota`, `total-quota`, bandwidth caps), and the
+    operator sets them;
+  - the browser client does not request credentials yet: the client's join path is follow-up work, as for join
+    tokens;
+  - "paid-only" returns as an entitlement check in this endpoint if a billing path (D10 = B) is ever taken.
+- **Consequences:**
+  - `tests/turn.rs` covers the known-answer vectors, the refusals, a credential that expires in its TTL with a
+    fresh label each time, and the endpoint being off without TURN or auth;
+  - `transport/tests/turn_relay.rs` adds a real coturn in `use-auth-secret` mode: a minted credential relays
+    data relay-only, and an expired or foreign-secret one is refused. These tests are ignored and run by
+    `just test-all` and CI.
+- **Status:** Proposed (2026-10-21) on branch `todo/P4-UNIBLOX-05`, part of a HIGH-risk item.
+

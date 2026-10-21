@@ -68,6 +68,7 @@ mod limits;
 mod redis_store;
 mod server;
 mod store;
+mod turn;
 
 use server::PeerTx;
 pub use server::SignalingServer;
@@ -79,6 +80,7 @@ pub use store::{
     DEFAULT_NODE_TTL, MemoryRegistryStore, RegistryError, RegistryResult, RegistryStore,
     SessionInfo,
 };
+pub use turn::{MAX_TURN_TTL_SECS, TurnConfig, TurnCredential, turn_credential};
 
 /// The scope delimiter between a room path's tilde-separated parts.
 pub(crate) const SCOPE_SEP: char = '~';
@@ -248,6 +250,9 @@ pub fn parse_next(query: &HashMap<String, String>) -> Result<Option<usize>, Scop
 /// Where the token endpoint is served: two path segments, so it can never be a room path.
 pub const TOKEN_PATH: &str = "/_uniblox/token";
 
+/// Where TURN credentials are served (ADR-0050): `GET` this `?room=<room>&token=<join token>`.
+pub const TURN_PATH: &str = "/_uniblox/turn";
+
 /// The query parameter that carries a join token.
 pub const TOKEN_PARAM: &str = "token";
 
@@ -265,6 +270,9 @@ pub struct SignalingConfig {
     pub issue_tokens: bool,
     /// The lifetime of a token the endpoint issues (capped at [`MAX_TOKEN_LIFETIME_SECS`]).
     pub token_lifetime: Duration,
+    /// The TURN relay to hand time-limited credentials for, at [`TURN_PATH`] (ADR-0050). Needs
+    /// `auth`: credentials go only to a client with a valid join token for its room.
+    pub turn: Option<TurnConfig>,
     /// The rate limits and caps.
     pub limits: SignalingLimits,
     /// Where the client IP for the per-IP limit comes from.
@@ -277,6 +285,7 @@ impl Default for SignalingConfig {
             auth: None,
             issue_tokens: false,
             token_lifetime: Duration::from_secs(600),
+            turn: None,
             limits: SignalingLimits::default(),
             client_ip: ClientIp::Peer,
         }

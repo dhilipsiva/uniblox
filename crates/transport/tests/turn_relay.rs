@@ -440,7 +440,11 @@ async fn relay_carries(port: u16, user: &str, pass: &str, expect_relay: bool) ->
         }));
     }
     connect_non_trickle(&offerer, &answerer, expect_relay).await;
-    let window = if expect_relay { DEADLINE } else { Duration::from_secs(8) };
+    let window = if expect_relay {
+        DEADLINE
+    } else {
+        Duration::from_secs(8)
+    };
     let carried = matches!(
         tokio::time::timeout(window, received_rx.recv()).await,
         Ok(Some(data)) if data == b"via a minted credential"
@@ -476,7 +480,7 @@ async fn an_expired_or_foreign_turn_credential_is_refused() {
         services::unix_now() - 1,
     );
     assert!(!relay_carries(turn.port, &expired.username, &expired.credential, false).await);
-    let foreign = services::turn_credential(b"another-secret", "peer-a", services::unix_now() + 600);
+    let foreign =
+        services::turn_credential(b"another-secret", "peer-a", services::unix_now() + 600);
     assert!(!relay_carries(turn.port, &foreign.username, &foreign.credential, false).await);
 }
-

@@ -5,8 +5,8 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use services::{
-    JoinTokenKey, SessionRegistry, SignalingConfig, TURN_PATH, TurnConfig, build_signaling_server_with,
-    turn_credential, unix_now,
+    JoinTokenKey, SessionRegistry, SignalingConfig, TURN_PATH, TurnConfig,
+    build_signaling_server_with, turn_credential, unix_now,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -95,7 +95,8 @@ async fn an_authenticated_client_gets_a_time_limited_credential() {
     let token = JoinTokenKey::new(SECRET)
         .unwrap()
         .mint(ROOM, unix_now() + 60);
-    let (status, headers, body) = get(addr, &format!("{TURN_PATH}?room={ROOM}&token={token}")).await;
+    let (status, headers, body) =
+        get(addr, &format!("{TURN_PATH}?room={ROOM}&token={token}")).await;
     assert_eq!(status, 200, "{body}");
     assert!(headers.contains("cache-control: no-store"), "{headers}");
     let json: serde_json::Value = serde_json::from_str(&body).expect("json");
@@ -106,9 +107,15 @@ async fn an_authenticated_client_gets_a_time_limited_credential() {
     let (expiry, label) = username.split_once(':').expect("<expiry>:<label>");
     let expiry: u64 = expiry.parse().expect("a unix expiry");
     let now = unix_now();
-    assert!((now + 590..=now + 610).contains(&expiry), "expires in the TTL: {expiry}");
+    assert!(
+        (now + 590..=now + 610).contains(&expiry),
+        "expires in the TTL: {expiry}"
+    );
     assert!(!label.is_empty());
-    assert_eq!(credential, turn_credential(TURN_SECRET, label, expiry).credential);
+    assert_eq!(
+        credential,
+        turn_credential(TURN_SECRET, label, expiry).credential
+    );
     // Two requests get two distinct usernames.
     let (_, _, again) = get(addr, &format!("{TURN_PATH}?room={ROOM}&token={token}")).await;
     let again: serde_json::Value = serde_json::from_str(&again).unwrap();
@@ -117,7 +124,9 @@ async fn an_authenticated_client_gets_a_time_limited_credential() {
 
 #[tokio::test]
 async fn the_turn_endpoint_is_off_without_turn_or_auth() {
-    let token = JoinTokenKey::new(SECRET).unwrap().mint(ROOM, unix_now() + 60);
+    let token = JoinTokenKey::new(SECRET)
+        .unwrap()
+        .mint(ROOM, unix_now() + 60);
     for config in [
         SignalingConfig {
             auth: Some(JoinTokenKey::new(SECRET).unwrap()),

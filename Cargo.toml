@@ -77,6 +77,9 @@ ed25519-dalek = { version = "3" }   # slice instrumentation (sign/verify cost); 
 serde_json = { version = "1" }
 # signaling join tokens (ADR-0047): HMAC-SHA256, the versions already in the lock
 hmac = { version = "0.12" }
+# TURN REST credentials (ADR-0050): HMAC-SHA1, base64; both already in the lock
+sha1 = { version = "0.10" }
+base64 = { version = "0.22" }
 # a fresh per-process event-signing key for the server (ADR-0049); already in the lock
 getrandom = { version = "0.3" }
 sha2 = { version = "0.10" }

@@ -51,6 +51,11 @@ SADD/SREM/SCARD, de-index on empty). The binary opts in via `UNIBLOX_REDIS_URL` 
 LISTING is shared — the relay is node-local, so a session's two peers must be on the same node (sticky routing;
 cross-node relay is out of scope).** Hermetic test spawns a real `redis-server` (flake `pkgs.redis`, coturn precedent).
 
+**TURN credentials (ADR-0050, proposed):** `SignalingConfig::turn` serves `GET /_uniblox/turn?room=&token=`: a
+coturn REST-API credential (`<expiry>:<label>`, base64 HMAC-SHA1 of the shared secret, `turn_credential`) only for a
+valid join token for that room; 404 without TURN or auth. Env: `UNIBLOX_TURN_SECRET`, `UNIBLOX_TURN_URLS`,
+`UNIBLOX_TURN_TTL_SECS`.
+
 **Registry liveness (ADR-0048, proposed):** each node is alive while its liveness entry (Redis
 `uniblox:node:<node>`, a TTL set by every join and heartbeat) has not expired; the reads count only live nodes and
 `RegistryStore::sweep` deletes dead nodes' sessions. `SessionRegistry::spawn_heartbeat` (started by
