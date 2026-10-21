@@ -7,8 +7,18 @@ use std::time::{Duration, Instant};
 use rhai::EvalAltResult;
 use scripting::{Health, ScriptEngine, ScriptError, ScriptLimits, sandbox_engine};
 
+/// Run one call with generous TIME budgets, so the resource limit under test is the one that fires
+/// (the watchdog has its own test below; in a debug build it would otherwise stop the slow map cases
+/// first, which is also a correct outcome).
 fn run(src: &str) -> Result<Health, Box<EvalAltResult>> {
-    ScriptEngine::from_source(src).unwrap().update_component(Health { hp: 0 })
+    let limits = ScriptLimits {
+        call_time_budget: Duration::from_secs(60),
+        frame_time_budget: Duration::from_secs(60),
+        ..ScriptLimits::default()
+    };
+    ScriptEngine::from_source_with(src, limits)
+        .unwrap()
+        .update_component(Health { hp: 0 })
 }
 
 // ── Resource limits ──────────────────────────────────────────────────────────
@@ -16,7 +26,10 @@ fn run(src: &str) -> Result<Health, Box<EvalAltResult>> {
 #[test]
 fn deep_recursion_hits_the_call_depth_limit() {
     let err = run("fn f(n) { f(n + 1) } fn update(h) { f(0); h }").unwrap_err();
-    assert!(matches!(*err, EvalAltResult::ErrorStackOverflow(..)), "{err:?}");
+    assert!(
+        matches!(*err, EvalAltResult::ErrorStackOverflow(..)),
+        "{err:?}"
+    );
 }
 
 #[test]
@@ -24,11 +37,29 @@ fn huge_strings_arrays_and_maps_are_refused() {
     for src in [
         r#"fn update(h) { let s = "x"; loop { s += s; } }"#,
         "fn update(h) { let a = []; loop { a.push(0); } }",
-        "fn update(h) { let m = #{}; let i = 0; loop { m[`k${i}`] = i; i += 1; } }",
+        // Copying a container into itself doubles it each step: the size check must stop it.
+        "fn update(h) { let m = #{ a: 1 }; let i = 0; loop { m[`k${i}`] = m; i += 1; } }",
+        "fn update(h) { let a = [1]; loop { a.push(a); } }",
     ] {
         let err = run(src).unwrap_err();
-        assert!(matches!(*err, EvalAltResult::ErrorDataTooLarge(..)), "{src}: {err:?}");
+        assert!(
+            matches!(*err, EvalAltResult::ErrorDataTooLarge(..)),
+            "{src}: {err:?}"
+        );
     }
+}
+
+/// A known Rhai gap (ADR-0046): inserting NEW keys into a map by index is not checked against the
+/// map-size limit. The operation cap still ends the call (measured: under 10,000 keys, under 1 MB,
+/// freed when the call returns, because the scope is rewound and scripts keep no state).
+#[test]
+fn map_index_inserts_are_bounded_by_the_operation_cap() {
+    let err = run("fn update(h) { let m = #{}; let i = 0; loop { m[`k${i}`] = i; i += 1; } }")
+        .unwrap_err();
+    assert!(
+        matches!(*err, EvalAltResult::ErrorTooManyOperations(..)),
+        "{err:?}"
+    );
 }
 
 #[test]
@@ -46,13 +77,17 @@ fn deeply_nested_maps_terminate() {
 #[test]
 fn tight_loops_hit_the_operation_limit() {
     let err = run("fn update(h) { let i = 0; while true { i += 1; } h }").unwrap_err();
-    assert!(matches!(*err, EvalAltResult::ErrorTooManyOperations(..)), "{err:?}");
+    assert!(
+        matches!(*err, EvalAltResult::ErrorTooManyOperations(..)),
+        "{err:?}"
+    );
 }
 
 #[test]
 fn deeply_nested_expressions_are_rejected_at_compile_time() {
     let expr = format!("{}1{}", "(".repeat(200), ")".repeat(200));
-    let err = ScriptEngine::from_source(&format!("fn update(h) {{ let x = {expr}; h }}")).unwrap_err();
+    let err =
+        ScriptEngine::from_source(&format!("fn update(h) {{ let x = {expr}; h }}")).unwrap_err();
     assert!(matches!(err, ScriptError::Parse(..)), "{err:?}");
 }
 
@@ -63,7 +98,10 @@ fn an_import_is_refused() {
         Err(_) => true,
         Ok(mut engine) => engine.update_component(Health { hp: 0 }).is_err(),
     };
-    assert!(refused, "an import must fail at compile time or at run time");
+    assert!(
+        refused,
+        "an import must fail at compile time or at run time"
+    );
 }
 
 // ── Source size, before compile ──────────────────────────────────────────────
@@ -75,7 +113,10 @@ fn an_oversized_source_is_rejected_before_compile() {
     let err = ScriptEngine::from_source(&src).unwrap_err();
     assert!(matches!(err, ScriptError::TooLarge { .. }), "{err:?}");
     let mut ok = ScriptEngine::from_source("fn update(h) { h }").unwrap();
-    assert!(matches!(ok.reload_from_str(&src), Err(ScriptError::TooLarge { .. })));
+    assert!(matches!(
+        ok.reload_from_str(&src),
+        Err(ScriptError::TooLarge { .. })
+    ));
 }
 
 #[test]
@@ -83,7 +124,11 @@ fn an_oversized_file_is_rejected_without_reading_it_all() {
     let limit = ScriptLimits::default().max_source_bytes;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("big.rhai");
-    std::fs::write(&path, format!("fn update(h) {{ h }} // {}", "x".repeat(limit))).unwrap();
+    std::fs::write(
+        &path,
+        format!("fn update(h) {{ h }} // {}", "x".repeat(limit)),
+    )
+    .unwrap();
     let err = ScriptEngine::from_file(&path).unwrap_err();
     assert!(matches!(err, ScriptError::TooLarge { .. }), "{err:?}");
 }
@@ -110,7 +155,10 @@ fn the_watchdog_aborts_a_script_that_blocks_inside_a_host_call() {
     .unwrap();
     let started = Instant::now();
     let err = engine.update_component(Health { hp: 0 }).unwrap_err();
-    assert!(matches!(*err, EvalAltResult::ErrorTerminated(..)), "{err:?}");
+    assert!(
+        matches!(*err, EvalAltResult::ErrorTerminated(..)),
+        "{err:?}"
+    );
     assert!(started.elapsed() < Duration::from_secs(2));
 }
 
@@ -126,7 +174,10 @@ fn a_host_api_cannot_loosen_the_limits() {
     )
     .unwrap();
     let err = engine.update_component(Health { hp: 0 }).unwrap_err();
-    assert!(matches!(*err, EvalAltResult::ErrorTooManyOperations(..)), "{err:?}");
+    assert!(
+        matches!(*err, EvalAltResult::ErrorTooManyOperations(..)),
+        "{err:?}"
+    );
 }
 
 // ── The per-frame budget across entities ─────────────────────────────────────
@@ -146,14 +197,23 @@ fn the_frame_budget_caps_the_cost_across_entities() {
         .map(|_| engine.update_component(Health { hp: 0 }).is_ok())
         .collect();
     let ran = results.iter().filter(|ok| **ok).count();
-    assert!(ran >= 1 && ran < 40, "the budget stopped part of the frame (ran {ran})");
-    assert!(results[ran..].iter().all(|ok| !ok), "after the budget is spent, nothing runs");
+    assert!(
+        (1..40).contains(&ran),
+        "the budget stopped part of the frame (ran {ran})"
+    );
+    assert!(
+        results[ran..].iter().all(|ok| !ok),
+        "after the budget is spent, nothing runs"
+    );
     let stats = engine.frame_stats();
     assert_eq!(stats.calls as usize, ran);
     assert_eq!(stats.skipped as usize, 40 - ran);
     assert!(stats.ops >= 200_000);
     engine.begin_frame();
-    assert!(engine.update_component(Health { hp: 0 }).is_ok(), "a new frame starts fresh");
+    assert!(
+        engine.update_component(Health { hp: 0 }).is_ok(),
+        "a new frame starts fresh"
+    );
 }
 
 // ── The whitelist ─────────────────────────────────────────────────────────────
@@ -206,5 +266,31 @@ fn no_state_bleeds_between_engines_or_across_a_reload() {
     assert_eq!(b.update_component(Health { hp: 0 }).unwrap().hp, 1);
     a.reload_from_str("fn other(h) { h }").unwrap();
     let err = a.update_component(Health { hp: 0 }).unwrap_err();
-    assert!(matches!(*err, EvalAltResult::ErrorFunctionNotFound(..)), "{err:?}");
+    assert!(
+        matches!(*err, EvalAltResult::ErrorFunctionNotFound(..)),
+        "{err:?}"
+    );
+}
+
+/// Regression (found by this matrix, ADR-0046): nesting maps or arrays up to the size cap must not
+/// overflow the native stack, even on a 1 MiB thread (the wasm32 default) in a debug build. An
+/// overflow aborts the whole process, so this test cannot pass by accident.
+#[test]
+fn nesting_to_the_cap_does_not_overflow_a_small_stack() {
+    for src in [
+        "fn update(h) { let m = #{}; loop { m = #{ inner: m }; } }",
+        "fn update(h) { let a = []; loop { a = [a]; } }",
+    ] {
+        let src = src.to_string();
+        let joined = std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(move || run(&src).is_err())
+            .unwrap()
+            .join();
+        assert_eq!(
+            joined.ok(),
+            Some(true),
+            "the nested script must end with an error"
+        );
+    }
 }

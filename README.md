@@ -17,7 +17,7 @@ Implemented and tested natively:
 In the browser, the client renders the shared simulation in both WebGPU and WebGL2 builds (3.4 MB each, brotli) and saves and reloads the world. `just browser-e2e` checks this in headless Chromium on every CI run: the first frame, a save → reload → load round trip through IndexedDB, and two tabs exchanging packets on both channels.
 
 Not built yet:
-- Scripting in the browser client: Rhai is linked in, but the client loads no content yet. The sandbox hardening (a wall-clock watchdog, per-frame budgets, size caps) is still to do.
+- Scripting in the browser client: Rhai is linked in, but the client loads no content yet. The sandbox hardening (ADR-0046: a wall-clock watchdog, a per-frame budget, source and container caps, a locked whitelist, a CI feature guard) is built and awaits the owner's review.
 - `platform`: an 11-line stub.
 - The native client: a stub that prints its name.
 - Mode 2 end to end in a browser.

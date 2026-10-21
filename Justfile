@@ -35,6 +35,15 @@ doc:
 deny:
     cargo deny check advisories bans licenses sources
 
+# The sandbox's rhai features stay off: neither `unchecked` nor `internals` (ADR-0046).
+sandbox-features:
+    scripts/check-rhai-features.sh
+
+# Measure what the sample game's script costs per call and per 64 Hz tick (ADR-0046's escape-hatch
+# trigger). Release build: debug numbers are 10x slower and meaningless here.
+script-cost:
+    cargo run --locked --release -p scripting --example script_cost
+
 # Mode 1 stays free of the networking stack (ADR-0030).
 net-free:
     scripts/check-net-free.sh
@@ -49,4 +58,4 @@ browser-e2e:
     python3 scripts/browser-e2e.py
 
 # The local gate: what CI checks, except the WASM builds (`just wasm`, its own CI job).
-ci: lint test-all doc deny net-free
+ci: lint test-all doc deny net-free sandbox-features

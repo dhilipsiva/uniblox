@@ -12,6 +12,8 @@ description = "A locked-down Rhai engine for uniblox game logic; built and sandb
 rhai.workspace = true
 bevy_ecs.workspace = true
 log.workspace = true
+# The watchdog's clock: std's Instant natively, the browser clock on wasm32 (ADR-0046).
+web-time.workspace = true
 
 [dev-dependencies]
 # integration tests (tests/) are separate crates — they need rhai/bevy_ecs directly. `metadata` (tests

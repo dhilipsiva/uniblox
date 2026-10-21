@@ -6705,6 +6705,7 @@ dependencies = [
  "log",
  "rhai",
  "tempfile",
+ "web-time",
 ]
 
 [[package]]

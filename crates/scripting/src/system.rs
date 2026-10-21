@@ -9,6 +9,7 @@ use crate::engine::ScriptEngine;
 /// Per-tick: run `update(Health)` for every entity with a `Health` component. A
 /// script error logs a warning and leaves the component unchanged (never panics).
 pub fn run_scripts(mut engine: NonSendMut<ScriptEngine>, mut q: Query<&mut Health>) {
+    engine.begin_frame();
     for mut health in &mut q {
         match engine.update_component(health.clone()) {
             Ok(next) => *health = next,

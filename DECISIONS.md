@@ -1744,3 +1744,56 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
     51e9711 fixed, so they never failed for the reason they claim. The engine-core and protocol tests
     did fail as intended.
 - **Status:** Proposed (2026-10-21) on branch `todo/P4-UNIBLOX-03`; accepted when merged.
+
+## ADR-0046 — the Phase-12 sandbox hardening: watchdog, frame budget, source cap, container cap, feature guard
+- **Context:** ADR-0011 set the initial Rhai limits and left Phase 12 (TODO.md, ten bullets) for a dedicated pass.
+  ADR-0045 made scripts run per owned entity per tick, which raised the stakes: a bundle is untrusted content.
+- **Decision — limits, applied last:** `scripting::sandbox_engine` (and every `ScriptEngine`) is `Engine::new_raw`
+  plus the whitelist, then the limits, so no host registration can loosen them:
+  - 100,000 operations per call;
+  - 32 call levels;
+  - 8 KiB strings;
+  - **256 elements per array or map**, nested elements included, so nesting depth is capped at 256 too;
+  - expression depths (64, 32), stricter than the suggested (64, 64);
+  - no modules;
+  - `eval` disabled, and no anonymous functions.
+  The container cap came from the adversarial matrix. Rhai's recursive data-size walk needs about 1.5 KiB of
+  native stack per nested level in a debug build (under 0.5 KiB in release). At the old cap of 1024 a nested map
+  overflowed a 2 MiB thread and aborted the process: hostile content crashing the host. 256 keeps a debug build
+  safe on a 1 MiB stack, the wasm32 default; `nesting_to_the_cap_does_not_overflow_a_small_stack` guards it.
+- **Decision — budgets:** `ScriptLimits` (defaults in brackets):
+  - a source cap checked before compile [256 KiB], with `from_file` and hot reload reading bounded;
+  - a wall-clock watchdog per call through `on_progress` [50 ms]. It catches a host function that blocks,
+    which the operation counter cannot. It is checked every 64 operations on `web_time::Instant`, which is
+    std's natively and the browser clock on wasm32;
+  - a budget per frame across all calls, in operations [1,000,000] and time [100 ms]. A call past it gets an
+    error, and `FrameStats` counts the calls, operations, time and refusals.
+  `engine_core::run_entity_scripts` starts a frame each tick and rotates its starting entity by the tick, so a
+  budget that cannot cover every entity in one tick still reaches all of them. `ScriptEngine::with_host_api`
+  lets a host add functions; the limits are applied after its callback.
+- **Decision — the feature guard:** `scripts/check-rhai-features.sh`, which `just ci` (and so CI) runs, fails if
+  rhai's `unchecked` (which compiles out every limit) or `internals` is resolved for any target. Mutation-tested:
+  enabling either fails it.
+- **Decision — the whitelist is locked:** `tests/api_whitelist.txt` lists the 91 callable signatures. These are
+  the array package, the `Health` example, the `Agent` API and the FLOAT unary minus. A test compares
+  `sandbox_engine()` with it, and another checks that `print`, `debug`, `exit`, `sleep`, `open`, `read_file`,
+  `system`, `timestamp` and `parse_json` are not callable. A change to the whitelist is a sandbox change
+  reviewed through that file.
+- **Decision — the escape-hatch ladder and its trigger:** a script too slow for its job steps down: Rhai → a
+  registered Rust host function → a native Bevy system → (last resort) an engine release. The trigger is script
+  time above 10–20% of the frame budget. `just script-cost` (the `script_cost` example) measures it: the sample
+  game costs 1.07 µs and 38 operations per `update_agent` call in release, so 1,000 scripted entities use 6.8% of
+  a 64 Hz tick and the trigger lies near 1,500–3,000 entities. Spatial queries, raycasts, heavy maths and broad
+  ECS iteration stay out of Rhai.
+- **Known gap:** inserting a NEW key into a map by index (`m[k] = v`) is not checked against the map-size limit
+  in Rhai 1.25. The operation cap still ends the call (measured: under 10,000 keys, under 1 MB), and the memory
+  is freed when the call returns, because the scope is rewound and scripts keep no state. Copying a container
+  into itself, which grows exponentially, is caught by the size check.
+- **The trust model, unchanged:** the sandbox protects the player's machine from malicious content. It does
+  nothing against a modified client and is not anti-cheat (CLAUDE.md, docs/CONTEXT.md §4).
+- **Consequences:** `cargo test -p scripting` runs the adversarial matrix (16 tests: recursion, strings, arrays,
+  maps, nesting, loops, expression depth, imports, the source and file caps, the watchdog, host loosening, the
+  frame budget, the whitelist, forbidden calls, state bleed) plus the agent and bridge tests. engine-core adds the
+  rotation test.
+- **Status:** Proposed (2026-10-21) on branch `todo/P4-UNIBLOX-04`. This is the HIGH-risk pass the repository
+  reserves for a human owner (TODO.md "Staged next steps" 4): accepted only after the owner's review.

@@ -14,6 +14,8 @@ pub enum ScriptError {
     Eval(Box<EvalAltResult>),
     /// Reading the script file failed.
     Io(std::io::Error),
+    /// The source is larger than `ScriptLimits::max_source_bytes`; refused before parsing.
+    TooLarge { bytes: usize, limit: usize },
 }
 
 impl fmt::Display for ScriptError {
@@ -22,6 +24,12 @@ impl fmt::Display for ScriptError {
             ScriptError::Parse(e) => write!(f, "script parse error: {e}"),
             ScriptError::Eval(e) => write!(f, "script evaluation error: {e}"),
             ScriptError::Io(e) => write!(f, "script io error: {e}"),
+            ScriptError::TooLarge { bytes, limit } => {
+                write!(
+                    f,
+                    "script source of {bytes} bytes exceeds the {limit}-byte limit"
+                )
+            }
         }
     }
 }
@@ -32,6 +40,7 @@ impl std::error::Error for ScriptError {
             ScriptError::Parse(e) => Some(e),
             ScriptError::Eval(e) => Some(e.as_ref()),
             ScriptError::Io(e) => Some(e),
+            ScriptError::TooLarge { .. } => None,
         }
     }
 }

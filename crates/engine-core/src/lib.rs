@@ -375,9 +375,22 @@ pub fn run_entity_scripts(
         // `try_insert`: the entity may be despawned before the command applies.
         commands.entity(e).try_insert(Scripted);
     }
-    for (owner, pos, mut vel, contacts) in &mut q {
+    // One frame budget per tick (ADR-0046). When it cannot cover every entity, rotate the start by
+    // the tick so every entity runs over a few ticks instead of the same ones starving.
+    engine.begin_frame();
+    let count = q.iter().count();
+    let start = if count == 0 {
+        0
+    } else {
+        (tick.0 % count as u64) as usize
+    };
+    let mut steer = |owner: &Owner,
+                     pos: &Position,
+                     vel: &mut Mut<Velocity>,
+                     contacts: Option<&Contacts>|
+     -> bool {
         if authority_of(owner.0, local.0) != Authority::Local {
-            continue;
+            return true;
         }
         let agent = Agent {
             x: f64::from(pos.x),
@@ -397,7 +410,28 @@ pub fn run_entity_scripts(
                 });
             }
             Ok(_) => log::warn!("script returned a non-finite velocity; ignored"),
+            Err(err) if engine.frame_stats().skipped > 0 => {
+                log::warn!(
+                    "script frame budget spent; the remaining entities run next tick ({err})"
+                );
+                return false;
+            }
             Err(err) => log::warn!("entity script skipped: {err}"),
+        }
+        true
+    };
+    let mut go = true;
+    for (owner, pos, mut vel, contacts) in q.iter_mut().skip(start) {
+        go = steer(owner, pos, &mut vel, contacts);
+        if !go {
+            break;
+        }
+    }
+    if go {
+        for (owner, pos, mut vel, contacts) in q.iter_mut().take(start) {
+            if !steer(owner, pos, &mut vel, contacts) {
+                break;
+            }
         }
     }
 }

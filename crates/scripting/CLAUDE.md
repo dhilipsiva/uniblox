@@ -12,8 +12,12 @@ component per tick via `run_scripts`; in-memory + native file-mtime hot-reload. 
 read-write) and `update_agent`, which `engine_core::run_entity_scripts` calls for each owned `Scripted` entity;
 unary minus for FLOAT registered (the raw engine lacks it). rhai 1.25 (non-sync,
 `default-features=false`) + bevy_ecs 0.20. Sandbox-audited; compiles for wasm32.
-**Full hardening (wall-clock watchdog, adversarial matrix, per-frame op budget, source-size cap,
-`unchecked`/`internals` CI assertion) is Phase 12.**
+**Phase-12 hardening (ADR-0046, awaiting the owner's review):** limits applied after any host registration
+(`with_host_api` cannot loosen them), containers capped at 256 elements (that also caps nesting: deeper nesting
+overflowed the native stack), `ScriptLimits` (source cap before compile, a 50 ms wall-clock watchdog per call,
+a per-frame ops/time budget with `begin_frame`/`frame_stats`), the whitelist locked in `tests/api_whitelist.txt`,
+and `scripts/check-rhai-features.sh` (in `just ci`) failing on `unchecked`/`internals`. `just script-cost`
+measures the sample's cost. Known gap: map index-inserts skip the size check (bounded by the op cap).
 
 ## Crate-local invariants
 - **Thin custom bridge, NOT `bevy_mod_scripting`** (BMS has no WASM support, issue #166).

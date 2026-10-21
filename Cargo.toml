@@ -71,6 +71,7 @@ console_error_panic_hook = { version = "0.1" }
 console_log              = { version = "1" }
 # dev-only
 tempfile = { version = "3" }
+web-time = { version = "1" }   # a wasm-safe Instant for the script watchdog (ADR-0046); already in the lock
 filetime = { version = "0.2" }
 ed25519-dalek = { version = "3" }   # slice instrumentation (sign/verify cost); op-signing itself is Phase 6
 serde_json = { version = "1" }

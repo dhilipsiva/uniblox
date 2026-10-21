@@ -177,7 +177,7 @@ bullets. Remaining Phase-5: the Mode-2 coordinator peer service.
 - **Rhai ↔ Bevy-ECS bridge** (ADR-0011, first real deps — rhai 1.25 non-sync + bevy_ecs 0.19) —
   locked-down `new_raw()` engine + all `set_max_*` limits + `eval` disabled, held as a NonSend resource,
   mutating a whitelisted `Health` component per tick; in-memory + file hot-reload. 8 TDD tests green,
-  sandbox-audited, compiles for wasm32. Full hardening is Phase 12.
+  sandbox-audited, compiles for wasm32. Phase-12 hardening: ADR-0046 (awaiting the owner's review).
 - **The mode-agnostic mini-game sim** (`engine-core` + `protocol::PeerId`) — `Position`/`Velocity`/`Owner`
   components, `LocalPeer`/`SimDt` resources, `authority_of` as THE single authority decision point, one
   branching `simulate` system (Local computes; Remote is the documented apply-path placeholder — never
@@ -330,15 +330,15 @@ bullets. Remaining Phase-5: the Mode-2 coordinator peer service.
 - **STUN-only connection success rate** — real-network peers (Phase-2 telemetry bullet).
 
 ## Next
-- **Scripting follow-ups (ADR-0045 landed the Rhai-driven entities and bundles):** load content in the
-  browser client for the hosted demo; the Phase-12 sandbox hardening (size caps, a wall-clock watchdog,
-  per-frame budgets).
+- **Scripting follow-ups:** load content in the browser client for the hosted demo; the owner's review of the
+  Phase-12 hardening (ADR-0046).
 - **Phase 5:** the Mode-2 coordinator peer service (MIXED: the election logic needs human review), then the
   deferred registry work (atomic updates, TTL crash cleanup, autoscaling, rate limiting and authentication).
 - **Phase 2 residual:** real-network STUN-only success rate and RTT/jitter, once peers run on real networks.
 - **Repository hygiene and CI:** a CI workflow runs `just ci` and the WASM builds; dependency currency
   (Bevy, str0m, redis, webrtc, and the matchbox TLS stack behind the dated `deny.toml` ignores) comes next.
-- Phase 3 depth beyond the core and Phase 12 (sandbox hardening) each need a human-owned HIGH pass.
+- Phase 3 depth beyond the core needs a human-owned HIGH pass; Phase 12 (ADR-0046) is built and waits for
+  the owner's review.
 
 ## Toolchain notes
 **The toolchain comes from the Nix flake devShell** (ADR-0010): pinned Rust 1.99.1 (edition 2024, wasm32
