@@ -1,7 +1,9 @@
 //! uniblox signaling service: room-based WebRTC SDP/ICE signaling with a
 //! `{mode, version}` scope + the ASYMMETRIC version filter (ADR-0038), optional
-//! `?next=N` session-SIZE grouping via a custom topology (ADR-0039), and an
-//! in-memory session registry.
+//! `?next=N` session-SIZE grouping (ADR-0039), a session registry that can be
+//! shared through Redis (ADR-0040, ADR-0048), and join tokens and DoS limits
+//! (ADR-0047). It speaks matchbox's wire protocol (`matchbox_protocol`) from its
+//! own axum server (`server.rs`), so matchbox clients connect unchanged.
 //!
 //! **Scope (in the room PATH):** `<mode>~<content>.<schema>~<min>~<lobby>`
 //! (e.g. `m1~7.2~3~arena`). The client's OWN engine rides the `?engine=N` query.
@@ -13,25 +15,23 @@
 //! malformed scope / bad `?engine` / bad `?next`. A plain path (no `~`) is a
 //! legacy room (no engine gate).
 //!
-//! **Session-SIZE grouping (`?next=N`, ADR-0039):** `NextTopology` is a custom
-//! [`SignalingTopology`] — a full-mesh SDP/ICE relay (matchbox `FullMesh`
-//! re-implemented from its contract) GENERALIZED with size grouping. `?next`
+//! **Session-SIZE grouping (`?next=N`, ADR-0039):** the relay is a full-mesh
+//! SDP/ICE relay (matchbox `FullMesh` re-implemented from its contract)
+//! GENERALIZED with size grouping. `?next`
 //! absent ⇒ ONE unbounded session per room (behaviourally identical to FullMesh);
 //! `?next=N` ⇒ the room subdivides into sessions of at most N, keyed
 //! `"<room>#<index>"`. Lifecycle is **batch-deal / no-backfill**: a session seals
 //! when it reaches N and never refills — a departure shrinks it but new joiners
 //! always fill the current open session (a fresh one once the last sealed). The
-//! matchbox topology never sees the query, so `?next` is stashed by the gate
-//! (keyed by `origin`) and bridged to the `PeerId` at id assignment, exactly like
-//! the registry bookkeeping. The gate RESERVES `#` (the sub-session delimiter):
+//! gate RESERVES `#` (the sub-session delimiter):
 //! a room path may not contain it, so the `"<room>#<index>"` key namespace stays
 //! disjoint from the raw-room-path namespace (no collision / cross-lobby leak).
 //! `?next` is a per-lobby CONVENTION: peers naming the same room but disagreeing
 //! on whether they send `?next` land in disjoint session namespaces (`R` vs
 //! `R#0`) and are never matched — clients of one lobby must agree on it.
 //!
-//! The [`SessionRegistry`] IS the topology's shared state: it holds the relay
-//! senders, the grouping bookkeeping, and the stashed `?next`, and lists sessions
+//! The [`SessionRegistry`] is the relay's shared state: it holds each member's
+//! bounded outbound queue and the grouping bookkeeping, and lists sessions
 //! (`list`/`peer_count`/`session_count`). A poisoned lock degrades to a no-op /
 //! empty listing rather than panicking the server.
 //!
@@ -43,9 +43,11 @@
 //! **Authentication and limits (ADR-0047):** [`build_signaling_server_with`] takes a
 //! [`SignalingConfig`]. With a [`JoinTokenKey`], the gate admits only a connection carrying a valid
 //! `?token=` for the room path it asks for (401 with a reason otherwise); an optional endpoint at
-//! [`TOKEN_PATH`] issues tokens. Every server limits connection attempts per client IP (429),
-//! signal messages per connection (dropped, then the socket is closed), the size of a signal, and
-//! the peers per session (503; `?next` above the cap is a 400).
+//! [`TOKEN_PATH`] issues tokens. Every server limits connection attempts per client IP (429), open
+//! connections per IP (429) and in total (503), frames per connection (dropped, then the socket is
+//! closed), the size of a WebSocket message (the WebSocket layer closes the connection), idle time,
+//! each peer's outbound queue (a peer that does not read is disconnected), and the peers per
+//! session (503; `?next` above the cap is a 400).
 //!
 //! Deferred: the Mode-2 coordinator peer service.
 
@@ -53,30 +55,22 @@ use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use async_trait::async_trait;
-use axum::Router;
-use axum::extract::ws::Message;
-use axum::extract::{ConnectInfo, Query};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
-use futures::StreamExt;
-use limits::{IpLimiter, TokenBucket, per_second};
-use matchbox_protocol::{JsonPeerEvent, JsonPeerRequest, PeerId};
-use matchbox_signaling::common_logic::{SignalingChannel, parse_request, try_send};
-use matchbox_signaling::{
-    ClientRequestError, NoCallbacks, SignalingServer, SignalingServerBuilder, SignalingState,
-    SignalingTopology, WsStateMeta,
-};
+use matchbox_protocol::PeerId;
 use tokio::time::timeout;
 use uuid::Uuid;
 
 mod auth;
 mod limits;
 mod redis_store;
+mod server;
 mod store;
+
+use server::PeerTx;
+pub use server::SignalingServer;
 
 pub use auth::{JoinTokenKey, MAX_TOKEN_LIFETIME_SECS, MIN_KEY_BYTES, TokenError, unix_now};
 pub use limits::{ClientIp, SignalingLimits};
@@ -87,7 +81,7 @@ pub use store::{
 };
 
 /// The scope delimiter between a room path's tilde-separated parts.
-const SCOPE_SEP: char = '~';
+pub(crate) const SCOPE_SEP: char = '~';
 
 /// The `?engine=N` query key carrying the client's own engine version.
 const ENGINE_PARAM: &str = "engine";
@@ -290,8 +284,9 @@ impl Default for SignalingConfig {
 }
 
 /// A room path the server accepts: non-empty, at most [`MAX_ROOM_BYTES`], free of the reserved
-/// sub-session delimiter, and a well-formed scope if it has the scope shape.
-fn check_room(room: &str) -> Result<(), String> {
+/// sub-session delimiter, and a well-formed scope if it has the scope shape. The gate, the token
+/// endpoint and `services mint-token` all apply it.
+pub fn validate_room(room: &str) -> Result<(), String> {
     if room.is_empty() {
         return Err("missing room".to_string());
     }
@@ -309,29 +304,21 @@ fn check_room(room: &str) -> Result<(), String> {
 
 #[derive(Default)]
 struct RegistryInner {
-    /// Gate-stashed `?next` size (None = unbounded) per connecting address;
-    /// consumed by `bridge` at id assignment.
-    pending: HashMap<SocketAddr, Option<usize>>,
-    /// peer → requested session size, bridged from `pending` at id assignment
-    /// (fires before the topology's `state_machine`); consumed (removed) by
-    /// [`join_local`](SessionRegistry::join_local). A never-upgraded id-assigned
-    /// peer leaves a staged entry — memory only, bounded by the deferred rate-limit.
-    peer_next: HashMap<PeerId, Option<usize>>,
     /// Live sessions keyed by session key: the room path (unbounded), or
     /// `"<room>#<index>"` when subdivided by `?next=N`. Maps each member to its
-    /// relay sender. This is what the node-local `list()` reports.
-    sessions: HashMap<String, HashMap<PeerId, SignalingChannel>>,
+    /// bounded outbound queue. This is what the node-local `list()` reports.
+    sessions: HashMap<String, HashMap<PeerId, PeerTx>>,
     /// The current OPEN (fillable) session key per room, for `?next=N` rooms only.
     /// Removed when the session seals (reaches N) ⇒ no backfill (ADR-0039).
     open: HashMap<String, String>,
-    /// Monotonic sub-session index per room, for unique session keys.
+    /// Monotonic sub-session index per room, for unique session keys; dropped once the room has no
+    /// session left.
     counter: HashMap<String, u64>,
     /// peer → its session key (reverse index for relay + `leave`).
     peer_session: HashMap<PeerId, String>,
 }
 
-/// The signaling node's session state — the [`SignalingState`] backing
-/// `NextTopology` (ADR-0040). Two layers:
+/// The signaling node's session state (ADR-0040). Two layers:
 ///
 /// * **node-local relay** (`local`): each session's peers + live relay senders +
 ///   the `?next` grouping bookkeeping. Drives the relay; never leaves the process.
@@ -340,8 +327,8 @@ struct RegistryInner {
 ///   membership, tagged by `node_id`, that many STATELESS nodes share. The
 ///   `global_*` methods report the registry across all nodes.
 ///
-/// Cheap to `clone` (shared `Arc`s): the same handle is the topology state, the
-/// gate's stash target, and the id-assignment bridge. Only the LISTING is shared —
+/// Cheap to `clone` (shared `Arc`s): the same handle is the relay's state and the
+/// gate's view of session sizes. Only the LISTING is shared —
 /// the relay is node-local, so the two peers of a session must be on the same node
 /// (sticky routing; cross-node relay is out of scope).
 #[derive(Clone)]
@@ -349,11 +336,7 @@ pub struct SessionRegistry {
     local: Arc<Mutex<RegistryInner>>,
     store: Arc<dyn RegistryStore>,
     node_id: Arc<str>,
-    /// The limits the relay enforces, set by [`build_signaling_server_with`].
-    limits: Arc<Mutex<SignalingLimits>>,
 }
-
-impl SignalingState for SessionRegistry {}
 
 impl Default for SessionRegistry {
     fn default() -> Self {
@@ -378,19 +361,7 @@ impl SessionRegistry {
             local: Arc::new(Mutex::new(RegistryInner::default())),
             store,
             node_id: node_id.into(),
-            limits: Arc::new(Mutex::new(SignalingLimits::default())),
         }
-    }
-
-    fn set_limits(&self, limits: SignalingLimits) {
-        if let Ok(mut g) = self.limits.lock() {
-            *g = limits;
-        }
-    }
-
-    /// The relay limits; the defaults if the lock is poisoned.
-    fn limits(&self) -> SignalingLimits {
-        self.limits.lock().map(|g| *g).unwrap_or_default()
     }
 
     /// Keep this node alive in the shared store and sweep the sessions of dead nodes, every third of
@@ -419,24 +390,6 @@ impl SessionRegistry {
         })
     }
 
-    /// Gate: stash the requested `?next` size for a connecting address (the only
-    /// id available before id assignment).
-    fn stash(&self, addr: SocketAddr, next: Option<usize>) {
-        if let Ok(mut g) = self.local.lock() {
-            g.pending.insert(addr, next);
-        }
-    }
-
-    /// Id assignment (fires PRE-topology): bridge the stashed `?next` from the
-    /// connecting `addr` to its assigned `PeerId`, so the topology can read it.
-    fn bridge(&self, addr: SocketAddr, peer: PeerId) {
-        if let Ok(mut g) = self.local.lock()
-            && let Some(next) = g.pending.remove(&addr)
-        {
-            g.peer_next.insert(peer, next);
-        }
-    }
-
     /// Node-local join assignment (sync; the lock is dropped before it returns).
     /// Assigns `peer` to a session per the batch-deal / no-backfill rule, registers
     /// its `sender`, and returns `Some((session key, existing members' senders))` —
@@ -447,13 +400,11 @@ impl SessionRegistry {
         &self,
         room: &str,
         peer: PeerId,
-        sender: SignalingChannel,
+        sender: PeerTx,
+        next: Option<usize>,
         max_peers: usize,
-    ) -> Option<(String, Vec<SignalingChannel>)> {
+    ) -> Option<(String, Vec<PeerTx>)> {
         let mut g = self.local.lock().ok()?;
-        // Requested size: `None` if the peer carried no `?next` (or wasn't
-        // bridged). `.flatten()` collapses "no entry" and "entry == None".
-        let next = g.peer_next.remove(&peer).flatten();
 
         let key = match next {
             None => room.to_string(), // unbounded ⇒ one session per room (FullMesh)
@@ -488,7 +439,7 @@ impl SessionRegistry {
             return None;
         }
         // Existing members' senders — captured BEFORE inserting the newcomer.
-        let existing: Vec<SignalingChannel> = g
+        let existing: Vec<PeerTx> = g
             .sessions
             .get(&key)
             .map(|m| m.values().cloned().collect())
@@ -509,7 +460,7 @@ impl SessionRegistry {
 
     /// The relay target for a `Signal`: `receiver`'s sender IFF it shares
     /// `peer`'s session (cross-session ⇒ `None`, the isolation boundary).
-    fn target(&self, peer: PeerId, receiver: PeerId) -> Option<SignalingChannel> {
+    fn target(&self, peer: PeerId, receiver: PeerId) -> Option<PeerTx> {
         let g = self.local.lock().ok()?;
         let key = g.peer_session.get(&peer)?;
         g.sessions.get(key)?.get(&receiver).cloned()
@@ -519,9 +470,8 @@ impl SessionRegistry {
     /// its session (pruning an emptied session + clearing a dangling `open`
     /// pointer). Returns `Some((session key, remaining members' senders))`, or
     /// `None` if the peer was in no session (or the lock is poisoned).
-    fn leave_local(&self, peer: PeerId) -> Option<(String, Vec<SignalingChannel>)> {
+    fn leave_local(&self, peer: PeerId) -> Option<(String, Vec<PeerTx>)> {
         let mut g = self.local.lock().ok()?;
-        g.peer_next.remove(&peer); // in case the peer never reached `join`
         let key = g.peer_session.remove(&peer)?;
         let mut remaining = Vec::new();
         let mut emptied = false;
@@ -535,6 +485,13 @@ impl SessionRegistry {
             // Clear a still-open pointer to the now-gone session (an unsealed
             // session that emptied; a sealed one was already un-pointed).
             g.open.retain(|_, v| v != &key);
+            // A `?next` room with no session left forgets its index counter (no leak per room).
+            if let Some((room, _)) = key.rsplit_once(SESSION_SEP) {
+                let prefix = format!("{room}{SESSION_SEP}");
+                if !g.sessions.keys().any(|k| k.starts_with(&prefix)) {
+                    g.counter.remove(room);
+                }
+            }
         }
         Some((key, remaining))
     }
@@ -622,13 +579,13 @@ impl SessionRegistry {
 }
 
 /// A `400 Bad Request` gate rejection carrying a plain-text reason.
-fn bad_request(reason: impl Into<String>) -> Response {
+pub(crate) fn bad_request(reason: impl Into<String>) -> Response {
     (StatusCode::BAD_REQUEST, reason.into()).into_response()
 }
 
 /// A `426 Upgrade Required` gate rejection: the client's engine is below the
 /// game's declared minimum.
-fn engine_too_old(engine: u32, min_engine: u32) -> Response {
+pub(crate) fn engine_too_old(engine: u32, min_engine: u32) -> Response {
     (
         StatusCode::UPGRADE_REQUIRED,
         format!("engine {engine} below required minimum {min_engine}; upgrade to join"),
@@ -636,114 +593,9 @@ fn engine_too_old(engine: u32, min_engine: u32) -> Response {
         .into_response()
 }
 
-/// The custom uniblox signaling topology: a full-mesh SDP/ICE relay (matchbox
-/// `FullMesh` re-implemented from its contract) GENERALIZED with `?next=N`
-/// session-SIZE grouping. `?next` absent ⇒ one unbounded session per room
-/// (FullMesh-equivalent); `?next=N` ⇒ the room subdivides into sessions of at
-/// most N (sealed on fill; no backfill — ADR-0039). Bookkeeping is inline (a
-/// custom topology has no `on_peer_connected`/`on_peer_disconnected`).
-struct NextTopology;
-
-#[async_trait]
-impl SignalingTopology<NoCallbacks, SessionRegistry> for NextTopology {
-    async fn state_machine(upgrade: WsStateMeta<NoCallbacks, SessionRegistry>) {
-        let WsStateMeta {
-            room,
-            peer_id,
-            sender,
-            mut receiver,
-            state,
-            ..
-        } = upgrade;
-
-        // Register the peer LOCALLY (sync), announce it to the peers ALREADY there
-        // (they initiate the offers) IMMEDIATELY, THEN mirror the join to the
-        // shared registry with a bounded timeout. Announcing before the store means
-        // a slow/black-holed store never delays peer discovery — only this peer's
-        // own relay-loop start, bounded. `sender` is moved into the session map
-        // (the relay writes to TARGET senders, never self). A poisoned local lock
-        // ⇒ nothing registered ⇒ end (the socket closes).
-        let limits = state.limits();
-        let Some((key, existing)) =
-            state.join_local(&room, peer_id, sender, limits.max_session_peers)
-        else {
-            return;
-        };
-        broadcast(&existing, &JsonPeerEvent::NewPeer(peer_id));
-        // Release the other members' senders now: a clone held for this connection's lifetime would
-        // keep their sockets open after the server drops them (ADR-0047: a flooding socket is closed).
-        drop(existing);
-        state.mirror_join(&key, peer_id).await;
-
-        // Relay loop (mirrors matchbox FullMesh): forward each Signal to the named
-        // receiver IFF it shares this peer's session; drop KeepAlive; a bad frame
-        // is recoverable, a reset/close is fatal. Every frame spends a token of the
-        // per-connection bucket and a signal over the size cap is dropped (ADR-0047);
-        // after `abuse_close_after` drops the socket is closed.
-        let refill = per_second(limits.signals_per_sec);
-        let mut bucket = TokenBucket::full(limits.signals_burst, Instant::now());
-        let mut dropped: u32 = 0;
-        while let Some(request) = receiver.next().await {
-            let oversized = matches!(&request, Ok(Message::Text(t)) if t.len() > limits.max_signal_bytes)
-                || matches!(&request, Ok(Message::Binary(b)) if b.len() > limits.max_signal_bytes);
-            if oversized || !bucket.try_take(limits.signals_burst, refill, Instant::now()) {
-                dropped += 1;
-                if dropped >= limits.abuse_close_after {
-                    tracing::warn!("closing signaling peer {peer_id:?}: {dropped} frames dropped");
-                    break;
-                }
-                continue;
-            }
-            let request = match parse_request(request) {
-                Ok(req) => req,
-                Err(ClientRequestError::Json(_) | ClientRequestError::UnsupportedType(_)) => {
-                    continue; // recoverable — a malformed frame, keep the socket
-                }
-                Err(_) => break, // Axum (reset) / Close ⇒ done
-            };
-            match request {
-                JsonPeerRequest::Signal {
-                    receiver: target_id,
-                    data,
-                } => {
-                    if let Some(target) = state.target(peer_id, target_id) {
-                        let event = JsonPeerEvent::Signal {
-                            sender: peer_id,
-                            data,
-                        };
-                        let _ = try_send(&target, Message::Text(event.to_string().into()));
-                    }
-                    // An unknown / cross-session receiver silently drops — the
-                    // session-isolation boundary.
-                }
-                JsonPeerRequest::KeepAlive => {}
-            }
-        }
-
-        // Peer gone: drop it from its session (local), tell the remaining members
-        // IMMEDIATELY, THEN mirror the removal to the shared registry (bounded).
-        if let Some((key, remaining)) = state.leave_local(peer_id) {
-            broadcast(&remaining, &JsonPeerEvent::PeerLeft(peer_id));
-            state.mirror_leave(&key, peer_id).await;
-        }
-    }
-}
-
-/// Best-effort broadcast of one event to many channels. MUST be called with the
-/// registry lock released (never `try_send` while holding the mutex).
-fn broadcast(channels: &[SignalingChannel], event: &JsonPeerEvent) {
-    if channels.is_empty() {
-        return;
-    }
-    let text = event.to_string();
-    for ch in channels {
-        let _ = try_send(ch, Message::Text(text.clone().into()));
-    }
-}
-
 /// Build the uniblox signaling server with the default [`SignalingConfig`]: the gate is OPEN (no
-/// join token) and the default rate limits apply. For local development and in-process tests; a
-/// public server uses [`build_signaling_server_with`] and a [`JoinTokenKey`].
+/// join token) and the default limits apply. For local development and in-process tests; a public
+/// server uses [`build_signaling_server_with`] and a [`JoinTokenKey`].
 pub fn build_signaling_server(
     addr: impl Into<SocketAddr>,
     registry: SessionRegistry,
@@ -751,183 +603,48 @@ pub fn build_signaling_server(
     build_signaling_server_with(addr, registry, SignalingConfig::default())
 }
 
-/// A `401 Unauthorized` gate rejection naming what was wrong with the token.
-fn unauthorized(reason: impl fmt::Display) -> Response {
-    (StatusCode::UNAUTHORIZED, reason.to_string()).into_response()
-}
-
-fn too_many_requests() -> Response {
-    (
-        StatusCode::TOO_MANY_REQUESTS,
-        "too many connection attempts from this address; retry later",
-    )
-        .into_response()
-}
-
-/// Build the uniblox signaling server: the custom `NextTopology` (scoped rooms
-/// isolated structurally by the path; `?next=N` session-SIZE grouping) + a gate
-/// that applies, in order: the per-IP attempt limit (429), the room checks (400),
-/// the join token when `config.auth` holds a key (401), the ASYMMETRIC version
-/// filter (admit `?engine >= min`, reasoned 426/400), the `?next` cap (400) and the
-/// session cap (503). It stashes `?next` + the `registry` as the shared topology
-/// state (relay senders + grouping + listing), bridged `origin → PeerId` at id
-/// assignment. With `config.issue_tokens` (and a key) it also serves [`TOKEN_PATH`].
-// The gate returns matchbox's `Result<bool, axum::Response>` — `Response` is a
-// large `Err` type, but returning it IS the point (a reasoned rejection), so the
-// `result_large_err` lint doesn't apply.
-#[allow(clippy::result_large_err)]
+/// Build the uniblox signaling server (ADR-0037 to ADR-0040, ADR-0047, ADR-0048): a full-mesh
+/// SDP/ICE relay over the matchbox wire protocol, with rooms isolated by their path, `?next=N`
+/// session grouping, the gate (the per-IP attempt rate, the room, the join token when
+/// `config.auth` holds a key, the asymmetric version filter, the `?next` and session caps, the
+/// connection caps), the WebSocket message limits, the idle timeout, the bounded outbound queues,
+/// and, with `config.issue_tokens` and a key, the token endpoint at [`TOKEN_PATH`]. It also starts
+/// the registry heartbeat when called inside a tokio runtime.
 pub fn build_signaling_server_with(
     addr: impl Into<SocketAddr>,
     registry: SessionRegistry,
     config: SignalingConfig,
 ) -> SignalingServer {
-    registry.set_limits(config.limits);
     // Keep this node alive in the shared registry (ADR-0048). Outside a runtime the server cannot
     // serve either; the host then calls `spawn_heartbeat` itself once it has one.
     if tokio::runtime::Handle::try_current().is_ok() {
         drop(registry.spawn_heartbeat());
     }
-    let limiter = Arc::new(IpLimiter::default());
-    let issuer = match (&config.auth, config.issue_tokens) {
-        (Some(key), true) => Some(Arc::new(Issuer {
-            key: key.clone(),
-            lifetime: config.token_lifetime,
-            limits: config.limits,
-            client_ip: config.client_ip,
-            limiter: Arc::clone(&limiter),
-        })),
-        (None, true) => {
-            tracing::warn!("issue_tokens needs a join-token key; the token endpoint is off");
-            None
-        }
-        _ => None,
-    };
-    let gate_reg = registry.clone();
-    let bridge_reg = registry.clone();
-    let SignalingConfig {
-        auth,
-        limits,
-        client_ip,
-        ..
-    } = config;
-    SignalingServerBuilder::<NextTopology, NoCallbacks, SessionRegistry>::new(
-        addr.into(),
-        NextTopology,
-        registry,
-    )
-    .mutate_router(move |router| match issuer {
-        Some(issuer) => token_route(router, issuer),
-        None => router,
-    })
-    .on_connection_request(move |meta| {
-        if !limiter.allow(client_ip.key(meta.origin, &meta.headers), &limits) {
-            return Err(too_many_requests());
-        }
-        let room = meta.path.clone().unwrap_or_default();
-        if room.is_empty() {
-            return Ok(false); // no room ⇒ bare 401
-        }
-        // Reserve the sub-session delimiter: a room that decodes to a `#`-bearing
-        // string (e.g. `arena%230`) would collide with a `?next` sub-session key
-        // `<room>#<index>` and cross the isolation boundary. Reject it (scoped AND
-        // legacy paths), and a malformed scope, before anything else is checked.
-        check_room(&room).map_err(bad_request)?;
-        if let Some(key) = &auth {
-            let token = meta
-                .query_params
-                .get(TOKEN_PARAM)
-                .ok_or_else(|| unauthorized("missing join token"))?;
-            key.verify(token, &room, unix_now()).map_err(unauthorized)?;
-        }
-        // A `~`-shaped path MUST carry a `?engine=` that clears the declared minimum.
-        // A plain path is a legacy room.
-        if room.contains(SCOPE_SEP) {
-            let scope = parse_scope(&room).map_err(|e| bad_request(e.to_string()))?;
-            let engine =
-                parse_engine(&meta.query_params).map_err(|e| bad_request(e.to_string()))?;
-            if engine < scope.min_engine {
-                return Err(engine_too_old(engine, scope.min_engine));
-            }
-        }
-        // Optional session-SIZE cap — orthogonal to the scope (also applies to
-        // legacy plain rooms), and never above the server's session cap.
-        let next = parse_next(&meta.query_params).map_err(|e| bad_request(e.to_string()))?;
-        match next {
-            Some(n) if n > limits.max_session_peers => {
-                return Err(bad_request(format!(
-                    "next={n} is above this server's session cap of {}",
-                    limits.max_session_peers
-                )));
-            }
-            None if gate_reg.peer_count(&room) >= limits.max_session_peers => {
-                return Err((StatusCode::SERVICE_UNAVAILABLE, "session full").into_response());
-            }
-            _ => {}
-        }
-        gate_reg.stash(meta.origin, next);
-        Ok(true)
-    })
-    .on_id_assignment(move |(addr, peer)| bridge_reg.bridge(addr, peer))
-    .cors()
-    .build()
-}
-
-/// The token endpoint's state: who it mints for and how often.
-struct Issuer {
-    key: JoinTokenKey,
-    lifetime: Duration,
-    limits: SignalingLimits,
-    client_ip: ClientIp,
-    limiter: Arc<IpLimiter>,
-}
-
-impl Issuer {
-    fn issue(
-        &self,
-        peer: SocketAddr,
-        headers: &HeaderMap,
-        query: &HashMap<String, String>,
-    ) -> Response {
-        if !self
-            .limiter
-            .allow(self.client_ip.key(peer, headers), &self.limits)
-        {
-            return too_many_requests();
-        }
-        let Some(room) = query.get("room") else {
-            return bad_request("missing room");
-        };
-        if let Err(reason) = check_room(room) {
-            return bad_request(reason);
-        }
-        let expires = unix_now() + self.lifetime.as_secs().clamp(1, MAX_TOKEN_LIFETIME_SECS);
-        let body = serde_json::json!({ "token": self.key.mint(room, expires), "expires": expires });
-        (
-            [(header::CONTENT_TYPE, "application/json")],
-            body.to_string(),
-        )
-            .into_response()
-    }
-}
-
-/// Mount the token endpoint (`GET` [`TOKEN_PATH`]`?room=<room>`).
-fn token_route(router: Router, issuer: Arc<Issuer>) -> Router {
-    router.route(
-        TOKEN_PATH,
-        get(
-            move |ConnectInfo(peer): ConnectInfo<SocketAddr>,
-                  headers: HeaderMap,
-                  Query(query): Query<HashMap<String, String>>| {
-                let issuer = Arc::clone(&issuer);
-                async move { issuer.issue(peer, &headers, &query) }
-            },
-        ),
-    )
+    server::build(addr.into(), registry, config)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `?next` room forgets its sub-session counter once its last session empties (the review's
+    /// leak: one entry per room ever used).
+    #[test]
+    fn a_next_rooms_counter_is_dropped_once_it_empties() {
+        let reg = SessionRegistry::new();
+        let (tx, _rx) = PeerTx::detached();
+        let a = PeerId(Uuid::new_v4());
+        let b = PeerId(Uuid::new_v4());
+        reg.join_local("room", a, tx.clone(), Some(2), 64).unwrap();
+        reg.join_local("room", b, tx.clone(), Some(2), 64).unwrap();
+        let counters = |reg: &SessionRegistry| reg.local.lock().unwrap().counter.len();
+        assert_eq!(counters(&reg), 1);
+        reg.leave_local(a);
+        assert_eq!(counters(&reg), 1, "one member is left");
+        reg.leave_local(b);
+        assert_eq!(counters(&reg), 0);
+        assert_eq!(reg.session_count(), 0);
+    }
 
     fn query(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs

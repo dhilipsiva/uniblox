@@ -1,6 +1,7 @@
 //! Signaling rate limits and caps (ADR-0047): a token bucket per client IP for connection attempts
-//! and token requests, a token bucket per connection for signal messages, a size cap per signal and a
-//! cap on peers per session.
+//! and token requests, caps on open connections per IP and in total, a token bucket per connection
+//! for its frames, a size cap per message (enforced by the WebSocket layer), an idle timeout, a
+//! bounded outbound queue per peer, and a cap on peers per session.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -17,14 +18,27 @@ pub struct SignalingLimits {
     pub connects_burst: u32,
     /// How often one more attempt becomes available per client IP.
     pub connect_refill: Duration,
-    /// Signal messages one connection may send at once.
+    /// Open connections one client IP may hold at once.
+    pub max_connections_per_ip: usize,
+    /// Open connections the server holds at once.
+    pub max_connections: usize,
+    /// Frames one connection may send at once.
     pub signals_burst: u32,
-    /// Signal messages per second one connection may sustain (0 = no refill).
+    /// Frames per second one connection may sustain (0 = no refill).
     pub signals_per_sec: u32,
-    /// The largest signal message relayed, in bytes; a larger one is dropped.
+    /// The largest WebSocket message (and frame) accepted, in bytes. The WebSocket layer enforces
+    /// it as fragments arrive and closes a connection that exceeds it.
     pub max_signal_bytes: usize,
-    /// Dropped messages (over the rate or the size) after which the connection is closed.
+    /// Frames dropped over the rate, net of the frames accepted since, after which the connection is
+    /// closed.
     pub abuse_close_after: u32,
+    /// A connection that sends no complete message for this long is closed (matchbox clients send a
+    /// keep-alive every 10 s).
+    pub idle_timeout: Duration,
+    /// Messages queued for one peer; a peer whose queue is full is not reading and is disconnected.
+    pub max_outbound_queue: usize,
+    /// Bytes the WebSocket layer may buffer for one peer's writes before the connection fails.
+    pub max_write_buffer_bytes: usize,
     /// The most peers one session may hold; `?next` may not ask for more.
     pub max_session_peers: usize,
     /// The most client IPs tracked at once; when full, a new IP is refused until buckets refill.
@@ -36,43 +50,69 @@ impl Default for SignalingLimits {
         Self {
             connects_burst: 30,
             connect_refill: Duration::from_secs(2),
-            signals_burst: 200,
-            signals_per_sec: 50,
+            max_connections_per_ip: 16,
+            max_connections: 10_000,
+            // A newcomer to a full session answers 63 offers with a few ICE candidates each.
+            signals_burst: 1024,
+            signals_per_sec: 100,
             max_signal_bytes: 32 * 1024,
-            abuse_close_after: 100,
+            abuse_close_after: 256,
+            idle_timeout: Duration::from_secs(60),
+            max_outbound_queue: 256,
+            max_write_buffer_bytes: 1024 * 1024,
             max_session_peers: 64,
             max_tracked_ips: 100_000,
         }
     }
 }
 
-/// Where the client IP for the per-IP limit comes from.
+/// Where the client IP for the per-IP limits comes from.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ClientIp {
     /// The TCP peer address (a server facing clients directly).
     #[default]
     Peer,
-    /// The right-most `X-Forwarded-For` entry, the one the trusted reverse proxy appended; the peer
-    /// address when the header is absent or unparsable. Only safe behind a proxy that sets it.
-    ForwardedFor,
+    /// From `X-Forwarded-For`, behind this many trusted proxies (at least 1): the entry that many
+    /// from the right, the one the outermost trusted proxy appended. The peer address when the header
+    /// is absent, too short or unparsable. Only safe behind proxies that set it.
+    ForwardedFor(usize),
+}
+
+/// One `X-Forwarded-For` entry: a bare address, `a.b.c.d:port`, `[v6]` or `[v6]:port`.
+fn forwarded_ip(entry: &str) -> Option<IpAddr> {
+    let entry = entry.trim();
+    entry
+        .parse()
+        .ok()
+        .or_else(|| entry.parse::<SocketAddr>().ok().map(|s| s.ip()))
+        .or_else(|| {
+            entry
+                .strip_prefix('[')
+                .and_then(|e| e.strip_suffix(']'))
+                .and_then(|e| e.parse().ok())
+        })
 }
 
 impl ClientIp {
-    /// The key the per-IP limit counts: the address, with IPv6 narrowed to its /64 (one host usually
-    /// holds a whole /64).
+    /// The key the per-IP limits count: the address (an IPv4-mapped IPv6 address as its IPv4), with
+    /// IPv6 narrowed to its /64 (one host usually holds a whole /64).
     pub(crate) fn key(self, peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
         let ip = match self {
             ClientIp::Peer => peer.ip(),
-            ClientIp::ForwardedFor => headers
-                .get_all("x-forwarded-for")
-                .iter()
-                .filter_map(|v| v.to_str().ok())
-                .flat_map(|v| v.split(','))
-                .next_back()
-                .and_then(|s| s.trim().parse().ok())
-                .unwrap_or(peer.ip()),
+            ClientIp::ForwardedFor(hops) => {
+                let entries: Vec<&str> = headers
+                    .get_all("x-forwarded-for")
+                    .iter()
+                    .filter_map(|v| v.to_str().ok())
+                    .flat_map(|v| v.split(','))
+                    .collect();
+                hops.checked_sub(1)
+                    .and_then(|back| entries.len().checked_sub(back + 1))
+                    .and_then(|i| forwarded_ip(entries[i]))
+                    .unwrap_or(peer.ip())
+            }
         };
-        match ip {
+        match ip.to_canonical() {
             IpAddr::V6(v6) => {
                 let mut seg = v6.segments();
                 seg[4..].fill(0);
@@ -127,7 +167,14 @@ impl TokenBucket {
 /// The per-IP limit shared by the gate and the token endpoint.
 #[derive(Debug, Default)]
 pub(crate) struct IpLimiter {
-    buckets: Mutex<HashMap<IpAddr, TokenBucket>>,
+    buckets: Mutex<Buckets>,
+}
+
+#[derive(Debug, Default)]
+struct Buckets {
+    by_ip: HashMap<IpAddr, TokenBucket>,
+    /// When a full table was last pruned; pruning walks it all, so at most once a second.
+    last_prune: Option<Instant>,
 }
 
 impl IpLimiter {
@@ -137,26 +184,37 @@ impl IpLimiter {
             return false;
         };
         let now = Instant::now();
-        if !buckets.contains_key(&ip) && buckets.len() >= limits.max_tracked_ips {
+        if !buckets.by_ip.contains_key(&ip) && buckets.by_ip.len() >= limits.max_tracked_ips {
+            let due = buckets
+                .last_prune
+                .is_none_or(|at| now.saturating_duration_since(at) >= Duration::from_secs(1));
+            if !due {
+                return false;
+            }
+            buckets.last_prune = Some(now);
             // Forget the clients that are back to a full bucket; they lose nothing.
-            buckets.retain(|_, b| !b.is_full(limits.connects_burst, limits.connect_refill, now));
-            if buckets.len() >= limits.max_tracked_ips {
+            buckets
+                .by_ip
+                .retain(|_, b| !b.is_full(limits.connects_burst, limits.connect_refill, now));
+            if buckets.by_ip.len() >= limits.max_tracked_ips {
                 return false;
             }
         }
         buckets
+            .by_ip
             .entry(ip)
             .or_insert_with(|| TokenBucket::full(limits.connects_burst, now))
             .try_take(limits.connects_burst, limits.connect_refill, now)
     }
 }
 
-/// The interval between two signal tokens for a per-second rate (zero = no refill).
+/// The interval between two frame tokens for a per-second rate (zero = no refill); never rounds a
+/// positive rate down to "no refill".
 pub(crate) fn per_second(rate: u32) -> Duration {
     if rate == 0 {
         Duration::ZERO
     } else {
-        Duration::from_secs(1) / rate
+        (Duration::from_secs(1) / rate).max(Duration::from_nanos(1))
     }
 }
 
@@ -200,19 +258,52 @@ mod tests {
     }
 
     #[test]
-    fn forwarded_for_takes_the_proxy_appended_entry() {
+    fn forwarded_for_takes_the_entry_of_the_outermost_trusted_proxy() {
         let peer: SocketAddr = "10.0.0.1:5".parse().unwrap();
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
         let mut h = HeaderMap::new();
         h.insert("x-forwarded-for", "1.1.1.1, 203.0.113.7".parse().unwrap());
+        assert_eq!(ClientIp::ForwardedFor(1).key(peer, &h), ip("203.0.113.7"));
+        assert_eq!(ClientIp::ForwardedFor(2).key(peer, &h), ip("1.1.1.1"));
         assert_eq!(
-            ClientIp::ForwardedFor.key(peer, &h),
-            "203.0.113.7".parse::<IpAddr>().unwrap()
+            ClientIp::ForwardedFor(3).key(peer, &h),
+            peer.ip(),
+            "too few entries"
         );
+        assert_eq!(ClientIp::ForwardedFor(0).key(peer, &h), peer.ip());
         assert_eq!(ClientIp::Peer.key(peer, &h), peer.ip());
         assert_eq!(
-            ClientIp::ForwardedFor.key(peer, &HeaderMap::new()),
+            ClientIp::ForwardedFor(1).key(peer, &HeaderMap::new()),
             peer.ip()
         );
+        for (entry, want) in [
+            ("198.51.100.9:4711", "198.51.100.9"),
+            ("[2001:db8::7]", "2001:db8::"),
+            ("[2001:db8::7]:443", "2001:db8::"),
+        ] {
+            let mut h = HeaderMap::new();
+            h.insert("x-forwarded-for", entry.parse().unwrap());
+            assert_eq!(ClientIp::ForwardedFor(1).key(peer, &h), ip(want), "{entry}");
+        }
+    }
+
+    /// The review found every IPv4-mapped client keyed as `::` (one bucket for all of IPv4).
+    #[test]
+    fn ipv4_mapped_clients_are_keyed_by_their_ipv4() {
+        let h = HeaderMap::new();
+        let a: SocketAddr = "[::ffff:203.0.113.7]:1".parse().unwrap();
+        let b: SocketAddr = "[::ffff:198.51.100.9]:1".parse().unwrap();
+        assert_eq!(
+            ClientIp::Peer.key(a, &h),
+            "203.0.113.7".parse::<IpAddr>().unwrap()
+        );
+        assert_ne!(ClientIp::Peer.key(a, &h), ClientIp::Peer.key(b, &h));
+    }
+
+    #[test]
+    fn a_huge_rate_still_refills() {
+        assert!(per_second(u32::MAX) > Duration::ZERO);
+        assert_eq!(per_second(0), Duration::ZERO);
     }
 
     #[test]

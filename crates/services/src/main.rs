@@ -10,10 +10,12 @@
 //! Authentication (ADR-0047), secure by default: set `UNIBLOX_SIGNALING_SECRET` (at least 32
 //! bytes) and every peer must carry a join token (`?token=`) for its room. Without a secret the
 //! server refuses to start unless `UNIBLOX_SIGNALING_INSECURE=1` (local development only).
-//! `UNIBLOX_ISSUE_TOKENS=1` serves `GET /_uniblox/token?room=<room>` (for a hosted demo);
-//! `UNIBLOX_TRUST_FORWARDED_FOR=1` takes the client IP for the rate limits from the proxy's
-//! `X-Forwarded-For`. `services mint-token <room> [lifetime-secs]` prints a token (for an operator,
-//! e.g. a Mode-3 server's `UNIBLOX_SIGNALING_URL`).
+//! The secret is taken as raw bytes; use 32 random ones. `UNIBLOX_ISSUE_TOKENS=1` serves
+//! `GET /_uniblox/token?room=<room>` (for a hosted demo; it needs the secret);
+//! `UNIBLOX_TRUST_FORWARDED_FOR=N` takes the client IP for the limits from `X-Forwarded-For` behind
+//! N trusted proxies. `services mint-token <room> [lifetime-secs]` prints a token (for an operator,
+//! e.g. a Mode-3 server's `UNIBLOX_SIGNALING_URL`). Warnings are logged unless `RUST_LOG` says
+//! otherwise.
 //!
 //! Horizontal scale (ADR-0040): set `UNIBLOX_REDIS_URL` to back the session
 //! registry with a shared Redis so multiple stateless nodes share one listing
@@ -26,8 +28,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use services::{
-    ClientIp, JoinTokenKey, RedisRegistryStore, SessionRegistry, SignalingConfig,
-    build_signaling_server_with, unix_now,
+    ClientIp, JoinTokenKey, MAX_TOKEN_LIFETIME_SECS, RedisRegistryStore, SessionRegistry,
+    SignalingConfig, build_signaling_server_with, unix_now, validate_room,
 };
 
 /// matchbox's conventional signaling port.
@@ -37,10 +39,11 @@ fn flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| v == "1")
 }
 
-/// The join-token key from `UNIBLOX_SIGNALING_SECRET`, or exit with the reason.
+/// The join-token key from `UNIBLOX_SIGNALING_SECRET` (raw bytes, UTF-8 or not), or exit with the
+/// reason.
 fn key_from_env() -> Option<JoinTokenKey> {
-    let secret = std::env::var("UNIBLOX_SIGNALING_SECRET").ok()?;
-    match JoinTokenKey::new(secret.as_bytes()) {
+    let secret = std::env::var_os("UNIBLOX_SIGNALING_SECRET")?;
+    match JoinTokenKey::new(secret.as_encoded_bytes()) {
         Ok(key) => Some(key),
         Err(err) => {
             eprintln!("[signaling] UNIBLOX_SIGNALING_SECRET: {err}");
@@ -55,11 +58,15 @@ fn mint_token(args: &[String]) -> ! {
         eprintln!("usage: services mint-token <room> [lifetime-secs]");
         std::process::exit(2);
     };
+    if let Err(reason) = validate_room(room) {
+        eprintln!("not a room the gate accepts: {reason}");
+        std::process::exit(2);
+    }
     let lifetime = match args.get(1).map(|s| s.parse::<u64>()) {
         None => 3600,
-        Some(Ok(secs)) => secs,
-        Some(Err(_)) => {
-            eprintln!("lifetime-secs must be a whole number of seconds");
+        Some(Ok(secs)) if (1..=MAX_TOKEN_LIFETIME_SECS).contains(&secs) => secs,
+        Some(_) => {
+            eprintln!("lifetime-secs must be a whole number from 1 to {MAX_TOKEN_LIFETIME_SECS}");
             std::process::exit(2);
         }
     };
@@ -67,7 +74,11 @@ fn mint_token(args: &[String]) -> ! {
         eprintln!("mint-token needs UNIBLOX_SIGNALING_SECRET");
         std::process::exit(2);
     };
-    println!("{}", key.mint(room, unix_now() + lifetime));
+    let Some(expires) = unix_now().checked_add(lifetime) else {
+        eprintln!("the expiry overflows");
+        std::process::exit(2);
+    };
+    println!("{}", key.mint(room, expires));
     std::process::exit(0);
 }
 
@@ -80,7 +91,10 @@ async fn main() {
 
     // RUST_LOG-controlled tracing (e.g. RUST_LOG=matchbox_signaling=debug).
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
         .init();
 
     let auth = key_from_env();
@@ -97,15 +111,28 @@ async fn main() {
             std::process::exit(2);
         }
     }
+    let issue_tokens = flag("UNIBLOX_ISSUE_TOKENS");
+    if issue_tokens && auth.is_none() {
+        eprintln!("[signaling] UNIBLOX_ISSUE_TOKENS=1 needs UNIBLOX_SIGNALING_SECRET");
+        std::process::exit(2);
+    }
+    let client_ip = match std::env::var("UNIBLOX_TRUST_FORWARDED_FOR").ok() {
+        None => ClientIp::Peer,
+        Some(v) => match v.parse::<usize>() {
+            Ok(hops) if hops >= 1 => ClientIp::ForwardedFor(hops),
+            _ => {
+                eprintln!(
+                    "[signaling] UNIBLOX_TRUST_FORWARDED_FOR must be the number of trusted proxies (>= 1)"
+                );
+                std::process::exit(2);
+            }
+        },
+    };
     let config = SignalingConfig {
         auth,
-        issue_tokens: flag("UNIBLOX_ISSUE_TOKENS"),
+        issue_tokens,
         token_lifetime: Duration::from_secs(600),
-        client_ip: if flag("UNIBLOX_TRUST_FORWARDED_FOR") {
-            ClientIp::ForwardedFor
-        } else {
-            ClientIp::Peer
-        },
+        client_ip,
         ..SignalingConfig::default()
     };
 

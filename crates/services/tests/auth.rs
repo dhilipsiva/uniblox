@@ -253,7 +253,10 @@ async fn the_token_endpoint_issues_working_tokens() {
     .await;
     let (status, headers, body) = http_get_full(addr, &format!("{TOKEN_PATH}?room={ROOM}")).await;
     assert_eq!(status, 200, "{body}");
-    assert!(headers.contains("cache-control: no-store"), "a token is never cached: {headers}");
+    assert!(
+        headers.contains("cache-control: no-store"),
+        "a token is never cached: {headers}"
+    );
     let json: serde_json::Value = serde_json::from_str(&body).expect("json");
     let token = json["token"].as_str().expect("a token");
     let expires = json["expires"].as_u64().expect("an expiry");

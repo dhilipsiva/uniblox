@@ -1848,29 +1848,75 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
 - **Decision — secure by default:** the binary refuses to start without `UNIBLOX_SIGNALING_SECRET` unless
   `UNIBLOX_SIGNALING_INSECURE=1` says it is a development server. The library's `build_signaling_server` stays
   open for in-process tests and local development; `build_signaling_server_with` takes the config.
+- **Decision — our own server, matchbox's protocol:** the service serves its own axum router and WebSocket
+  handler (`server.rs`) instead of matchbox's builder. It keeps matchbox's wire protocol (`matchbox_protocol`),
+  so matchbox clients connect unchanged. Matchbox's handler left the WebSocket limits at tungstenite's
+  defaults (64 MiB messages, 16 MiB frames) and gave every peer an unbounded outbound queue. The review below
+  measured both as memory exhaustion.
 - **Decision — limits** (`SignalingLimits`, defaults in brackets):
   - connection attempts and token requests per client IP, one shared token bucket [burst 30, one more every
-    2 s]; `429` past it. IPv6 counts per /64. The client IP is the TCP peer, or the right-most
-    `X-Forwarded-For` entry with `ClientIp::ForwardedFor` (only behind a proxy that sets it). The table holds at
-    most [100,000] IPs; when it is full of clients still limited, a new IP is refused (fail closed);
-  - signal messages per connection, a token bucket over every frame [burst 200, 50/s]; a frame over it is dropped;
-  - the size of a signal frame [32 KiB]; a larger one is dropped;
-  - after [100] dropped frames the server closes the connection;
+    2 s]; `429` past it. Before counting, an IPv4-mapped address is taken as its IPv4 and IPv6 is narrowed to
+    its /64. The client IP is the TCP peer, or, with `ClientIp::ForwardedFor(n)`, the `X-Forwarded-For`
+    entry `n` from the right (behind `n` trusted proxies; `ip:port` and `[v6]` forms parse). The table holds
+    at most [100,000] IPs; when it is full of clients still limited, a new IP is refused (fail closed), and
+    the table is pruned at most once a second;
+  - open connections per client IP [16] (`429`) and in total [10,000] (`503`); a slot is held from the gate
+    until the connection ends;
+  - the size of a WebSocket message and frame [32 KiB], enforced by the WebSocket layer as fragments arrive;
+    a larger one closes the connection;
+  - a connection that sends no complete message for [60 s] is closed (matchbox clients send a keep-alive every
+    10 s);
+  - frames per connection, a token bucket [burst 1,024, 100/s], sized for a newcomer answering a full session;
+    a frame over it is dropped, and after [256] drops net of the frames accepted since, the connection is
+    closed;
+  - each peer's outbound queue [256 messages] and WebSocket write buffer [1 MiB]: a peer that does not read is
+    disconnected instead of buffered;
   - peers per session [64]: the gate refuses a full unbounded session with `503`, and `?next` above the cap
-    with `400`; `join_local` enforces the cap again against a race.
-- **Also fixed:** a joining peer's state machine kept clones of the earlier members' senders for its whole
-  connection, so a server-side close of an earlier member could not complete while the later one stayed. It now
-  drops them right after announcing itself.
-- **Known limits:** the per-IP limit is per node, not shared through the Redis registry. axum's WebSocket
-  message limit is matchbox's default (64 MiB), so an oversized frame is buffered before it is dropped; the
-  per-IP limit bounds how many such connections one client holds. The browser client does not fetch tokens yet
-  (its demo room URL is compiled in), so `just browser-e2e` runs the open development server; the client's join
-  through the scoped service, with a token from the endpoint, is follow-up work.
-- **Consequences:** `tests/auth.rs` (11: the token checks, the Done-when refusal of an unauthenticated
-  connection, the open default, the endpoint on and off, the per-IP limit for connections and token requests,
-  the flood dropped then closed, the size cap, the session and `?next` caps), `tests/binary.rs` (the secure
-  default and `mint-token`) and unit tests for the token bucket, the IPv6 /64 key, the forwarded-for parse and the
-  bounded IP table. The existing signaling tests run unchanged on the open default.
+    with `400`; `join_local` enforces the cap again against a race. A signal to oneself is dropped.
+- **Also fixed:**
+  - a joining peer's state machine kept clones of the earlier members' senders for its whole connection, so a
+    server-side close of an earlier member could not complete while the later one stayed. It now drops them
+    right after announcing itself;
+  - `?next` reaches the relay directly, so the gate's stash and the id-assignment bridge (which leaked an entry
+    per aborted upgrade) are gone;
+  - a `?next` room's sub-session counter is dropped once its last session empties;
+  - a token has one spelling (no leading zeros, a lowercase tag);
+  - the token endpoint answers `Cache-Control: no-store`;
+  - `mint-token` refuses rooms the gate refuses and lifetimes over a day (or that overflow);
+  - the secret is read as raw bytes, UTF-8 or not;
+  - `UNIBLOX_ISSUE_TOKENS` without a secret is a startup error;
+  - warnings are logged by default.
+- **Review:** a fresh security review of the first cut (7d7b269) returned REQUEST CHANGES:
+  - HIGH: memory DoS within every limit. One IP could hold about 77 MiB per connection in unfinished
+    fragmented messages, and kept 30 + 0.5/s connections open, because the per-IP limit bounded only the rate
+    of new connections, contrary to this ADR's first wording;
+  - MEDIUM: a non-reading peer grew the server's queue by about 1.35 MiB/s;
+  - MEDIUM: every IPv4-mapped client shared one bucket;
+  - LOW items, covered by the fixes above.
+  All of it is addressed. Tokens and the gate held up: no forgery, no cross-room reuse, no bypass route.
+- **Known limits:**
+  - the per-IP limits are per node, not shared through the Redis registry;
+  - a client that rotates through many IPv6 /64s or IPv4 addresses gets a bucket and 16 connections for
+    each;
+  - the browser client does not fetch tokens yet (its demo room URL is compiled in), so `just browser-e2e`
+    runs the open development server. The client's join through the scoped service, with a token from the
+    endpoint, is follow-up work.
+- **Consequences:** `tests/auth.rs` (16) covers:
+  - the token checks and their single spelling;
+  - the Done-when refusal of an unauthenticated connection, and the open default;
+  - the endpoint on and off, with `no-store`;
+  - the per-IP limit for connections and token requests;
+  - the flood dropped then closed;
+  - an oversized message, and an unfinished fragmented message, closing the connection;
+  - the per-IP connection cap;
+  - the idle timeout;
+  - a non-reading peer disconnected;
+  - the session and `?next` caps.
+
+  `tests/binary.rs` (6) covers the secure default, `mint-token` and its refusals, a non-UTF-8 secret, and the
+  endpoint without a secret. Unit tests cover the token bucket, the address keys (IPv6 /64, IPv4-mapped,
+  forwarded-for hops and forms), the bounded IP table, the refill rounding and the `?next` counter. The
+  existing signaling and Redis tests run unchanged.
 - **Status:** Proposed (2026-10-21) on branch `todo/P4-UNIBLOX-05`, part of a HIGH-risk item: accepted after the
   owner's review.
 

@@ -9,15 +9,14 @@ homepage.workspace = true
 description = "The uniblox signaling service: mode- and version-scoped WebRTC signaling, session grouping and a shared Redis session registry"
 
 [dependencies]
-matchbox_signaling.workspace = true
 matchbox_protocol.workspace = true         # PeerId + JsonPeer{Request,Event} wire types
-axum = { workspace = true, features = ["ws"] }  # reasoned gate rejections (ADR-0038) + ws::Message for the relay (ADR-0039)
-async-trait.workspace = true               # the custom NextTopology SignalingTopology impl (ADR-0039)
-futures.workspace = true                   # StreamExt on the WsStateMeta receiver (relay loop, ADR-0039)
+axum = { workspace = true, features = ["ws"] }  # the server, its WebSocket handler and limits, reasoned gate rejections (ADR-0038, ADR-0047)
+async-trait.workspace = true               # the RegistryStore trait (ADR-0040)
+futures.workspace = true                   # splitting a peer socket into its reader and writer (ADR-0047)
 redis.workspace = true                     # the shared Redis session-registry backend (ADR-0040)
 uuid.workspace = true                      # per-node id for the shared registry (ADR-0040)
 tracing.workspace = true                   # best-effort store-mirror failure logs (ADR-0040)
-tokio = { workspace = true, features = ["time"] }  # bounded timeout on the store mirror (ADR-0040)
+tokio = { workspace = true, features = ["time", "net", "sync"] }  # the store-mirror timeout (ADR-0040); the server, its queues and timers (ADR-0047)
 tracing-subscriber.workspace = true
 hmac.workspace = true                      # join tokens (ADR-0047)
 sha2.workspace = true

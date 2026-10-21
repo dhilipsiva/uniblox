@@ -6,31 +6,31 @@
 
 ## Status
 **Scoped signaling with the asymmetric filter + `?next=N` grouping (ADR-0037/0038/0039) — library + binary.**
-`build_signaling_server(addr, registry)` builds the custom **`NextTopology`** (`SignalingServerBuilder::new`, NOT
-FullMesh) with a scope in the room PATH `<mode>~<content>.<schema>~<min>~<lobby>` (e.g. `m1~7.2~3~arena`); the
-client's OWN engine rides the `?engine=N` query. The topology isolates strictly by the path string, so
-content/schema/min/lobby give EXACT-match structural isolation while the engine (out of the key) lets
-different-but-compatible versions share ONE session. The `on_connection_request` gate implements the **ASYMMETRIC
-filter** (admit iff `?engine >= min_engine`, else a REASONED rejection — `426` too-old, `400` malformed/bad-`?engine`/
-bad-`?next`, via `axum` `(StatusCode, body).into_response()` returned verbatim on `Err`) AND stashes `?next`. A plain
-path (no `~`) is a legacy room (no engine gate). **`NextTopology` (ADR-0039)** re-implements matchbox `FullMesh`'s
-relay (via `common_logic::{parse_request, try_send}`) GENERALIZED with `?next=N` session-SIZE grouping: `?next` absent
-⇒ one unbounded session per room (FullMesh-equivalent; session key = the path); `?next=N` ⇒ the room subdivides into
-sessions keyed `"<room>#<index>"`, each capped at N, **batch-deal / no-backfill** (a session seals at N and never
-refills). The topology can't see the query, so `?next` is stashed by the gate (`origin`) → bridged to `PeerId` at
-`on_id_assignment` → consumed in the topology's `join`. The `SessionRegistry` IS the topology's shared
-`SignalingState` — it holds the relay senders + grouping bookkeeping + stashed `?next`, and lists sessions
-(`list()`/`peer_count()`/`session_count()`; keys are session keys). Join/leave bookkeeping is INLINE in the topology
-(a custom topology has no `on_peer_connected/on_peer_disconnected`); lock discipline = collect senders under the
-`Mutex`, drop it, then `try_send`. `parse_scope`/`parse_engine`/`parse_next` + `Scope`/`Mode` (signaling-local tag).
-Binary = thin wrapper (port `UNIBLOX_SIGNALING_PORT`/3536, `RUST_LOG` tracing). 5 unit + 16 raw-WS integration tests.
+The service is its OWN axum server (`server.rs`, ADR-0047) speaking matchbox's wire protocol (`matchbox_protocol`
+`JsonPeerRequest`/`JsonPeerEvent`), so matchbox clients connect unchanged; matchbox_signaling is no longer used.
+`build_signaling_server(addr, registry)` (open) / `build_signaling_server_with(.., SignalingConfig)` return a
+`SignalingServer` with matchbox's `bind`/`serve` API. Rooms are the URL PATH `<mode>~<content>.<schema>~<min>~<lobby>`
+(e.g. `m1~7.2~3~arena`); the client's OWN engine rides `?engine=N`. Isolation is strictly by the path string, so
+content/schema/min/lobby are EXACT-match structural while the engine (out of the key) lets compatible versions share
+ONE session. The gate (`Shared::gate`) applies, in order: the per-IP attempt rate (429), the room (`validate_room`,
+400), the join token (401), the ASYMMETRIC filter (`426` too-old, `400` malformed/bad-`?engine`), the `?next` and
+session caps (400/503), then a connection slot (429 per IP, 503 total). A plain path (no `~`) is a legacy room. The
+relay (`run_peer`/`relay`) is matchbox `FullMesh`'s contract GENERALIZED with `?next=N` session-SIZE grouping:
+absent ⇒ one unbounded session per room; `?next=N` ⇒ sessions keyed `"<room>#<index>"`, each capped at N,
+**batch-deal / no-backfill**. `?next` goes straight from the gate to `join_local`. The `SessionRegistry` holds each
+member's bounded `PeerTx` (queue + disconnect switch) and the grouping bookkeeping, and lists sessions
+(`list()`/`peer_count()`/`session_count()`). Lock discipline: collect `PeerTx`s under the `Mutex`, drop it, then
+send. `parse_scope`/`parse_engine`/`parse_next` + `Scope`/`Mode` (signaling-local tag). Binary = thin wrapper (port
+`UNIBLOX_SIGNALING_PORT`/3536, `RUST_LOG` tracing, warnings by default).
 
 **Authentication and limits (ADR-0047, proposed):** `build_signaling_server_with(addr, registry, SignalingConfig)`.
 With `auth: Some(JoinTokenKey)` the gate admits only a valid `?token=` for the requested room path (HMAC-SHA256
 `v1.<expiry>.<tag>`, at most a day, 401 with a reason otherwise); `issue_tokens` serves `GET /_uniblox/token?room=`.
-`SignalingLimits`: a per-IP bucket for connection attempts and token requests (429; IPv6 per /64; `ClientIp::
-ForwardedFor` behind a proxy; bounded table, fail closed), a per-connection bucket over every frame plus a 32 KiB
-frame cap (drop; close after 100 drops), and 64 peers per session (503; `?next` above it is 400). The binary refuses
+`SignalingLimits`: a per-IP bucket for connection attempts and token requests (429; IPv4-mapped as IPv4, IPv6 per
+/64; `ClientIp::ForwardedFor(hops)` behind proxies; bounded table, fail closed), 16 open connections per IP and
+10,000 in total, a 32 KiB WebSocket message/frame cap enforced as fragments arrive, a 60 s idle timeout, a
+per-connection frame bucket (1,024 burst, 100/s; close after 256 net drops), a 256-message outbound queue and a 1 MiB
+write buffer per peer (a non-reader is disconnected), and 64 peers per session. The binary refuses
 to start without `UNIBLOX_SIGNALING_SECRET` unless `UNIBLOX_SIGNALING_INSECURE=1`; `services mint-token <room>`.
 `build_signaling_server` (no config) stays open for tests and local development.
 
@@ -60,7 +60,7 @@ leave = one Lua script, sweep = one `MULTI` per dead session.
 ## Crate-local invariants
 - **DONE (ADR-0037/0038/0039/0040):** `{mode, version}` scoping + the connection gate + the session registry; the
   **ASYMMETRIC version filter** (admit `engine >= min`, content + schema EXACT, reasoned `426`/`400`); **`?next=N`
-  session-SIZE grouping** via the custom `NextTopology` (batch-deal / no-backfill); and **horizontal scale** — the
+  session-SIZE grouping** in the relay (batch-deal / no-backfill); and **horizontal scale** — the
   `RegistryStore` split + `RedisRegistryStore` (two stateless nodes share one Redis registry). The relay is
   re-implemented from FullMesh's contract — the ADR-0037/0038 tests double as its regression on the unbounded path.
 - **DEFERRED (later Phase-5 / Phase-11):** the Mode-2 coordinator peer service; cross-node relay (sticky routing

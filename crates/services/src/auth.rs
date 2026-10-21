@@ -13,7 +13,7 @@ use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// The shortest signaling secret accepted, in bytes.
+/// The shortest signaling secret accepted, in bytes. Use 32 random bytes; only the length is checked.
 pub const MIN_KEY_BYTES: usize = 32;
 
 /// The longest lifetime a token may claim (a day): a token minted further ahead is refused, so a
@@ -96,7 +96,11 @@ impl JoinTokenKey {
         else {
             return Err(TokenError::Malformed);
         };
-        if expires.is_empty() || !expires.bytes().all(|b| b.is_ascii_digit()) {
+        // One spelling per token: digits only, no leading zero.
+        if expires.is_empty()
+            || !expires.bytes().all(|b| b.is_ascii_digit())
+            || (expires.len() > 1 && expires.starts_with('0'))
+        {
             return Err(TokenError::Malformed);
         }
         let expires: u64 = expires.parse().map_err(|_| TokenError::Malformed)?;
@@ -132,7 +136,7 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
-/// Exactly 32 bytes of lowercase or uppercase hex, else `None`.
+/// Exactly 32 bytes of lowercase hex (the one spelling `mint` writes), else `None`.
 fn unhex(s: &str) -> Option<Vec<u8>> {
     if s.len() != 64 {
         return None;
@@ -140,7 +144,6 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
     let nibble = |c: u8| match c {
         b'0'..=b'9' => Some(c - b'0'),
         b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
         _ => None,
     };
     s.as_bytes()

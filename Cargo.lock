@@ -6899,7 +6899,6 @@ dependencies = [
  "futures",
  "hmac",
  "matchbox_protocol",
- "matchbox_signaling",
  "redis",
  "serde_json",
  "sha2 0.10.9",

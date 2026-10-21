@@ -83,11 +83,18 @@ fn a_non_utf8_secret_is_used_as_bytes() {
     use std::os::unix::ffi::OsStrExt;
     let raw: Vec<u8> = (0u8..40).map(|b| b ^ 0xA5).collect();
     let out = services()
-        .env("UNIBLOX_SIGNALING_SECRET", std::ffi::OsStr::from_bytes(&raw))
+        .env(
+            "UNIBLOX_SIGNALING_SECRET",
+            std::ffi::OsStr::from_bytes(&raw),
+        )
         .args(["mint-token", "room"])
         .output()
         .expect("run the binary");
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let token = String::from_utf8(out.stdout).unwrap();
     let key = JoinTokenKey::new(&raw).unwrap();
     assert_eq!(key.verify(token.trim(), "room", unix_now()), Ok(()));
@@ -103,4 +110,3 @@ fn issuing_tokens_needs_a_secret() {
         .expect("run the binary");
     assert_eq!(out.status.code(), Some(2));
 }
-
