@@ -9,7 +9,7 @@ limits; the thin custom ECS bridge.
 Implemented (initial bridge). `ScriptEngine` — a locked-down `Engine::new_raw()` + all `set_max_*` limits +
 `disable_symbol("eval")` — held as a Bevy **NonSend** resource (ADR-0011), mutating a whitelisted `Health`
 component per tick via `run_scripts`; in-memory + native file-mtime hot-reload. rhai 1.25 (non-sync,
-`default-features=false`) + bevy_ecs 0.19. Sandbox-audited; compiles for wasm32.
+`default-features=false`) + bevy_ecs 0.20. Sandbox-audited; compiles for wasm32.
 **Full hardening (wall-clock watchdog, adversarial matrix, per-frame op budget, source-size cap,
 `unchecked`/`internals` CI assertion) is Phase 12.**
 

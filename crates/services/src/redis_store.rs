@@ -60,6 +60,11 @@ pub struct RedisRegistryStore {
 
 impl RedisRegistryStore {
     /// Connect to Redis at `url` (e.g. `redis://127.0.0.1:6379`).
+    ///
+    /// redis-rs 1.x gives this connection a 1 s connect timeout and a 500 ms response timeout (0.27 had
+    /// none, ADR-0041): an unreachable or slow Redis fails here, or makes a store call return a
+    /// `RegistryError`, instead of hanging. That suits a best-effort listing mirror, whose failures are
+    /// logged and never touch the node-local relay. redis-rs 1.x also rejects `redis://0.0.0.0`.
     pub async fn connect(url: &str) -> RegistryResult<Self> {
         let client = redis::Client::open(url).map_err(to_err)?;
         let conn = client

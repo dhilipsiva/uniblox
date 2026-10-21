@@ -1522,7 +1522,7 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   fix delta → fixes sound, no HIGH/MEDIUM, no regressions.**
 - **Status:** Accepted (2026-07-13).
 
-## ADR-0041 — dependency currency (2026-10-21): Bevy 0.20, str0m 0.24, redis 1.6, Rust 1.99.1; three pins kept
+## ADR-0041 — dependency currency (2026-10-21): Bevy 0.20, str0m 0.24, redis 1.7, Rust 1.99.1; three pins kept
 - **Context:** the 2026-10-20 portfolio assessment found the workspace behind its main dependencies (Bevy 0.19 vs
   0.20, str0m 0.21 vs 0.24, redis 0.27 vs 1.x, webrtc 0.17 vs 0.21), the `wasm-bindgen` crate and CLI agreeing
   only because the nixpkgs revision happened to ship 0.2.121, and `cargo deny` failing on 15 advisory hits, a
@@ -1530,11 +1530,27 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   included.
 - **Decision — moved:** `nix flake update` (nixpkgs 2026-10-20, rust-overlay 2026-10-21) with the toolchain pinned
   EXACTLY to Rust 1.99.1 instead of `stable.latest`, and `rust-version` 1.96 → 1.99 (Bevy 0.20 needs ≥ 1.97.1);
-  Bevy 0.19 → 0.20 (no code changes in engine-core, replication, server, standalone or the client, both wasm
-  variants included); str0m 0.21 → 0.24.1 (no code changes; its 0.22–0.24 changelog is mostly media, and the
-  data-channel entries are fixes); redis 0.27 → 1.6 (no code changes); async-trait 0.1.92 (clippy's
-  `double_must_use` on newer Rust); rustls 0.23.46, rustls-webpki 0.103.16 and spin 0.10.1 through
-  semver-compatible updates; the internal path dependencies gained `version = "0.1.0"` (the wildcard bans).
+  Bevy 0.19 → 0.20 (no source changes in engine-core, replication, server, standalone or the client, both wasm
+  variants included); str0m 0.21 → 0.24.1 (no source changes); redis 0.27 → 1.7.1 (no source changes). The
+  preceding hygiene work (CI, 2026-10-21) had already moved async-trait to 0.1.92 (clippy's `double_must_use` on
+  newer Rust), rustls 0.23 to 0.23.46, rustls-webpki 0.103 to 0.103.16 and spin to 0.10.1 through
+  semver-compatible updates, and had given the internal path dependencies `version = "0.1.0"`.
+- **Behaviour changes that compile unchanged** (found by the independent review; none breaks a test, none has
+  a dedicated test yet):
+  - redis-rs 1.x: the multiplexed connection now has a 1 s connect and a 500 ms response timeout (0.27: none), so
+    a slow Redis yields `RegistryError`s, already logged best-effort, instead of hanging; `redis://0.0.0.0` is
+    rejected. Documented at `RedisRegistryStore::connect`.
+  - str0m 0.22 (#1000): when the remote peer closes (DTLS close_notify, or the SCTP association is lost), `Rtc`
+    now moves to Closed, so `Str0mPeer` ends on `!rtc.is_alive()` and reports Disconnected at once (the offerer
+    then reconnects) instead of waiting for ICE to time out. During the closing drain a send logs the misleading
+    "before open — dropped" warning. No test closes a peer from the remote side.
+  - str0m 0.24 now applies the reliability parameters to a negotiated stream the remote opened by sending first
+    (0.21 sent such a stream reliable and ordered), and sctp-proto 0.10.7 corrects the partial-reliability retry
+    budget. The README bandwidth figure measures the matchbox `Transport`, not this path.
+  - Bevy 0.20 no longer panics when NonSend data is dropped on the wrong thread; it logs a warning and leaks
+    the value. `Net` holds the `Transport`, so an `App` dropped off its thread would keep its sockets. Every
+    `App` is dropped on its own thread today. A panicking system now goes through the error handler, so the
+    stderr line naming the system is gone; the crash is the same.
 - **Decision — wasm-bindgen pinned together:** the crate pin moves `=0.2.121` → `=0.2.129` together with the
   flake's CLI, now the versioned `wasm-bindgen-cli_0_2_129` attribute, so a nixpkgs bump cannot move it; `flake.nix`
   reads the crate version from Cargo.lock and refuses to evaluate the dev shell when the two differ.
@@ -1550,10 +1566,14 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
     matchbox release, a `[patch]`, or a newer winit.
 - **Consequences:** `cargo deny check advisories bans licenses sources` passes with those 9 ignores and no other
   exception; `just ci` (fmt, clippy, 246 tests, rustdoc, deny, net-free) passes on Rust 1.99.1; both WASM builds
-  succeed after the flake update (3,452,507 / 3,473,869 bytes brotli, +1.5% on Bevy 0.19, gate PASS) and the
+  succeed after the flake update (3,452,507 / 3,473,869 bytes brotli: +1.5% on the Bevy 0.19 build measured the same
+  day, 3,399,879 / 3,420,105, and +1.9% on the sizes last recorded in this log, ADR-0031; gate PASS) and the
   client renders in headless Chrome (WebGL2 via SwiftShader: the avatar and NPCs draw). Native measurements,
   recorded in README "Measurements": replication 879–918 B/s per peer at 2 entities and ~20 Hz over three runs
   (the pre-update tree measures 881 B/s, so the bump changed nothing on the wire; the 742 B/s in the Phase-1
   notes was measured on an earlier tree), loopback RTT 4.0 ms, ed25519 sign/verify 9.3/18.9 µs. The
   `slice_metrics` example now creates `target/` before writing its JSON.
+- **Review:** an independent review (2026-10-21) found nothing HIGH or MEDIUM; its six LOW notes are the
+  behaviour changes above and corrections to this record. `just ci` re-run green; transport, replication and
+  server tests 12 runs, 0 failures.
 - **Status:** Proposed (2026-10-21) on branch `todo/P2-UNIBLOX-01`; accepted when merged.

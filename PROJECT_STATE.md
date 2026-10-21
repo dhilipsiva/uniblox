@@ -254,7 +254,7 @@ bullets. Remaining Phase-5: the Mode-2 coordinator peer service.
   was trivially true); T18 asserts the old owner's entity freezes; new T28 covers the mint-on-transfer arm.
   Phase-3 carries: adoption-switch re-verification with real buffers; hand-back/repeated/loss handoffs.
 - **str0m native/server WebRTC peer** (ADR-0015, Phase 2) — `transport::Str0mPeer` (native-only): sans-IO
-  str0m 0.21 (`rust-crypto`, Nix-friendly) speaking matchbox's exact signaling wire (via `matchbox_protocol`
+  str0m 0.21 (0.24 since ADR-0041; `rust-crypto`, Nix-friendly) speaking matchbox's exact signaling wire (via `matchbox_protocol`
   + blocking tungstenite) with one connection thread per remote peer running the canonical drain-to-Timeout
   loop; matchbox's negotiated no-DCEP channels (ids 0/1, labels `matchbox_socket_{i}`) pre-declared both
   roles. Interop proven hermetically: str0m↔native-matchbox BOTH role directions + str0m↔str0m, both

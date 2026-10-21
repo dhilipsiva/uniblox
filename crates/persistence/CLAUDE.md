@@ -6,7 +6,7 @@ world to a blob, hash it to a `protocol::ContentId`, reload by id.
 
 ## Status
 Implemented (ADR-0033, Phase 4 Item B2). `save_world(&World) -> (ContentId, Vec<u8>)` reads authoritative
-state READ-ONLY (`iter_entities` + `EntityRef::get`, filtered to `Owner`-bearing sim entities — bevy_ecs 0.19
+state READ-ONLY (`iter_entities` + `EntityRef::get`, filtered to `Owner`-bearing sim entities — bevy_ecs 0.20
 stores resources on entities, so the `Owner` filter excludes them), encodes a postcard `SaveBlob`, and returns
 its blake3 content id (ADR-0032). `load_world(&mut World, blob, dt)` clears existing sim entities (two-pass —
 `iter_entities` borrows `&World`, `despawn` needs `&mut`), reseeds `insert_sim` + the saved `Tick`, and rebuilds
