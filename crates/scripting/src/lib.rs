@@ -20,8 +20,9 @@ mod system;
 pub use agent::{Agent, register_agent};
 pub use component::{Health, register_api};
 pub use engine::{
-    FRAME_BUDGET_TOKEN, FrameStats, MAX_CONTAINER_ELEMENTS, MAX_OPERATIONS_PER_CALL, ScriptEngine,
-    ScriptLimits, TIME_BUDGET_TOKEN, sandbox_engine,
+    FRAME_BUDGET_TOKEN, FrameStats, MAX_CALL_LEVELS, MAX_CONTAINER_ELEMENTS, MAX_EXPR_DEPTH,
+    MAX_FN_EXPR_DEPTH, MAX_FUNCTIONS, MAX_OPERATIONS_PER_CALL, MAX_STRING_BYTES, OPS_BUDGET_TOKEN,
+    ScriptEngine, ScriptLimits, TIME_BUDGET_TOKEN, sandbox_engine, worst_case_stack_scripts,
 };
 pub use error::ScriptError;
 pub use system::{hot_reload_system, insert_scripting, run_scripts};

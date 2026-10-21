@@ -231,9 +231,16 @@ fn the_frame_budget_caps_the_cost_across_entities() {
         "after the budget is spent, nothing runs"
     );
     let stats = engine.frame_stats();
-    assert_eq!(stats.calls as usize, ran + 1, "the ones that finished, and the one cut off");
+    assert_eq!(
+        stats.calls as usize,
+        ran + 1,
+        "the ones that finished, and the one cut off"
+    );
     assert_eq!(stats.skipped as usize, 40 - ran - 1);
-    assert_eq!(stats.ops, 200_001, "the cut-off call stopped one operation past the budget");
+    assert_eq!(
+        stats.ops, 200_001,
+        "the cut-off call stopped one operation past the budget"
+    );
     engine.begin_frame();
     assert!(
         engine.update_component(Health { hp: 0 }).is_ok(),
@@ -338,8 +345,7 @@ fn the_worst_case_recursion_and_nesting_fit_the_documented_stack() {
                     frame_time_budget: Duration::from_secs(60),
                     ..ScriptLimits::default()
                 };
-                let mut engine =
-                    ScriptEngine::from_source_with(&src, limits).expect("it compiles");
+                let mut engine = ScriptEngine::from_source_with(&src, limits).expect("it compiles");
                 engine
                     .update_component(Health { hp: 0 })
                     .map(|h| h.hp)
@@ -348,7 +354,10 @@ fn the_worst_case_recursion_and_nesting_fit_the_documented_stack() {
             .unwrap()
             .join();
         let outcome = joined.expect("no stack overflow");
-        assert!(outcome.is_ok(), "{name}: the worst case runs within the limits: {outcome:?}");
+        assert!(
+            outcome.is_ok(),
+            "{name}: the worst case runs within the limits: {outcome:?}"
+        );
     }
 }
 
@@ -363,8 +372,15 @@ fn the_worst_case_scripts_sit_at_the_limits() {
             1,
         );
         let deeper_body = deeper_body.replacen(" }\nfn update", ") }\nfn update", 1);
-        assert_eq!(deeper_body.len(), src.len() + 2, "{name}: both edits applied");
-        assert!(sandbox_engine().compile(&deeper_body).is_err(), "{name}: body depth");
+        assert_eq!(
+            deeper_body.len(),
+            src.len() + 2,
+            "{name}: both edits applied"
+        );
+        assert!(
+            sandbox_engine().compile(&deeper_body).is_err(),
+            "{name}: body depth"
+        );
         let deeper_call = src.replace(
             &format!("deep(a, b, {})", scripting::MAX_CALL_LEVELS - 1),
             &format!("deep(a, b, {})", scripting::MAX_CALL_LEVELS),
@@ -377,7 +393,10 @@ fn the_worst_case_scripts_sit_at_the_limits() {
             .join()
             .expect("no stack overflow");
         let err = joined.unwrap_err();
-        assert!(err.contains("ErrorStackOverflow"), "{name}: call depth: {err}");
+        assert!(
+            err.contains("ErrorStackOverflow"),
+            "{name}: call depth: {err}"
+        );
     }
 }
 
@@ -404,7 +423,10 @@ fn callbacks_count_against_the_frame_budget() {
                fn update(h) { let a = []; let i = 0; while i < 100 { a.push(i); i += 1; } a.map(\"burn\"); h }";
     let mut engine = ScriptEngine::from_source_with(src, limits).unwrap();
     engine.begin_frame();
-    assert!(engine.update_component(Health { hp: 0 }).is_err(), "the frame budget stops it");
+    assert!(
+        engine.update_component(Health { hp: 0 }).is_err(),
+        "the frame budget stops it"
+    );
     let ops = engine.frame_stats().ops;
     assert!((50_000..60_000).contains(&ops), "counted ops {ops}");
 }
@@ -444,8 +466,14 @@ fn the_reviewed_intrinsics_work() {
 /// can reach through the map index-insert gap).
 #[test]
 fn the_string_cap_is_one_kibibyte() {
-    assert!(run(r#"fn update(h) { let s = "x"; let i = 0; while i < 10 { s += s; i += 1; } h }"#).is_ok());
+    assert!(
+        run(r#"fn update(h) { let s = "x"; let i = 0; while i < 10 { s += s; i += 1; } h }"#)
+            .is_ok()
+    );
     let err = run(r#"fn update(h) { let s = "x"; let i = 0; while i < 11 { s += s; i += 1; } h }"#)
         .unwrap_err();
-    assert!(matches!(*err, EvalAltResult::ErrorDataTooLarge(..)), "{err:?}");
+    assert!(
+        matches!(*err, EvalAltResult::ErrorDataTooLarge(..)),
+        "{err:?}"
+    );
 }

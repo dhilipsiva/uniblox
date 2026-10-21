@@ -27,6 +27,10 @@ for t in wasm-bindgen wasm-opt brotli; do
 done
 
 RAW="${CARGO_TARGET_DIR:-target}/wasm32-unknown-unknown/release/client.wasm"
+# An 8 MiB stack instead of the 1 MiB wasm32 default: the worst native recursion a script can reach
+# needs ~0.45 MiB in a native release build (ADR-0046, `just stack-check`); this keeps a wide margin
+# for wasm frame sizes. A stack overflow in wasm traps and kills the client.
+STACK="-C link-arg=-zstack-size=8388608"
 
 emit () {
   local variant="$1" cargo_args="$2" rustflags="${3:-}"
@@ -69,8 +73,8 @@ emit () {
 }
 
 echo "uniblox two-build WASM pipeline"
-emit webgl2 ""                 ""                              # default build
-emit webgpu "--features webgpu" "--cfg=web_sys_unstable_apis"  # WebGPU build
+emit webgl2 ""                 "${STACK}"                               # default build
+emit webgpu "--features webgpu" "${STACK} --cfg=web_sys_unstable_apis"   # WebGPU build
 # Stage the capability-detection page at the served root.
 cp crates/client/web/index.html dist/index.html
 echo "Done. Artifacts: dist/webgl2/ and dist/webgpu/ (+ index.html). Serve with scripts/serve.sh (no COOP/COEP)."
