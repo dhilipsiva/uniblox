@@ -1,0 +1,84 @@
+# uniblox
+
+**Status:** pre-release (0.1.0, nothing published): the netcode core and the Mode-1 and Mode-3 runtimes work and are tested natively; scripting, the platform backend and the native client are not built yet. Details under [Status](#status).
+
+uniblox is a browser-first Rust engine for multiplayer games, built around one idea, the *authority-swap*: a single per-entity, authoritative state-replication mechanism in which only the assignment of authority differs between modes. The same simulation therefore runs standalone, peer-to-peer and on a server with no fork in the game logic. It is being developed as a netcode library with a hosted demo.
+
+The simulation uses Bevy 0.19's ECS. The transport is WebRTC DataChannels only (matchbox in the browser, str0m natively; no media, no SFU), and the browser build is single-threaded WebAssembly. Game logic is meant to run as sandboxed Rhai scripts.
+
+## Status
+
+Implemented and tested natively:
+- the replication protocol, the two-channel transport and the scoped signaling service, with a shared Redis session registry;
+- the Mode-1 (standalone) and Mode-3 (server) runtimes;
+- content-addressed saves.
+
+In the browser, the client renders the shared simulation in both WebGPU and WebGL2 builds (3.4 MB each, brotli) and saves and reloads the world. That browser behaviour is verified by hand; there is no automated browser test yet.
+
+Not built yet:
+- `scripting`: the Rhai engine is sandbox-tested, but no runtime uses it, so games cannot be scripted yet.
+- `platform`: an 11-line stub.
+- The native client: a stub that prints its name.
+- Mode 2 end to end in a browser.
+- Real-network numbers, such as the STUN-only connection rate.
+- CI and published crates.
+
+## Modes
+
+| Mode | Who is authoritative | Where it runs today |
+|---|---|---|
+| 1, Standalone | The local player owns every entity; the networking stack is absent. | `standalone` (headless) and the browser `client`, which saves and reloads the world by content ID in IndexedDB. |
+| 2, P2P hybrid | Each entity has one owning peer. A coordinator, the lowest live peer, arbitrates ownership claims and transfers, and survivors re-assign a departed peer's entities. | `replication` and `transport` between peers, matched by the `services` signaling server. Tested natively; the browser flow is not built yet. |
+| 3, Full server | A headless server owns every entity; clients predict their own avatar and interpolate the rest. | `server`, a headless authoritative runtime with a 64 Hz fixed tick. |
+
+Modes 2 and 3 run identical systems and differ only in ownership data (ADR-0014).
+
+## Crates
+
+| Crate | Role |
+|---|---|
+| `protocol` | Wire types: peer and network-entity identity, quantization, replication messages, content IDs. |
+| `replication` | The authority-gated replication protocol: acked-baseline deltas, interest management, prediction and reconciliation, ownership arbitration, resync. |
+| `transport` | Two-channel WebRTC DataChannels (unreliable state, reliable events) over matchbox and str0m. |
+| `services` | Signaling and the session registry: mode- and version-scoped rooms, session-size grouping, an optional shared Redis registry. |
+| `engine-core` | The shared simulation: components, systems and `authority_of`, the single authority decision. |
+| `standalone`, `server` | The Mode-1 and Mode-3 runtimes. |
+| `client` | The browser client, built twice (WebGPU and WebGL2). |
+| `persistence` | Content-addressed saves (blake3 IDs) with in-memory, file and IndexedDB stores. |
+| `scripting` | A locked-down Rhai engine, sandbox-tested; no other crate depends on it yet. |
+| `platform` | A placeholder for identity, billing, publishing and moderation. |
+
+## Build, run and test
+
+The toolchain (Rust 1.96 with the wasm32 target, wasm-bindgen, wasm-opt, brotli, node, coturn and redis) comes from the Nix flake:
+
+```bash
+nix develop                  # or `direnv allow` once; .envrc uses the flake
+cargo build
+cargo test                   # not --release: the release profile aborts on panic
+cargo clippy --all-targets -- -D warnings
+```
+
+The TURN-relay and shared-registry tests start `turnserver` and `redis-server`, which the dev shell provides.
+
+Running it:
+
+```bash
+cargo run -p services        # signaling on port 3536 (UNIBLOX_SIGNALING_PORT; UNIBLOX_REDIS_URL for a shared registry)
+cargo run -p server          # Mode 3; joins UNIBLOX_SIGNALING_URL (default ws://127.0.0.1:3536/uniblox-demo)
+cargo run -p standalone      # Mode 1, headless
+scripts/build-wasm.sh        # the two browser builds into dist/, with the size check
+scripts/serve.sh             # serve dist/ locally
+```
+
+## Records
+
+- [DECISIONS.md](DECISIONS.md): the architecture decision log (40 ADRs).
+- [TODO.md](TODO.md): the phase plan and its acceptance criteria.
+- [PROJECT_STATE.md](PROJECT_STATE.md): current status.
+- [docs/CONTEXT.md](docs/CONTEXT.md): background and the open naming question.
+- [CLAUDE.md](CLAUDE.md): the operating context for coding agents.
+
+## Licence
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option. Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this work, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.

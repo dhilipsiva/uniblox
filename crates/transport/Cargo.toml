@@ -2,6 +2,11 @@
 name = "transport"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Two-channel WebRTC DataChannel transport for uniblox: matchbox in the browser, str0m natively"
 
 [dependencies]
 matchbox_socket.workspace = true

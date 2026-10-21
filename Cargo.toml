@@ -11,6 +11,12 @@ members  = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+# The stable toolchain the flake provides (CONVENTIONS.md, MSRV policy: it moves only with a
+# CHANGELOG line, and CI builds on it).
+rust-version = "1.96"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/dhilipsiva/uniblox"
+homepage = "https://github.com/dhilipsiva/uniblox"
 
 # Single source of truth for third-party version pins (ADR-0007). Member crates
 # reference these via `dep.workspace = true`; Cargo.lock pins the exact patch.

@@ -2,6 +2,11 @@
 name = "server"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "The uniblox Mode-3 runtime: the headless authoritative server that runs the shared simulation"
 
 [dependencies]
 protocol = { path = "../protocol" }

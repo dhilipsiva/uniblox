@@ -2,6 +2,11 @@
 name = "persistence"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Content-addressed uniblox saves: save and load a world by its blake3 content ID, with in-memory, file and IndexedDB stores"
 
 # The Mode-1 content-addressed save (ADR-0033). Serializes the authoritative
 # world state to a postcard blob, hashes it to a protocol::ContentId (blake3,

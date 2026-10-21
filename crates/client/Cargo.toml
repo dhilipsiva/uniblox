@@ -2,6 +2,11 @@
 name = "client"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "The uniblox game client: a Bevy render app built for the browser in WebGPU and WebGL2 variants (the native build is a stub)"
 
 [features]
 # WebGL2 is the implicit default build. The `webgpu` feature is enabled for the

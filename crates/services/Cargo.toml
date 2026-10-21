@@ -2,6 +2,11 @@
 name = "services"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "The uniblox signaling service: mode- and version-scoped WebRTC signaling, session grouping and a shared Redis session registry"
 
 [dependencies]
 matchbox_signaling.workspace = true

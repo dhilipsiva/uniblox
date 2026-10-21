@@ -2,6 +2,11 @@
 name = "standalone"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "The uniblox Mode-1 runtime: the shared simulation with local authority and no networking stack"
 
 # Mode 1 (Standalone) runtime, ADR-0030. Deliberately NET-FREE: depends only on
 # engine-core (+ protocol) and the bevy app/time/ecs crates — NO transport,
