@@ -35,8 +35,13 @@ pub struct SignalingLimits {
     /// A connection that sends no complete message for this long is closed (matchbox clients send a
     /// keep-alive every 10 s).
     pub idle_timeout: Duration,
-    /// Messages queued for one peer; a peer whose queue is full is not reading and is disconnected.
+    /// Messages queued for one peer. Past this (or `max_outbound_bytes`) a message to it is dropped
+    /// and charged to its sender.
     pub max_outbound_queue: usize,
+    /// Bytes queued for one peer.
+    pub max_outbound_bytes: usize,
+    /// A peer whose socket accepts no write for this long is not reading: it is disconnected.
+    pub writer_stall_timeout: Duration,
     /// Bytes the WebSocket layer may buffer for one peer's writes before the connection fails.
     pub max_write_buffer_bytes: usize,
     /// The most peers one session may hold; `?next` may not ask for more.
@@ -58,7 +63,10 @@ impl Default for SignalingLimits {
             max_signal_bytes: 32 * 1024,
             abuse_close_after: 256,
             idle_timeout: Duration::from_secs(60),
-            max_outbound_queue: 256,
+            // A newcomer to a full session receives 63 offers plus their ICE candidates at once.
+            max_outbound_queue: 1024,
+            max_outbound_bytes: 1024 * 1024,
+            writer_stall_timeout: Duration::from_secs(10),
             max_write_buffer_bytes: 1024 * 1024,
             max_session_peers: 64,
             max_tracked_ips: 100_000,

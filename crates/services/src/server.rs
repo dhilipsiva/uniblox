@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -31,12 +32,23 @@ use crate::{
 /// How long a closing peer's writer may take to flush before it is cut off.
 const WRITER_GRACE: Duration = Duration::from_secs(1);
 
-/// One peer's outbound side: a bounded queue to its socket writer, and the switch that disconnects
-/// it. Cheap to clone; the registry holds one per session member.
+/// One peer's outbound side: a queue to its socket writer, bounded in messages and in bytes. Cheap to
+/// clone; the registry holds one per session member.
 #[derive(Clone)]
 pub(crate) struct PeerTx {
     tx: mpsc::Sender<Message>,
-    kill: Arc<Notify>,
+    /// Bytes queued and not yet written, shared with the writer.
+    queued: Arc<AtomicUsize>,
+    max_bytes: usize,
+}
+
+/// A message's size against the byte budget.
+fn msg_len(msg: &Message) -> usize {
+    match msg {
+        Message::Text(t) => t.len(),
+        Message::Binary(b) | Message::Ping(b) | Message::Pong(b) => b.len(),
+        Message::Close(_) => 0,
+    }
 }
 
 impl PeerTx {
@@ -47,18 +59,28 @@ impl PeerTx {
         (
             Self {
                 tx,
-                kill: Arc::new(Notify::new()),
+                queued: Arc::default(),
+                max_bytes: usize::MAX,
             },
             rx,
         )
     }
 
-    /// Queue `msg` for the peer. A full queue means the peer is not reading: it is disconnected
-    /// rather than buffered without bound.
-    pub(crate) fn send(&self, msg: Message) {
-        if let Err(mpsc::error::TrySendError::Full(_)) = self.tx.try_send(msg) {
-            self.kill.notify_one();
+    /// Queue `msg` for the peer; whether it was queued. A full queue drops the message: the SENDER
+    /// is charged for it (the relay counts it against the sender's abuse budget), never the
+    /// receiver, whose queue a sender can fill at will. A receiver that does not read is found by
+    /// its writer stalling instead.
+    pub(crate) fn send(&self, msg: Message) -> bool {
+        let len = msg_len(&msg);
+        if self.queued.fetch_add(len, Ordering::Relaxed) + len > self.max_bytes {
+            self.queued.fetch_sub(len, Ordering::Relaxed);
+            return false;
         }
+        if self.tx.try_send(msg).is_err() {
+            self.queued.fetch_sub(len, Ordering::Relaxed);
+            return false;
+        }
+        true
     }
 }
 
@@ -69,7 +91,7 @@ pub(crate) fn broadcast(peers: &[PeerTx], event: &JsonPeerEvent) {
     }
     let text = event.to_string();
     for peer in peers {
-        peer.send(Message::Text(text.clone().into()));
+        let _ = peer.send(Message::Text(text.clone().into()));
     }
 }
 
@@ -188,15 +210,14 @@ impl Shared {
         if c.total >= self.limits.max_connections {
             return Err((StatusCode::SERVICE_UNAVAILABLE, "server full").into_response());
         }
-        let open = c.per_ip.entry(ip).or_insert(0);
-        if *open >= self.limits.max_connections_per_ip {
+        if c.per_ip.get(&ip).copied().unwrap_or(0) >= self.limits.max_connections_per_ip {
             return Err((
                 StatusCode::TOO_MANY_REQUESTS,
                 "too many open connections from this address",
             )
                 .into_response());
         }
-        *open += 1;
+        *c.per_ip.entry(ip).or_insert(0) += 1;
         c.total += 1;
         Ok(ConnSlot {
             counts: Arc::clone(&self.conns),
@@ -303,7 +324,7 @@ async fn turn(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    s.turn_credentials(peer, &headers, &query)
+    with_cors(s.turn_credentials(peer, &headers, &query))
 }
 
 /// `GET /`: no room. Counted against the attempt rate like any other connection.
@@ -337,13 +358,23 @@ async fn join(
         .on_upgrade(move |socket| run_peer(s, socket, room, admit))
 }
 
+/// The HTTP endpoints may be called from a page on another origin (the hosted demo): every answer,
+/// refusals included, carries the CORS header so the page can read it.
+fn with_cors(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        header::HeaderValue::from_static("*"),
+    );
+    response
+}
+
 async fn token(
     State(s): State<Arc<Shared>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    s.issue(peer, &headers, &query)
+    with_cors(s.issue(peer, &headers, &query))
 }
 
 /// One peer's connection: register it, announce it, relay its signals within its session, and
@@ -354,23 +385,36 @@ async fn run_peer(s: Arc<Shared>, socket: WebSocket, room: String, admit: Admit)
     let peer = PeerId(Uuid::new_v4());
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::channel::<Message>(limits.max_outbound_queue.max(1));
+    let queued = Arc::new(AtomicUsize::new(0));
     let kill = Arc::new(Notify::new());
     let writer_kill = Arc::clone(&kill);
+    let writer_queued = Arc::clone(&queued);
+    let stall = limits.writer_stall_timeout;
     let mut writer = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
-            if sink.send(msg).await.is_err() {
-                break;
+            let len = msg_len(&msg);
+            let sent = tokio::time::timeout(stall, sink.send(msg)).await;
+            writer_queued.fetch_sub(len, Ordering::Relaxed);
+            match sent {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => break,
+                Err(_) => {
+                    tracing::warn!("disconnecting signaling peer {peer:?}: it stopped reading");
+                    break;
+                }
             }
         }
-        let _ = sink.close().await;
-        // The socket is gone or full: end the peer's read loop too.
+        // The socket is gone or stalled: end the peer's read loop first (a close to a peer that does
+        // not read would block), then close, bounded.
         writer_kill.notify_one();
+        let _ = tokio::time::timeout(stall, sink.close()).await;
     });
     let me = PeerTx {
         tx,
-        kill: Arc::clone(&kill),
+        queued,
+        max_bytes: limits.max_outbound_bytes,
     };
-    me.send(Message::Text(
+    let _ = me.send(Message::Text(
         JsonPeerEvent::IdAssigned(peer).to_string().into(),
     ));
 
@@ -419,10 +463,7 @@ async fn relay(
     loop {
         let frame = tokio::select! {
             biased;
-            () = kill.notified() => {
-                tracing::warn!("disconnecting signaling peer {peer:?}: it is not reading");
-                return;
-            }
+            () = kill.notified() => return,
             frame = tokio::time::timeout(limits.idle_timeout, stream.next()) => frame,
         };
         let msg = match frame {
@@ -433,31 +474,47 @@ async fn relay(
             Ok(None | Some(Err(_))) => return,
             Ok(Some(Ok(msg))) => msg,
         };
+        let charge = |dropped: &mut u32| {
+            *dropped += 1;
+            *dropped >= limits.abuse_close_after
+        };
         if !bucket.try_take(limits.signals_burst, refill, Instant::now()) {
-            dropped += 1;
-            if dropped >= limits.abuse_close_after {
-                tracing::warn!("closing signaling peer {peer:?}: {dropped} frames over its rate");
+            if charge(&mut dropped) {
+                tracing::warn!("closing signaling peer {peer:?}: {dropped} frames over its limits");
                 return;
             }
             continue;
         }
-        dropped = dropped.saturating_sub(1);
+        // Whether this frame was dropped for a full receiver queue; only a frame that was not earns
+        // back one drop (a drop must never be cancelled by its own frame).
+        let mut overflowed = false;
         match msg {
             Message::Text(text) => match text.as_str().parse::<JsonPeerRequest>() {
                 Ok(JsonPeerRequest::Signal { receiver, data }) => {
-                    if receiver == peer {
-                        continue;
-                    }
-                    if let Some(target) = s.registry.target(peer, receiver) {
+                    if receiver != peer
+                        && let Some(target) = s.registry.target(peer, receiver)
+                    {
                         let event = JsonPeerEvent::Signal { sender: peer, data };
-                        target.send(Message::Text(event.to_string().into()));
+                        // A full receiver queue is the sender's cost, not the receiver's.
+                        overflowed = !target.send(Message::Text(event.to_string().into()));
                     }
-                    // An unknown or cross-session receiver silently drops: the isolation boundary.
+                    // A signal to oneself, or to an unknown or cross-session receiver, silently
+                    // drops: the isolation boundary.
                 }
                 Ok(JsonPeerRequest::KeepAlive) | Err(_) => {}
             },
             Message::Close(_) => return,
             Message::Binary(_) | Message::Ping(_) | Message::Pong(_) => {}
+        }
+        if overflowed {
+            if charge(&mut dropped) {
+                tracing::warn!(
+                    "closing signaling peer {peer:?}: it overflows another peer's queue"
+                );
+                return;
+            }
+        } else {
+            dropped = dropped.saturating_sub(1);
         }
     }
 }

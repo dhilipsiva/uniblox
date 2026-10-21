@@ -29,8 +29,10 @@ With `auth: Some(JoinTokenKey)` the gate admits only a valid `?token=` for the r
 `SignalingLimits`: a per-IP bucket for connection attempts and token requests (429; IPv4-mapped as IPv4, IPv6 per
 /64; `ClientIp::ForwardedFor(hops)` behind proxies; bounded table, fail closed), 16 open connections per IP and
 10,000 in total, a 32 KiB WebSocket message/frame cap enforced as fragments arrive, a 60 s idle timeout, a
-per-connection frame bucket (1,024 burst, 100/s; close after 256 net drops), a 256-message outbound queue and a 1 MiB
-write buffer per peer (a non-reader is disconnected), and 64 peers per session. The binary refuses
+per-connection frame bucket (1,024 burst, 100/s; close after 256 net drops), a per-peer outbound queue of 1,024
+messages / 1 MiB whose overflow is charged to the SENDER (never evict the receiver: a sender controls its queue),
+writer-stall detection (no write progress for 10 s disconnects a non-reader), a 1 MiB write buffer, and 64 peers
+per session. The binary refuses
 to start without `UNIBLOX_SIGNALING_SECRET` unless `UNIBLOX_SIGNALING_INSECURE=1`; `services mint-token <room>`.
 `build_signaling_server` (no config) stays open for tests and local development.
 

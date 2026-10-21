@@ -525,7 +525,10 @@ async fn a_flood_closes_the_flooder_not_its_victim() {
             break;
         }
     }
-    assert!(closed_by_server(&mut a, Duration::from_secs(5)).await, "the flooder is closed");
+    assert!(
+        closed_by_server(&mut a, Duration::from_secs(5)).await,
+        "the flooder is closed"
+    );
     // B is still a member and still served: it drains what it was sent, then sees a newcomer.
     let mut c = connect(addr, &path).await;
     let c_id = assigned_id(&mut c).await;

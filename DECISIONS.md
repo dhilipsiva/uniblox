@@ -1867,10 +1867,11 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   - a connection that sends no complete message for [60 s] is closed (matchbox clients send a keep-alive every
     10 s);
   - frames per connection, a token bucket [burst 1,024, 100/s], sized for a newcomer answering a full session;
-    a frame over it is dropped, and after [256] drops net of the frames accepted since, the connection is
-    closed;
-  - each peer's outbound queue [256 messages] and WebSocket write buffer [1 MiB]: a peer that does not read is
-    disconnected instead of buffered;
+    a frame over it is dropped. After [256] drops (net of the frames delivered since) the connection is closed;
+  - each peer's outbound queue [1,024 messages, 1 MiB] and WebSocket write buffer [1 MiB]. A message to a full
+    queue is dropped and charged to its SENDER's drop count, so a flooder is closed and its victim stays: a
+    receiver's queue is something any sender can fill. A peer that does not read is found by its writer
+    instead: no write progress for [10 s] disconnects it;
   - peers per session [64]: the gate refuses a full unbounded session with `503`, and `?next` above the cap
     with `400`; `join_local` enforces the cap again against a race. A signal to oneself is dropped.
 - **Also fixed:**
@@ -1894,10 +1895,19 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   - MEDIUM: every IPv4-mapped client shared one bucket;
   - LOW items, covered by the fixes above.
   All of it is addressed. Tokens and the gate held up: no forgery, no cross-room reuse, no bypass route.
+
+  A re-review of the fix (11225f3) found that the first queue bound disconnected the receiver when its queue
+  filled, which the sender controls. Any member could evict any other. Now the overflow is charged to the
+  sender, non-readers are found by writer stall, and the queue is bounded in bytes too. Operators behind NAT-heavy
+  networks can raise the per-IP caps (`UNIBLOX_MAX_CONNECTIONS_PER_IP`, `UNIBLOX_CONNECTS_BURST`).
 - **Known limits:**
   - the per-IP limits are per node, not shared through the Redis registry;
   - a client that rotates through many IPv6 /64s or IPv4 addresses gets a bucket and 16 connections for
-    each;
+    each, and clients behind one NAT share theirs;
+  - while a flooder fills a victim's queue (before it is closed), other senders' messages to that victim are
+    dropped too;
+  - a client may stay within twice the sustained frame rate indefinitely: the drop count is net of what it
+    delivers;
   - the browser client does not fetch tokens yet (its demo room URL is compiled in), so `just browser-e2e`
     runs the open development server. The client's join through the scoped service, with a token from the
     endpoint, is follow-up work.

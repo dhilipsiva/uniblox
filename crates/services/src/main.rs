@@ -22,6 +22,9 @@
 //! with a valid join token a credential valid for `UNIBLOX_TURN_TTL_SECS` (default 3600, at most a
 //! day). It needs the signaling secret.
 //!
+//! Clients behind one NAT share the per-IP limits; `UNIBLOX_MAX_CONNECTIONS_PER_IP` (default 16) and
+//! `UNIBLOX_CONNECTS_BURST` (default 30) raise them for large groups.
+//!
 //! Horizontal scale (ADR-0040): set `UNIBLOX_REDIS_URL` to back the session
 //! registry with a shared Redis so multiple stateless nodes share one listing
 //! (peers of a session must land on the same node — sticky routing). Unset ⇒ a
@@ -34,8 +37,8 @@ use std::time::Duration;
 
 use services::{
     ClientIp, JoinTokenKey, MAX_TOKEN_LIFETIME_SECS, MAX_TURN_TTL_SECS, RedisRegistryStore,
-    SessionRegistry, SignalingConfig, TurnConfig, build_signaling_server_with, unix_now,
-    validate_room,
+    SessionRegistry, SignalingConfig, SignalingLimits, TurnConfig, build_signaling_server_with,
+    unix_now, validate_room,
 };
 
 /// matchbox's conventional signaling port.
@@ -53,6 +56,19 @@ fn key_from_env() -> Option<JoinTokenKey> {
         Ok(key) => Some(key),
         Err(err) => {
             eprintln!("[signaling] UNIBLOX_SIGNALING_SECRET: {err}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// A positive whole number from the environment variable `name`, or exit with the reason. `None` when
+/// unset.
+fn env_number<T: std::str::FromStr + Default + PartialEq>(name: &str) -> Option<T> {
+    let value = std::env::var(name).ok()?;
+    match value.parse::<T>() {
+        Ok(n) if n != T::default() => Some(n),
+        _ => {
+            eprintln!("[signaling] {name} must be a positive whole number");
             std::process::exit(2);
         }
     }
@@ -182,13 +198,21 @@ async fn main() {
         );
         std::process::exit(2);
     }
+    // Clients behind one NAT share these per-IP limits: an operator expecting large groups raises them.
+    let mut limits = SignalingLimits::default();
+    if let Some(n) = env_number("UNIBLOX_MAX_CONNECTIONS_PER_IP") {
+        limits.max_connections_per_ip = n;
+    }
+    if let Some(n) = env_number("UNIBLOX_CONNECTS_BURST") {
+        limits.connects_burst = n;
+    }
     let config = SignalingConfig {
         auth,
         issue_tokens,
         token_lifetime: Duration::from_secs(600),
         turn,
+        limits,
         client_ip,
-        ..SignalingConfig::default()
     };
 
     let port = std::env::var("UNIBLOX_SIGNALING_PORT")
