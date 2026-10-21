@@ -12,9 +12,9 @@ mod ttl_scenario;
 use futures::StreamExt;
 use matchbox_protocol::JsonPeerEvent;
 use services::{MemoryRegistryStore, RegistryStore, SessionRegistry, build_signaling_server};
-use ttl_scenario::{TTL, a_crashed_nodes_members_expire_and_are_swept};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
+use ttl_scenario::{TTL, a_crashed_nodes_members_expire_and_are_swept};
 
 #[tokio::test]
 async fn memory_store_crash_cleanup() {

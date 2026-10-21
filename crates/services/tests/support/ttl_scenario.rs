@@ -22,13 +22,27 @@ pub async fn a_crashed_nodes_members_expire_and_are_swept(store: &dyn RegistrySt
         store.heartbeat("live").await.unwrap();
         tokio::time::sleep(TTL / 4).await;
     }
-    assert_eq!(store.peer_count("room").await.unwrap(), 1, "the dead node's peer is not counted");
+    assert_eq!(
+        store.peer_count("room").await.unwrap(),
+        1,
+        "the dead node's peer is not counted"
+    );
     assert_eq!(store.peer_count("other").await.unwrap(), 0);
     assert_eq!(store.session_count().await.unwrap(), 1);
-    let listed: Vec<String> = store.list().await.unwrap().into_iter().map(|s| s.room).collect();
+    let listed: Vec<String> = store
+        .list()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|s| s.room)
+        .collect();
     assert_eq!(listed, vec!["room".to_string()]);
 
-    assert_eq!(store.sweep().await.unwrap(), 2, "both of the dead node's sessions are removed");
+    assert_eq!(
+        store.sweep().await.unwrap(),
+        2,
+        "both of the dead node's sessions are removed"
+    );
     assert_eq!(store.sweep().await.unwrap(), 0, "nothing left to sweep");
     assert_eq!(store.peer_count("room").await.unwrap(), 1);
 

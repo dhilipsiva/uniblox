@@ -192,10 +192,13 @@ async fn redis_crash_cleanup() {
     // Nothing of the dead node is left in Redis.
     let client = redis::Client::open(url.as_str()).unwrap();
     let mut conn = client.get_multiplexed_async_connection().await.unwrap();
-    let keys: Vec<String> = redis::cmd("KEYS").arg("uniblox:*").query_async(&mut conn).await.unwrap();
+    let keys: Vec<String> = redis::cmd("KEYS")
+        .arg("uniblox:*")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
     assert!(
         keys.iter().all(|k| !k.contains("dead")),
         "the sweep removed the dead node's keys: {keys:?}"
     );
 }
-

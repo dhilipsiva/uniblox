@@ -51,6 +51,12 @@ SADD/SREM/SCARD, de-index on empty). The binary opts in via `UNIBLOX_REDIS_URL` 
 LISTING is shared — the relay is node-local, so a session's two peers must be on the same node (sticky routing;
 cross-node relay is out of scope).** Hermetic test spawns a real `redis-server` (flake `pkgs.redis`, coturn precedent).
 
+**Registry liveness (ADR-0048, proposed):** each node is alive while its liveness entry (Redis
+`uniblox:node:<node>`, a TTL set by every join and heartbeat) has not expired; the reads count only live nodes and
+`RegistryStore::sweep` deletes dead nodes' sessions. `SessionRegistry::spawn_heartbeat` (started by
+`build_signaling_server_with` under a runtime) beats + sweeps every TTL/3 (default 30 s). Redis join = one `MULTI`,
+leave = one Lua script, sweep = one `MULTI` per dead session.
+
 ## Crate-local invariants
 - **DONE (ADR-0037/0038/0039/0040):** `{mode, version}` scoping + the connection gate + the session registry; the
   **ASYMMETRIC version filter** (admit `engine >= min`, content + schema EXACT, reasoned `426`/`400`); **`?next=N`
@@ -58,7 +64,7 @@ cross-node relay is out of scope).** Hermetic test spawns a real `redis-server` 
   `RegistryStore` split + `RedisRegistryStore` (two stateless nodes share one Redis registry). The relay is
   re-implemented from FullMesh's contract — the ADR-0037/0038 tests double as its regression on the unbounded path.
 - **DEFERRED (later Phase-5 / Phase-11):** the Mode-2 coordinator peer service; cross-node relay (sticky routing
-  assumed); atomic `MULTI`/Lua store ops + TTL/heartbeat crash-cleanup + autoscale-under-load.
+  assumed); autoscale-under-load.
 - Scoping is structural ISOLATION; access control is the join token (ADR-0047), a bearer credential for one room
   until its expiry, not an identity.
 

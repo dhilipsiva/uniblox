@@ -81,7 +81,10 @@ mod store;
 pub use auth::{JoinTokenKey, MAX_TOKEN_LIFETIME_SECS, MIN_KEY_BYTES, TokenError, unix_now};
 pub use limits::{ClientIp, SignalingLimits};
 pub use redis_store::RedisRegistryStore;
-pub use store::{MemoryRegistryStore, RegistryError, RegistryResult, RegistryStore, SessionInfo};
+pub use store::{
+    DEFAULT_NODE_TTL, MemoryRegistryStore, RegistryError, RegistryResult, RegistryStore,
+    SessionInfo,
+};
 
 /// The scope delimiter between a room path's tilde-separated parts.
 const SCOPE_SEP: char = '~';
@@ -388,6 +391,32 @@ impl SessionRegistry {
     /// The relay limits; the defaults if the lock is poisoned.
     fn limits(&self) -> SignalingLimits {
         self.limits.lock().map(|g| *g).unwrap_or_default()
+    }
+
+    /// Keep this node alive in the shared store and sweep the sessions of dead nodes, every third of
+    /// the store's node TTL, until the task is aborted (ADR-0048). [`build_signaling_server_with`]
+    /// starts it; a host that drives a `SessionRegistry` without that builder starts it itself. Store
+    /// failures are logged and retried at the next beat; each call is bounded by the mirror timeout.
+    pub fn spawn_heartbeat(&self) -> tokio::task::JoinHandle<()> {
+        let store = Arc::clone(&self.store);
+        let node = Arc::clone(&self.node_id);
+        let every = (store.node_ttl() / 3).max(Duration::from_millis(10));
+        tokio::spawn(async move {
+            loop {
+                match timeout(STORE_MIRROR_TIMEOUT, store.heartbeat(&node)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => tracing::warn!("registry heartbeat failed: {err}"),
+                    Err(_) => tracing::warn!("registry heartbeat timed out"),
+                }
+                match timeout(STORE_MIRROR_TIMEOUT, store.sweep()).await {
+                    Ok(Ok(0)) => {}
+                    Ok(Ok(n)) => tracing::info!("swept {n} sessions of dead signaling nodes"),
+                    Ok(Err(err)) => tracing::warn!("registry sweep failed: {err}"),
+                    Err(_) => tracing::warn!("registry sweep timed out"),
+                }
+                tokio::time::sleep(every).await;
+            }
+        })
     }
 
     /// Gate: stash the requested `?next` size for a connecting address (the only
@@ -753,6 +782,11 @@ pub fn build_signaling_server_with(
     config: SignalingConfig,
 ) -> SignalingServer {
     registry.set_limits(config.limits);
+    // Keep this node alive in the shared registry (ADR-0048). Outside a runtime the server cannot
+    // serve either; the host then calls `spawn_heartbeat` itself once it has one.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        drop(registry.spawn_heartbeat());
+    }
     let limiter = Arc::new(IpLimiter::default());
     let issuer = match (&config.auth, config.issue_tokens) {
         (Some(key), true) => Some(Arc::new(Issuer {

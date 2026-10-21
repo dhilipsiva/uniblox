@@ -1874,3 +1874,29 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
 - **Status:** Proposed (2026-10-21) on branch `todo/P4-UNIBLOX-05`, part of a HIGH-risk item: accepted after the
   owner's review.
 
+## ADR-0048 — registry liveness: node heartbeats, crash cleanup, atomic updates
+- **Context:** ADR-0040 shares the session listing through Redis but left two gaps: a node that crashed kept
+  its members listed forever (nothing expired them), and each join or leave was several commands, so a
+  concurrent pair could leave the index and the member sets disagreeing.
+- **Decision — liveness:** every node is alive while its liveness entry has not expired. In Redis that is
+  `uniblox:node:<node>`, set with a TTL by every join and every heartbeat; in `MemoryRegistryStore` it is an
+  expiry per node. The reads (`list`, `peer_count`, `session_count`) count only the sessions of live nodes, and
+  `RegistryStore::sweep` deletes the sessions of dead ones. `SessionRegistry::spawn_heartbeat` refreshes the
+  node and sweeps every third of the TTL (default 30 s, `DEFAULT_NODE_TTL`; `with_node_ttl` on either store),
+  each call bounded by the mirror timeout, failures logged and retried. `build_signaling_server_with` starts it
+  whenever a tokio runtime is present, so a server cannot forget it; any node may sweep, and sweeping is
+  idempotent.
+- **Decision — atomic updates:** a join is one `MULTI` (add the member, index the session, refresh liveness), a
+  leave one Lua script (remove the member, de-index once the set is empty), and a sweep one `MULTI` per dead
+  session. `session_count` now counts what `list` returns, so the two no longer disagree after a race.
+- **Known limits:** a node that misses its heartbeats for longer than the TTL (a long pause or a partition, not
+  only a crash) is swept like a crashed one; its members reappear in the listing only when they join again. The
+  relay is node-local and never affected. Peer-level expiry is not needed: a peer that vanishes ends its socket,
+  and the node records the leave.
+- **Consequences:** `tests/registry_ttl.rs` (the crash scenario on the in-memory store; a running server keeps
+  its own node alive past the TTL) and `redis_crash_cleanup` in `tests/redis_registry.rs` (the same scenario on
+  a real Redis, and no key of the dead node left after the sweep; ignored, run by `just test-all` and CI). The
+  existing two-node and record/prune tests run unchanged.
+- **Status:** Proposed (2026-10-21) on branch `todo/P4-UNIBLOX-05`, part of a HIGH-risk item: accepted after the
+  owner's review.
+
