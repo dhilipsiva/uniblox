@@ -1157,7 +1157,7 @@ impl Replication {
             }
             NetEvent::OwnershipTransfer { id, new_owner, seq } => {
                 // ADR-0049: a rank is minted in its minter's name; a transfer names its sender.
-                if seq.seq >= RANK_CEILING {
+                if seq.seq == RANK_CEILING {
                     log::warn!(
                         "transfer for {id:?} from {from:?} at the reserved top rank — dropped"
                     );
@@ -1253,7 +1253,7 @@ impl Replication {
                 self.resync_requests.entry(from).or_default().extend(ids);
             }
             NetEvent::ResyncSpawn { id, pos, vel, seq } => {
-                if seq.seq >= RANK_CEILING {
+                if seq.seq == RANK_CEILING {
                     log::warn!(
                         "resync for {id:?} from {from:?} at the reserved top rank — dropped"
                     );
@@ -1376,7 +1376,7 @@ impl Replication {
                 // equal-seq tie resolves toward the higher coordinator (a
                 // post-migration coordinator's commit outranks the old one).
                 // ADR-0049: the coordinator sends the commits it mints.
-                if seq.seq >= RANK_CEILING {
+                if seq.seq == RANK_CEILING {
                     log::warn!(
                         "commit for {id:?} from {from:?} at the reserved top rank — dropped"
                     );
