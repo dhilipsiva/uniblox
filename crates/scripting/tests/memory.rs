@@ -57,7 +57,8 @@ fn kib() -> String {
 }
 
 /// The heaviest shapes found (2026-10-21): array trees grown in place by index assignment, each
-/// assignment cloning a checked value of up to 127 elements and a 1 KiB string.
+/// assignment cloning a checked value of up to 127 elements and a 1 KiB string. They run as
+/// top-level statements, which every call evaluates and which allow the deepest nesting (64).
 fn hostile_scripts() -> Vec<String> {
     let s = kib();
     let fill = "let v = []; while v.len() < 127 { v.push(0); }";
@@ -100,7 +101,7 @@ fn one_hostile_call_stays_under_the_documented_memory_bound() {
     };
     for src in hostile_scripts() {
         let mut engine =
-            ScriptEngine::from_source_with(&format!("fn update(h) {{ {src} h }}"), limits)
+            ScriptEngine::from_source_with(&format!("fn update(h) {{ h }}\n{src}"), limits)
                 .expect("it compiles");
         let before = CURRENT.load(Ordering::Relaxed);
         PEAK.store(before, Ordering::Relaxed);
