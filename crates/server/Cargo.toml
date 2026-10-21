@@ -20,6 +20,7 @@ bevy_time.workspace = true
 bevy_ecs.workspace = true
 futures.workspace = true
 log.workspace = true
+getrandom.workspace = true   # the per-process event-signing key (ADR-0049)
 
 [dev-dependencies]
 # scripted_modes.rs runs Mode 1 on the real standalone app (ADR-0045).

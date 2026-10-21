@@ -103,8 +103,10 @@ per-bucket sub-streams.
 - **Carry the Bevy entity generation (u32)** alongside the index — indices are
   recycled; reject state addressed to a stale generation.
 - **Custom protocol, not lightyear/replicon/renet.**
-- Reserve the signature field in the wire format, but do NOT functionally sign
-  in the slice — signing is Phase 6; the slice only measures sign/verify cost.
+- Every reliable event but `Ack` is signed and verified (ADR-0049): `Replication::new(world, key)`, keys pinned
+  per peer on first sight, signatures bound to sender and recipient, owner changes minted by their sender. This
+  authenticates; authorization of owner changes is the proposed part of ADR-0049 (an owner decision) — do not
+  invent an entitlement rule without it.
 
 ## Rules
 "Compiles but subtly wrong" is the dominant risk here — neither the compiler nor

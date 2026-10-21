@@ -13,6 +13,7 @@ protocol = { path = "../protocol", version = "0.1.0" }
 engine-core = { path = "../engine-core", version = "0.1.0" }
 bevy_ecs.workspace = true
 log.workspace = true
+ed25519-dalek.workspace = true   # signed reliable events (ADR-0049)
 
 [dev-dependencies]
 # e2e tests + the slice_metrics example only — transport stays OUT of the
@@ -20,5 +21,4 @@ log.workspace = true
 transport = { path = "../transport", version = "0.1.0" }
 matchbox_signaling.workspace = true
 tokio = { workspace = true, features = ["time"] }
-ed25519-dalek.workspace = true
 serde_json.workspace = true

@@ -1900,3 +1900,62 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
 - **Status:** Proposed (2026-10-21) on branch `todo/P4-UNIBLOX-05`, part of a HIGH-risk item: accepted after the
   owner's review.
 
+## ADR-0049 — signed reliable events: per-peer keys, recipient-bound signatures, minter binding; authorization proposed
+- **Context:** the wire format reserved `EventMsg::sig`, and nothing signed. Every reliable event, ownership
+  changes included, was trusted on arrival, and any peer could mint an `OwnerSeq` in another peer's name.
+  The repository's Phase-6 plan says to always sign the reliable channel.
+- **Decision — signed events (wire v8):** each peer has an ed25519 key (`Replication::new(world, key)`). Every
+  reliable event except `Ack` carries the signer's public key and a signature over a domain string, the sender,
+  the recipient and the event without its signature (`protocol::event_signing_bytes`). The receiver checks it
+  with `verify_strict` and drops an unsigned, malformed or badly signed event. It also drops an event signed for
+  another recipient, so a peer cannot replay what it was sent to a third peer. It pins each peer's key on that
+  peer's first validly signed event and drops a later one under another key. The pin is cleared when the peer
+  is untracked. `Ack` stays unsigned: it is ephemeral bookkeeping on an authenticated link, and the most frequent
+  event. `replication::seal_event` signs an event a host or test injects.
+- **Why the first key is trusted:** a DataChannel is DTLS-authenticated, with its fingerprint exchanged through
+  the signaling server (now authenticated, ADR-0047), and `from` derives from the id that server assigns. So the
+  first key seen on a link is the peer's own, as far as the signaling server can be trusted.
+- **Decision — minter binding:** an `OwnershipTransfer` or `OwnershipCommit` must name its sender as the
+  minter (`seq.coordinator == from`). A peer can then no longer mint a rank in another peer's name, for example
+  to win the equal-seq tie toward the higher coordinator. Honest flows already satisfy this: the giver sends its
+  transfer, and the coordinator sends its commits.
+- **Keys:** the server makes a fresh key per process from the OS random source (`server::fresh_signing_key`).
+  A persistent device key (non-extractable WebCrypto in IndexedDB, or the OS keyring) is still the open Phase-6
+  bullet, so a peer's signing identity lasts one session.
+- **What this does not do:** it authenticates events; it does not authorize them. A peer can still mint a higher
+  rank in its own name and take any entity. A `ResyncSpawn` still lets its sender re-anchor an entity it claims at
+  a rank no lower than the receiver's. Closing that needs an entitlement rule in the replication core, which is
+  the owner's call, below.
+- **Proposed — authorization (needs the owner's decision and test cases; the replication crate is HIGH-risk):**
+  - *A (recommended): coordinator-minted grants.* Every owner change is a grant `{id, new_owner, seq}` signed by
+    its minter. It is accepted only from the receiver's current coordinator, or from the proxy's current owner (a
+    push: Mode 1, or the coordinator's own handoff). A `ResyncSpawn` that changes the owner carries the grant
+    naming its sender. When the coordinator changes, the new coordinator re-mints the grants whose minter has
+    left, so a peer that joined later can still verify them.
+    - Costs: a grant is dropped while views of the coordinator disagree, until resync; re-anchoring costs one
+      commit per affected entity.
+    - The coordinator stays trusted: a malicious one can grant itself anything. A client can only become
+      coordinator by reconnecting until the server assigns it a low id, which ADR-0047's limits slow down.
+  - *B: one fixed session authority* (the session's first peer, or the Mode-3 server) is the only minter. This is
+    simple and strong for Mode 3, but loses the migration of minting rights in Mode 2.
+  - *C: keep authentication only*, inside the casual/co-op envelope.
+  - Test cases proposed for A:
+    - a non-coordinator's self-minted transfer is dropped;
+    - the coordinator's commit applies;
+    - a forged `ResyncSpawn` without a grant is dropped;
+    - a grant from a departed coordinator is accepted after re-anchoring;
+    - a late joiner verifies an adopted entity;
+    - R6 (a cross-sender reorder) still resolves by rank.
+- **Cost:** one signature per reliable event per recipient and one verification per received event: 9.3 µs and
+  18.9 µs natively with the opt-level=3 crypto override (README "Measurements"). Acks, the hot reliable path, are
+  unsigned.
+- **Consequences:**
+  - `tests/signing.rs` (8 tests) covers the signed transfer, the Done-when rejection of an unsigned
+    `OwnershipTransfer` (stripped or crafted), tampering, another recipient, a changed key, minter binding,
+    signatures on every non-Ack event, and the public key.
+  - The existing suites now sign their hand-crafted events with the sending peer's test key and send ownership
+    changes from their minter. T20 now gives each recipient its own copy of a transfer.
+  - Mutation-tested: ignoring the verification fails half of `signing.rs`.
+- **Status:** Proposed (2026-10-21) on branch `todo/P4-UNIBLOX-05`, part of a HIGH-risk item. The authorization
+  section waits on the owner's decision.
+

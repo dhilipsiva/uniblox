@@ -6879,6 +6879,7 @@ dependencies = [
  "bevy_time",
  "engine-core",
  "futures",
+ "getrandom 0.3.4",
  "log",
  "matchbox_signaling",
  "protocol",

@@ -25,6 +25,13 @@ use protocol::bundle::load_bundle_dir;
 use replication::Replication;
 use scripting::ScriptEngine;
 
+/// A deterministic per-peer event-signing key for tests (ADR-0049).
+fn test_key(peer: PeerId) -> replication::SigningKey {
+    let mut seed = [0x5A; 32];
+    seed[..8].copy_from_slice(&peer.0.to_le_bytes());
+    replication::SigningKey::from_bytes(&seed)
+}
+
 /// The standalone app's fixed rate is 64 Hz.
 const DT: f32 = 1.0 / 64.0;
 /// About 23 s of simulated time: every demo entity reaches a wall several times.
@@ -101,7 +108,7 @@ fn networked(ids: &[u64], owners: &[u64]) -> (Vec<Participant>, Vec<(usize, Enti
             insert_sim(&mut world, PeerId(id), DT);
             let mut schedule = Schedule::default();
             schedule.add_systems((advance_tick, run_entity_scripts, simulate).chain());
-            let repl = Replication::new(&mut world);
+            let repl = Replication::new(&mut world, test_key(PeerId(id)));
             Participant {
                 id: PeerId(id),
                 world,
@@ -267,7 +274,7 @@ fn peers(ids: &[u64], owners: &[u64], src: &str) -> (Vec<Participant>, Vec<(usiz
             insert_sim(&mut world, PeerId(id), DT);
             let mut schedule = Schedule::default();
             schedule.add_systems((advance_tick, run_entity_scripts, simulate).chain());
-            let repl = Replication::new(&mut world);
+            let repl = Replication::new(&mut world, test_key(PeerId(id)));
             Participant {
                 id: PeerId(id),
                 world,

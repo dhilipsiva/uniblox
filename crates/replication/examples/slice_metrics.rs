@@ -22,6 +22,13 @@ use protocol::PeerId;
 use replication::Replication;
 use transport::{PeerState, Transport};
 
+/// A deterministic per-peer event-signing key for tests (ADR-0049).
+fn test_key(peer: PeerId) -> replication::SigningKey {
+    let mut seed = [0x5A; 32];
+    seed[..8].copy_from_slice(&peer.0.to_le_bytes());
+    replication::SigningKey::from_bytes(&seed)
+}
+
 const NET_TICK: Duration = Duration::from_millis(50); // ~20 Hz, the assumed net tick
 const BANDWIDTH_WINDOW: Duration = Duration::from_secs(3);
 const PING_COUNT: usize = 50;
@@ -83,7 +90,7 @@ async fn measure_bandwidth(entities: usize) -> BandwidthMetrics {
     insert_sim(&mut world_a, a_id, 1.0 / 64.0);
     let mut sched_a = Schedule::default();
     sched_a.add_systems(simulate);
-    let mut repl_a = Replication::new(&mut world_a);
+    let mut repl_a = Replication::new(&mut world_a, test_key(a_id));
     // Per-peer collect (ADR-0021): track B (unbounded AOI ⇒ B sees all of A's
     // entities) so collect_all produces B's outbox to measure.
     let b_proto = PeerId::from_uuid_bytes(*peer_b.0.as_bytes());
@@ -105,7 +112,7 @@ async fn measure_bandwidth(entities: usize) -> BandwidthMetrics {
 
     let mut world_b = World::new();
     insert_sim(&mut world_b, b_id, 1.0 / 64.0);
-    let mut repl_b = Replication::new(&mut world_b);
+    let mut repl_b = Replication::new(&mut world_b, test_key(b_id));
 
     let mut state_bytes = 0usize;
     let mut events_bytes = 0usize;

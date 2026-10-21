@@ -15,6 +15,13 @@ use replication::Replication;
 use server::{NET_INTERVAL, TickCount, build_server_app, build_server_app_focused};
 use transport::{PeerState, Transport};
 
+/// A deterministic per-peer event-signing key for tests (ADR-0049).
+fn test_key(peer: PeerId) -> replication::SigningKey {
+    let mut seed = [0x5A; 32];
+    seed[..8].copy_from_slice(&peer.0.to_le_bytes());
+    replication::SigningKey::from_bytes(&seed)
+}
+
 const DEADLINE: Duration = Duration::from_secs(120); // generous: bounds hangs, not CPU contention (full parallel suite runs several e2e binaries)
 const POLL: Duration = Duration::from_millis(5);
 
@@ -53,7 +60,7 @@ impl Client {
         let id = PeerId::from_uuid_bytes(*uuid.0.as_bytes());
         let mut world = World::new();
         engine_core::insert_sim(&mut world, id, 1.0 / 64.0);
-        let repl = Replication::new(&mut world);
+        let repl = Replication::new(&mut world, test_key(id));
         Client {
             local: id,
             world,

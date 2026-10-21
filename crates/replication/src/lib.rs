@@ -68,16 +68,73 @@ use std::collections::{HashMap, HashSet};
 
 use bevy_ecs::prelude::*;
 use bevy_ecs::system::SystemState;
+use ed25519_dalek::{Signature, Signer as _, VerifyingKey};
 use engine_core::{
     Authority, Controlled, ControlledBy, Input, InputHistory, Intent, InterpBuffer, LocalPeer,
     Owner, PendingInputs, Position, ProcessedInput, Snapshot, Tick, Velocity, authority_of,
     push_pending_input, push_snapshot, spawn_owned,
 };
 use protocol::{
-    DigestEntry, EventMsg, NetEntityId, NetEvent, OwnerSeq, PeerId, QVec2, StateEntry, StateMsg,
-    WIRE_VERSION, decode_event, decode_state, dequantize, encode_event, encode_state,
-    quantize_vec2,
+    DigestEntry, EventMsg, NetEntityId, NetEvent, OwnerSeq, PeerId, QVec2, SIG_KEY_BYTES,
+    StateEntry, StateMsg, WIRE_VERSION, WireError, decode_event, decode_state, dequantize,
+    encode_event, encode_state, event_signing_bytes, quantize_vec2,
 };
+
+/// A peer's ed25519 signing key (ADR-0049), re-exported so a host need not depend on the crate.
+pub use ed25519_dalek::SigningKey;
+
+/// The length of a reliable event's signature field: the signer's public key, then the signature.
+pub const SIGNATURE_BYTES: usize = SIG_KEY_BYTES + 64;
+
+/// This peer's event signer (ADR-0049): its key and its own id, the sender every signature names.
+struct EventSigner {
+    key: SigningKey,
+    local: PeerId,
+}
+
+impl EventSigner {
+    fn seal(&self, to: PeerId, msg: &EventMsg) -> Result<Box<[u8]>, WireError> {
+        seal_msg(&self.key, self.local, to, msg)
+    }
+}
+
+/// Encode `msg` from `sender` to `recipient`, signed with `key` (every event but `Ack`).
+fn seal_msg(
+    key: &SigningKey,
+    sender: PeerId,
+    recipient: PeerId,
+    msg: &EventMsg,
+) -> Result<Box<[u8]>, WireError> {
+    let mut msg = msg.clone();
+    msg.sig = None;
+    if !matches!(msg.event, NetEvent::Ack { .. }) {
+        let signature = key.sign(&event_signing_bytes(sender, recipient, &msg)?);
+        let mut sig = key.verifying_key().to_bytes().to_vec();
+        sig.extend_from_slice(&signature.to_bytes());
+        msg.sig = Some(sig);
+    }
+    Ok(encode_event(&msg)?.into_boxed_slice())
+}
+
+/// Encode one reliable event from `sender` to `recipient`, signed with `key` (ADR-0049). The
+/// replicator signs everything it sends itself; this is for a host or a test that injects an event.
+pub fn seal_event(
+    key: &SigningKey,
+    sender: PeerId,
+    recipient: PeerId,
+    event: NetEvent,
+) -> Result<Box<[u8]>, WireError> {
+    seal_msg(
+        key,
+        sender,
+        recipient,
+        &EventMsg {
+            version: WIRE_VERSION,
+            sig: None,
+            event,
+        },
+    )
+}
 
 mod interest;
 use interest::{Aoi, DEFAULT_CELL, SpatialGrid};
@@ -347,10 +404,24 @@ pub struct Replication {
     pending_transfer_requests: HashMap<NetEntityId, PeerId>,
     /// The tracked peer set (added on connect, dropped on departure).
     peers: HashSet<PeerId>,
+    /// Signs every reliable event this peer sends (ADR-0049).
+    signer: EventSigner,
+    /// Each peer's public key, pinned from its first validly signed event (ADR-0049); a later
+    /// event under another key is dropped. Cleared when the peer is untracked.
+    peer_keys: HashMap<PeerId, VerifyingKey>,
 }
 
 impl Replication {
-    pub fn new(world: &mut World) -> Self {
+    /// A replicator for the peer in `world`'s [`LocalPeer`] (insert it first: every signature names
+    /// it as the sender), signing its reliable events with `key` (ADR-0049).
+    pub fn new(world: &mut World, key: SigningKey) -> Self {
+        let local = match world.get_resource::<LocalPeer>() {
+            Some(local) => local.0,
+            None => {
+                log::error!("Replication::new before LocalPeer: signatures will name PeerId(0)");
+                PeerId(0)
+            }
+        };
         Replication {
             change_query: SystemState::new(world),
             map: NetIdMap::default(),
@@ -369,7 +440,59 @@ impl Replication {
             pending_claims: HashMap::new(),
             pending_transfer_requests: HashMap::new(),
             peers: HashSet::new(),
+            signer: EventSigner { key, local },
+            peer_keys: HashMap::new(),
         }
+    }
+
+    /// This peer's public key (ADR-0049), the one its signed events carry.
+    pub fn public_key(&self) -> [u8; 32] {
+        self.signer.key.verifying_key().to_bytes()
+    }
+
+    /// Whether `msg` from `from` carries a valid signature addressed to us (ADR-0049), pinning
+    /// `from`'s key on first sight. `Ack` needs none. Logs and returns false otherwise.
+    fn verify(&mut self, from: PeerId, msg: &EventMsg) -> bool {
+        if matches!(msg.event, NetEvent::Ack { .. }) {
+            return true;
+        }
+        let Some(sig) = msg.sig.as_deref() else {
+            log::warn!("unsigned event from {from:?} — dropped");
+            return false;
+        };
+        let Some((key, signature)) = (sig.len() == SIGNATURE_BYTES)
+            .then(|| sig.split_at(SIG_KEY_BYTES))
+            .and_then(|(k, s)| {
+                Some((<[u8; 32]>::try_from(k).ok()?, <[u8; 64]>::try_from(s).ok()?))
+            })
+        else {
+            log::warn!("malformed signature on event from {from:?} — dropped");
+            return false;
+        };
+        let Ok(key) = VerifyingKey::from_bytes(&key) else {
+            log::warn!("invalid signing key on event from {from:?} — dropped");
+            return false;
+        };
+        if self
+            .peer_keys
+            .get(&from)
+            .is_some_and(|pinned| *pinned != key)
+        {
+            log::warn!("event from {from:?} under a different key than it used before — dropped");
+            return false;
+        }
+        let Ok(bytes) = event_signing_bytes(from, self.signer.local, msg) else {
+            return false;
+        };
+        if key
+            .verify_strict(&bytes, &Signature::from_bytes(&signature))
+            .is_err()
+        {
+            log::warn!("bad signature on event from {from:?} — dropped");
+            return false;
+        }
+        self.peer_keys.entry(from).or_insert(key);
+        true
     }
 
     /// One network tick of the SENDER, PER PEER (ADR-0021 interest management).
@@ -770,8 +893,8 @@ impl Replication {
 
             let events: Vec<Box<[u8]>> = events
                 .iter()
-                .filter_map(|msg| match encode_event(msg) {
-                    Ok(bytes) => Some(bytes.into_boxed_slice()),
+                .filter_map(|msg| match self.signer.seal(p, msg) {
+                    Ok(bytes) => Some(bytes),
                     Err(err) => {
                         log::error!("event encode failed (dropping event): {err}");
                         None
@@ -943,9 +1066,9 @@ impl Replication {
                 return;
             }
         };
-        if msg.sig.is_some() {
-            // Reserved for Phase 6; nothing signs in the slice.
-            log::warn!("ignoring unexpected signature on event from {from:?}");
+        // ADR-0049: every reliable event but `Ack` is signed by its sender, for us.
+        if !self.verify(from, &msg) {
+            return;
         }
 
         // NOTE (ADR-0028 b): membership is reconciled by the pump's `poll_peers`
@@ -1009,6 +1132,14 @@ impl Replication {
                 self.map.remove_by_id(&id);
             }
             NetEvent::OwnershipTransfer { id, new_owner, seq } => {
+                // ADR-0049: a rank is minted in its minter's name; a transfer names its sender.
+                if seq.coordinator != from {
+                    log::warn!(
+                        "transfer for {id:?} from {from:?} minted as {:?} — dropped",
+                        seq.coordinator
+                    );
+                    return;
+                }
                 let Some(&proxy) = self.map.by_id.get(&id) else {
                     log::warn!("transfer for unknown {id:?} from {from:?} — dropped");
                     return;
@@ -1207,6 +1338,14 @@ impl Replication {
                 // demote. A stale/duplicate commit (rank ≤ ours) is dropped; an
                 // equal-seq tie resolves toward the higher coordinator (a
                 // post-migration coordinator's commit outranks the old one).
+                // ADR-0049: the coordinator sends the commits it mints.
+                if seq.coordinator != from {
+                    log::warn!(
+                        "commit for {id:?} from {from:?} minted as {:?} — dropped",
+                        seq.coordinator
+                    );
+                    return;
+                }
                 let Some(&proxy) = self.map.by_id.get(&id) else {
                     log::warn!("commit for unknown {id:?} from {from:?} — dropped");
                     return;
@@ -1313,9 +1452,9 @@ impl Replication {
                     seq: input.seq,
                     intent: quantize_vec2(input.intent.vx, input.intent.vy),
                 });
-                match encode_event(&msg) {
+                match self.signer.seal(authority, &msg) {
                     Ok(bytes) => {
-                        out.push((authority, bytes.into_boxed_slice()));
+                        out.push((authority, bytes));
                         max_sent = max_sent.max(input.seq);
                     }
                     Err(err) => log::error!("input encode failed: {err}"),
@@ -1404,8 +1543,8 @@ impl Replication {
                 continue;
             }
             entries.sort_by_key(|d| d.id);
-            match encode_event(&event(NetEvent::Digest { entries })) {
-                Ok(bytes) => out.push((p, bytes.into_boxed_slice())),
+            match self.signer.seal(p, &event(NetEvent::Digest { entries })) {
+                Ok(bytes) => out.push((p, bytes)),
                 Err(err) => log::error!("digest encode to {p:?} failed: {err}"),
             }
         }
@@ -1428,8 +1567,11 @@ impl Replication {
             }
             let mut ids: Vec<NetEntityId> = ids.into_iter().collect();
             ids.sort();
-            match encode_event(&event(NetEvent::ResyncRequest { ids })) {
-                Ok(bytes) => out.push((peer, bytes.into_boxed_slice())),
+            match self
+                .signer
+                .seal(peer, &event(NetEvent::ResyncRequest { ids }))
+            {
+                Ok(bytes) => out.push((peer, bytes)),
                 Err(err) => log::error!("resync request encode to {peer:?} failed: {err}"),
             }
         }
@@ -1492,13 +1634,16 @@ impl Replication {
                         seq: 0,
                         coordinator: id.spawner,
                     });
-                match encode_event(&event(NetEvent::ResyncSpawn {
-                    id,
-                    pos: qpos(&pos),
-                    vel: qvel(&vel),
-                    seq,
-                })) {
-                    Ok(bytes) => out.push((peer, bytes.into_boxed_slice())),
+                match self.signer.seal(
+                    peer,
+                    &event(NetEvent::ResyncSpawn {
+                        id,
+                        pos: qpos(&pos),
+                        vel: qvel(&vel),
+                        seq,
+                    }),
+                ) {
+                    Ok(bytes) => out.push((peer, bytes)),
                     Err(err) => log::error!("resync spawn encode to {peer:?} failed: {err}"),
                 }
             }
@@ -1576,6 +1721,7 @@ impl Replication {
     /// prevent an unbounded leak of `known`/`send_state`.
     pub fn untrack_peer(&mut self, peer: PeerId) {
         self.peers.remove(&peer);
+        self.peer_keys.remove(&peer);
         self.acked_seq.remove(&peer);
         self.ack_sent.remove(&peer);
         self.applied_seq.remove(&peer);
@@ -1761,8 +1907,11 @@ impl Replication {
             self.pending_claims.entry(id).or_default().insert(local);
             return None;
         }
-        match encode_event(&event(NetEvent::ClaimOwnership { id })) {
-            Ok(bytes) => Some((coordinator, bytes.into_boxed_slice())),
+        match self
+            .signer
+            .seal(coordinator, &event(NetEvent::ClaimOwnership { id }))
+        {
+            Ok(bytes) => Some((coordinator, bytes)),
             Err(err) => {
                 log::error!("claim encode for {id:?} failed: {err}");
                 None
@@ -1797,8 +1946,11 @@ impl Replication {
             self.pending_transfer_requests.insert(id, to);
             return None;
         }
-        match encode_event(&event(NetEvent::TransferRequest { id, to })) {
-            Ok(bytes) => Some((coordinator, bytes.into_boxed_slice())),
+        match self
+            .signer
+            .seal(coordinator, &event(NetEvent::TransferRequest { id, to }))
+        {
+            Ok(bytes) => Some((coordinator, bytes)),
             Err(err) => {
                 log::error!("transfer-request encode for {id:?} failed: {err}");
                 None
@@ -1873,7 +2025,7 @@ impl Replication {
                 None
             };
             let Some((entity, current_owner, current_seq)) = arbitrable else {
-                push_rejects(&mut out, id, &candidates);
+                push_rejects(&self.signer, &mut out, id, &candidates);
                 continue;
             };
             let Some(winner) = elect_owner(candidates.iter().copied()) else {
@@ -1900,12 +2052,15 @@ impl Replication {
             let mut recipients: Vec<PeerId> = recipients.into_iter().collect();
             recipients.sort();
             for peer in recipients {
-                match encode_event(&event(NetEvent::OwnershipCommit {
-                    id,
-                    new_owner: winner,
-                    seq: new_seq,
-                })) {
-                    Ok(bytes) => out.push((peer, bytes.into_boxed_slice())),
+                match self.signer.seal(
+                    peer,
+                    &event(NetEvent::OwnershipCommit {
+                        id,
+                        new_owner: winner,
+                        seq: new_seq,
+                    }),
+                ) {
+                    Ok(bytes) => out.push((peer, bytes)),
                     Err(err) => log::error!("commit encode to {peer:?} failed: {err}"),
                 }
             }
@@ -1916,7 +2071,7 @@ impl Replication {
                 .copied()
                 .filter(|&c| c != winner)
                 .collect();
-            push_rejects(&mut out, id, &losers);
+            push_rejects(&self.signer, &mut out, id, &losers);
         }
         out
     }
@@ -1943,10 +2098,11 @@ impl Replication {
     }
 }
 
+/// An unsigned event; [`EventSigner::seal`] signs it per recipient (ADR-0049).
 fn event(event: NetEvent) -> EventMsg {
     EventMsg {
         version: WIRE_VERSION,
-        sig: None, // reserved; nothing signs in the slice (Phase 6)
+        sig: None,
         event,
     }
 }
@@ -1954,10 +2110,15 @@ fn event(event: NetEvent) -> EventMsg {
 /// Push a directed `ClaimRejected{id}` for every peer in `peers` (ADR-0025
 /// A-handshake): the coordinator's definitive "your claim did not win / could not
 /// be arbitrated" reply, so a claimant re-routes/retries rather than hanging.
-fn push_rejects(out: &mut Vec<(PeerId, Box<[u8]>)>, id: NetEntityId, peers: &[PeerId]) {
+fn push_rejects(
+    signer: &EventSigner,
+    out: &mut Vec<(PeerId, Box<[u8]>)>,
+    id: NetEntityId,
+    peers: &[PeerId],
+) {
     for &peer in peers {
-        match encode_event(&event(NetEvent::ClaimRejected { id })) {
-            Ok(bytes) => out.push((peer, bytes.into_boxed_slice())),
+        match signer.seal(peer, &event(NetEvent::ClaimRejected { id })) {
+            Ok(bytes) => out.push((peer, bytes)),
             Err(err) => log::error!("reject encode to {peer:?} failed: {err}"),
         }
     }

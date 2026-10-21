@@ -30,6 +30,13 @@ use engine_core::{Owner, Position, Velocity, insert_sim, simulate, spawn_owned};
 use protocol::PeerId;
 use replication::{Outbox, Replication};
 
+/// A deterministic per-peer event-signing key for tests (ADR-0049).
+fn test_key(peer: PeerId) -> replication::SigningKey {
+    let mut seed = [0x5A; 32];
+    seed[..8].copy_from_slice(&peer.0.to_le_bytes());
+    replication::SigningKey::from_bytes(&seed)
+}
+
 const DT: f32 = 0.5;
 const TOL: f32 = 0.5 / 1024.0;
 const ROUNDS: usize = 6;
@@ -66,7 +73,7 @@ fn run_session(ids: &[u64], spawns: &[Vec<Spawn>]) -> Session {
             insert_sim(&mut world, PeerId(id), DT);
             let mut schedule = Schedule::default();
             schedule.add_systems(simulate);
-            let repl = Replication::new(&mut world);
+            let repl = Replication::new(&mut world, test_key(PeerId(id)));
             Participant {
                 id: PeerId(id),
                 world,

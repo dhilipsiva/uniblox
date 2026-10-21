@@ -289,6 +289,17 @@ pub fn net_pump(world: &mut World) {
     world.insert_non_send(net);
 }
 
+/// A fresh event-signing key for this process (ADR-0049), from the OS random source. A failing OS
+/// random source is fatal: the server cannot sign without it.
+pub fn fresh_signing_key() -> replication::SigningKey {
+    let mut seed = [0u8; 32];
+    if let Err(err) = getrandom::fill(&mut seed) {
+        log::error!("[server] the OS random source failed ({err}); cannot create a signing key");
+        std::process::exit(1);
+    }
+    replication::SigningKey::from_bytes(&seed)
+}
+
 /// Assemble the headless authoritative server App around an already-connected
 /// transport (its signaling id already known → `local`). Spawns `entity_count`
 /// server-owned demo entities — the ONLY mode-defining input: the server owns
@@ -328,7 +339,7 @@ fn build_server_app_inner(
 
     let world = app.world_mut();
     insert_sim(world, local, (1.0 / TICK_HZ) as f32);
-    let repl = Replication::new(world);
+    let repl = Replication::new(world, fresh_signing_key());
     // Every demo entity advances in +x — the M3/M4 test predicates observe
     // proxies in replay order (arbitrary), so ALL entities must move on x.
     // Keep nonzero vel.x if you change these (auditor finding F2).

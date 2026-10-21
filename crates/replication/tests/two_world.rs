@@ -21,6 +21,18 @@ use protocol::{
 };
 use replication::{Outbox, Replication};
 
+/// Encode `event` as `from` sends it to `to`, signed with `from`'s test key (ADR-0049).
+fn signed(from: PeerId, to: PeerId, event: NetEvent) -> Box<[u8]> {
+    replication::seal_event(&test_key(from), from, to, event).expect("encode")
+}
+
+/// A deterministic per-peer event-signing key for tests (ADR-0049).
+fn test_key(peer: PeerId) -> replication::SigningKey {
+    let mut seed = [0x5A; 32];
+    seed[..8].copy_from_slice(&peer.0.to_le_bytes());
+    replication::SigningKey::from_bytes(&seed)
+}
+
 const DT: f32 = 0.5;
 /// Quantization tolerance: 1/2048.
 const TOL: f32 = 0.5 / 1024.0;
@@ -49,7 +61,7 @@ impl TestPeer {
         // wins over a stale InterpBuffer and Local authority wins last.
         let mut render = Schedule::default();
         render.add_systems((reset_render_role, interpolate, predict, copy_owned_render).chain());
-        let repl = Replication::new(&mut world);
+        let repl = Replication::new(&mut world, test_key(PeerId(id)));
         TestPeer {
             id: PeerId(id),
             world,
@@ -526,17 +538,16 @@ fn stale_generation_never_misapplied() {
         index: old_id.index,
         generation: old_id.generation + 1,
     };
-    let spawn_new = protocol::encode_event(&protocol::EventMsg {
-        version: protocol::WIRE_VERSION,
-        sig: None,
-        event: NetEvent::Spawn {
+    let spawn_new = signed(
+        a.id,
+        b.id,
+        NetEvent::Spawn {
             id: new_id,
             pos: protocol::quantize_vec2(5.0, 5.0),
             vel: protocol::quantize_vec2(0.0, 0.0),
         },
-    })
-    .unwrap();
-    b.deliver_events(a.id, &[spawn_new.into_boxed_slice()]);
+    );
+    b.deliver_events(a.id, &[spawn_new]);
     assert_eq!(b.entity_count(), 1, "new-generation proxy must exist");
 
     let mut stale_msg = decode_state(&stale).unwrap();
@@ -778,8 +789,10 @@ fn early_new_owner_state_dropped_until_transfer() {
     a.repl
         .transfer_ownership(&mut a.world, e_a, b.id)
         .expect("A owns e_a");
-    let out_transfer = a.collect_for(b.id);
-    b.deliver_all(a.id, &out_transfer);
+    // A tells both peers in one collect; each gets its own copy, signed for it (ADR-0049).
+    let outs = a.collect_all();
+    b.deliver_all(a.id, outbox_for(&outs, b.id).unwrap());
+    let transfer_for_c = outbox_for(&outs, c.id).unwrap().events.clone();
     let proxy_on_b = b.entity_owned_by(b.id);
 
     b.world.get_mut::<Position>(proxy_on_b).unwrap().x = 7.0;
@@ -792,7 +805,7 @@ fn early_new_owner_state_dropped_until_transfer() {
         "early new-owner state must drop"
     );
 
-    c.deliver_events(a.id, &out_transfer.events);
+    c.deliver_events(a.id, &transfer_for_c);
     b.world.get_mut::<Position>(proxy_on_b).unwrap().x = 8.0;
     let next = b.collect_for(c.id).state.unwrap();
     c.deliver_state(b.id, &next);
@@ -3162,12 +3175,7 @@ fn resync_responder_only_answers_owned() {
     );
 
     let id = net_id(a.id, e);
-    let req = EventMsg {
-        version: WIRE_VERSION,
-        sig: None,
-        event: NetEvent::ResyncRequest { ids: vec![id] },
-    };
-    let bytes = encode_event(&req).expect("encode");
+    let bytes = signed(PeerId(9), b.id, NetEvent::ResyncRequest { ids: vec![id] });
     b.repl.apply_events(&mut b.world, PeerId(9), &bytes);
 
     assert!(
@@ -3187,10 +3195,10 @@ fn resync_own_authority_guard_drops_foreign_assert() {
     let _ = a.collect_all(); // mint e's id into the map so the guard can resolve it
     let id = net_id(a.id, e);
 
-    let ev = EventMsg {
-        version: WIRE_VERSION,
-        sig: None,
-        event: NetEvent::ResyncSpawn {
+    let bytes = signed(
+        PeerId(2),
+        a.id,
+        NetEvent::ResyncSpawn {
             id,
             pos: quantize_vec2(99.0, 99.0),
             vel: quantize_vec2(0.0, 0.0),
@@ -3200,8 +3208,7 @@ fn resync_own_authority_guard_drops_foreign_assert() {
                 coordinator: PeerId(2),
             },
         },
-    };
-    let bytes = encode_event(&ev).expect("encode");
+    );
     a.repl.apply_events(&mut a.world, PeerId(2), &bytes);
 
     assert_eq!(
@@ -3591,10 +3598,10 @@ fn transfer_seq_increments_along_chain() {
     );
 }
 
-/// AK-K2 — highest rank wins irrespective of ARRIVAL ORDER and irrespective of the
-/// sending peer: a higher-rank transfer delivered FIRST applies, and a later
-/// lower-rank transfer is dropped. `from` is not consulted — the rank is the
-/// arbiter (the old `owner!=from` gate is gone).
+/// AK-K2 — highest rank wins irrespective of ARRIVAL ORDER: a higher-rank transfer
+/// delivered FIRST applies, and a later lower-rank transfer is dropped. The rank is
+/// the arbiter (the old `owner!=from` gate is gone); each transfer comes from its
+/// minter, since ADR-0049 drops one whose rank names another peer.
 #[test]
 fn highest_seq_wins_on_reordered_transfer() {
     let mut a = TestPeer::new(1); // spawner
@@ -3612,12 +3619,11 @@ fn highest_seq_wins_on_reordered_transfer() {
     );
 
     let mk = |new_owner: PeerId, seq: OwnerSeq| {
-        encode_event(&EventMsg {
-            version: WIRE_VERSION,
-            sig: None,
-            event: NetEvent::OwnershipTransfer { id, new_owner, seq },
-        })
-        .expect("encode")
+        signed(
+            seq.coordinator,
+            d.id,
+            NetEvent::OwnershipTransfer { id, new_owner, seq },
+        )
     };
     let hi = mk(
         PeerId(3),
@@ -3634,8 +3640,8 @@ fn highest_seq_wins_on_reordered_transfer() {
         },
     );
 
-    // Higher rank FIRST (delivered from an arbitrary peer — `from` is irrelevant).
-    d.repl.apply_events(&mut d.world, PeerId(7), &hi);
+    // Higher rank FIRST, from its minter (ADR-0049 binds the minter to the sender).
+    d.repl.apply_events(&mut d.world, PeerId(2), &hi);
     assert_eq!(d.owner(proxy), PeerId(3), "higher-rank transfer applies");
     assert_eq!(
         d.repl.owner_seq(proxy),
@@ -3646,7 +3652,7 @@ fn highest_seq_wins_on_reordered_transfer() {
     );
 
     // Lower rank SECOND — dropped despite arriving later.
-    d.repl.apply_events(&mut d.world, PeerId(8), &lo);
+    d.repl.apply_events(&mut d.world, PeerId(1), &lo);
     assert_eq!(
         d.owner(proxy),
         PeerId(3),
@@ -3675,10 +3681,10 @@ fn equal_rank_transfer_dropped_strict_gate() {
     let id = net_id(a.id, e);
 
     let mk = |new_owner: PeerId| {
-        encode_event(&EventMsg {
-            version: WIRE_VERSION,
-            sig: None,
-            event: NetEvent::OwnershipTransfer {
+        signed(
+            a.id,
+            d.id,
+            NetEvent::OwnershipTransfer {
                 id,
                 new_owner,
                 seq: OwnerSeq {
@@ -3686,8 +3692,7 @@ fn equal_rank_transfer_dropped_strict_gate() {
                     coordinator: a.id,
                 },
             },
-        })
-        .expect("encode")
+        )
     };
 
     // Advance D to rank {1, A}, owner PeerId(2).
@@ -3718,10 +3723,10 @@ fn resync_backdoor_stale_former_owner_dropped() {
     let id = net_id(src.id, e);
 
     // Commit D's proxy to PeerId(3) at rank {5, coordinator 2}.
-    let commit = encode_event(&EventMsg {
-        version: WIRE_VERSION,
-        sig: None,
-        event: NetEvent::OwnershipTransfer {
+    let commit = signed(
+        PeerId(2),
+        d.id,
+        NetEvent::OwnershipTransfer {
             id,
             new_owner: PeerId(3),
             seq: OwnerSeq {
@@ -3729,8 +3734,7 @@ fn resync_backdoor_stale_former_owner_dropped() {
                 coordinator: PeerId(2),
             },
         },
-    })
-    .expect("encode");
+    );
     d.repl.apply_events(&mut d.world, PeerId(2), &commit);
     assert_eq!(
         d.owner(proxy),
@@ -3740,10 +3744,10 @@ fn resync_backdoor_stale_former_owner_dropped() {
 
     // The FORMER owner (PeerId(1)) sends a stale ResyncSpawn at a LOWER rank {3,1}
     // asserting itself — must be dropped by the `seq >= rec.owner_seq` gate.
-    let stale = encode_event(&EventMsg {
-        version: WIRE_VERSION,
-        sig: None,
-        event: NetEvent::ResyncSpawn {
+    let stale = signed(
+        PeerId(1),
+        d.id,
+        NetEvent::ResyncSpawn {
             id,
             pos: quantize_vec2(99.0, 99.0),
             vel: quantize_vec2(0.0, 0.0),
@@ -3752,8 +3756,7 @@ fn resync_backdoor_stale_former_owner_dropped() {
                 coordinator: PeerId(1),
             },
         },
-    })
-    .expect("encode");
+    );
     d.repl.apply_events(&mut d.world, PeerId(1), &stale);
 
     assert_eq!(
@@ -3782,10 +3785,10 @@ fn resync_value_heal_ignores_lower_rank() {
 
     // Move D's proxy to owner X=PeerId(9) at rank {3, 2}.
     let x = PeerId(9);
-    let t = encode_event(&EventMsg {
-        version: WIRE_VERSION,
-        sig: None,
-        event: NetEvent::OwnershipTransfer {
+    let t = signed(
+        PeerId(2),
+        d.id,
+        NetEvent::OwnershipTransfer {
             id,
             new_owner: x,
             seq: OwnerSeq {
@@ -3793,8 +3796,7 @@ fn resync_value_heal_ignores_lower_rank() {
                 coordinator: PeerId(2),
             },
         },
-    })
-    .expect("encode");
+    );
     d.repl.apply_events(&mut d.world, PeerId(2), &t);
     assert_eq!(d.owner(proxy), x);
 
@@ -3803,10 +3805,10 @@ fn resync_value_heal_ignores_lower_rank() {
 
     // A resync from the CURRENT owner X at a LOWER rank {1, 9} — the same-owner
     // value heal snaps regardless of rank; owner + rank are untouched.
-    let heal = encode_event(&EventMsg {
-        version: WIRE_VERSION,
-        sig: None,
-        event: NetEvent::ResyncSpawn {
+    let heal = signed(
+        x,
+        d.id,
+        NetEvent::ResyncSpawn {
             id,
             pos: quantize_vec2(5.0, 5.0),
             vel: quantize_vec2(0.0, 0.0),
@@ -3815,8 +3817,7 @@ fn resync_value_heal_ignores_lower_rank() {
                 coordinator: x,
             },
         },
-    })
-    .expect("encode");
+    );
     d.repl.apply_events(&mut d.world, x, &heal);
 
     assert!(
@@ -4002,12 +4003,7 @@ fn claim_to_non_coordinator_is_ignored() {
     let (o, _coord, mut x, _y, e, _pc, _px, _py) = coord_mesh();
     // X=PeerId(2) is not the coordinator (peer 1 is). Hand it a claim directly.
     let id = net_id(o.id, e);
-    let claim = encode_event(&EventMsg {
-        version: WIRE_VERSION,
-        sig: None,
-        event: NetEvent::ClaimOwnership { id },
-    })
-    .expect("encode");
+    let claim = signed(PeerId(3), x.id, NetEvent::ClaimOwnership { id });
     x.repl.apply_events(&mut x.world, PeerId(3), &claim);
     assert!(
         !x.repl.has_pending_claim(id),
@@ -4032,10 +4028,10 @@ fn newer_coordinator_commit_wins_equal_seq_tie() {
     let id = net_id(o.id, e);
 
     let commit = |new_owner: PeerId, coordinator: PeerId| {
-        encode_event(&EventMsg {
-            version: WIRE_VERSION,
-            sig: None,
-            event: NetEvent::OwnershipCommit {
+        signed(
+            coordinator,
+            d.id,
+            NetEvent::OwnershipCommit {
                 id,
                 new_owner,
                 seq: OwnerSeq {
@@ -4043,8 +4039,7 @@ fn newer_coordinator_commit_wins_equal_seq_tie() {
                     coordinator,
                 },
             },
-        })
-        .expect("encode")
+        )
     };
 
     // Old coordinator (id 1) commits {5,1} -> owner 7.
@@ -4085,12 +4080,7 @@ fn unarbitrable_claim_is_rejected_not_blackholed() {
         index: 42,
         generation: 0,
     };
-    let claim = encode_event(&EventMsg {
-        version: WIRE_VERSION,
-        sig: None,
-        event: NetEvent::ClaimOwnership { id },
-    })
-    .expect("encode");
+    let claim = signed(claimant, coord.id, NetEvent::ClaimOwnership { id });
     coord.repl.apply_events(&mut coord.world, claimant, &claim);
     assert!(
         coord.repl.has_pending_claim(id),

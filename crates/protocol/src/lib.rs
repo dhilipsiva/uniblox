@@ -16,6 +16,9 @@ mod content;
 pub use content::{ContentId, ContentIdError, VersionTriple, content_id};
 
 /// Wire-format version, checked on decode. Bump on ANY message-shape change.
+/// v8 (ADR-0049): reliable events are signed — `EventMsg::sig` carries the
+/// sender's ed25519 key and a signature over [`event_signing_bytes`], required
+/// for every event except `Ack`.
 /// v7 (ADR-0028 / Phase 3): coordinator sole-minter — `NetEvent` gains
 /// `TransferRequest` (a non-coordinator owner routes its PUSH handoff through the
 /// coordinator so the coordinator is the sole `OwnerSeq` minter in Mode 2).
@@ -31,7 +34,7 @@ pub use content::{ContentId, ContentIdError, VersionTriple, content_id};
 /// (the owner's privileged create-or-correct that heals a frozen wrong-owner /
 /// orphaned proxy). v3 (ADR-0022): `StateMsg` gains `tick` + `last_input`. v2
 /// added `NetEvent::Ack`. Pre-release hard cutover.
-pub const WIRE_VERSION: u8 = 7;
+pub const WIRE_VERSION: u8 = 8;
 
 /// Fixed-point quantization scale: world units × 1024.
 ///
@@ -197,10 +200,37 @@ pub struct DigestEntry {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct EventMsg {
     pub version: u8,
-    /// RESERVED for Phase 6 ed25519 op-signing. Always `None` in the slice —
-    /// present so the wire format does not change when signing lands.
+    /// The sender's signature (ADR-0049): [`SIG_KEY_BYTES`] of its ed25519 public
+    /// key, then the 64-byte signature over [`event_signing_bytes`]. Required for
+    /// every event except `Ack` (ephemeral bookkeeping on an authenticated link).
     pub sig: Option<Vec<u8>>,
     pub event: NetEvent,
+}
+
+/// The public-key prefix of [`EventMsg::sig`], in bytes.
+pub const SIG_KEY_BYTES: usize = 32;
+
+/// The domain separator of a signed event.
+const EVENT_SIGNING_DOMAIN: &[u8] = b"uniblox-event-v1\0";
+
+/// The bytes a reliable event's signature covers (ADR-0049): a domain separator,
+/// the sender and the recipient (so an event cannot be replayed to another peer
+/// or attributed to another sender), and the event encoded with no signature.
+pub fn event_signing_bytes(
+    sender: PeerId,
+    recipient: PeerId,
+    msg: &EventMsg,
+) -> Result<Vec<u8>, WireError> {
+    let unsigned = EventMsg {
+        version: msg.version,
+        sig: None,
+        event: msg.event.clone(),
+    };
+    let mut out = EVENT_SIGNING_DOMAIN.to_vec();
+    out.extend_from_slice(&sender.0.to_le_bytes());
+    out.extend_from_slice(&recipient.0.to_le_bytes());
+    out.extend_from_slice(&postcard::to_stdvec(&unsigned)?);
+    Ok(out)
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]

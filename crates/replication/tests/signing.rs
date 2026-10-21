@@ -50,7 +50,11 @@ impl Peer {
     fn owner_of(&mut self, spawner: PeerId) -> PeerId {
         let mut q = self.world.query::<(&Owner, &Position)>();
         let owners: Vec<PeerId> = q.iter(&self.world).map(|(o, _)| o.0).collect();
-        assert_eq!(owners.len(), 1, "one entity in these tests (spawned by {spawner:?})");
+        assert_eq!(
+            owners.len(),
+            1,
+            "one entity in these tests (spawned by {spawner:?})"
+        );
         owners[0]
     }
 }
@@ -79,7 +83,9 @@ fn setup() -> (Peer, Peer, Entity, NetEntityId) {
 
 /// A hands its entity to B; the transfer A sends B.
 fn transfer_bytes(a: &mut Peer, e: Entity) -> Vec<Box<[u8]>> {
-    a.repl.transfer_ownership(&mut a.world, e, B).expect("A owns it");
+    a.repl
+        .transfer_ownership(&mut a.world, e, B)
+        .expect("A owns it");
     a.events_for(B)
 }
 
