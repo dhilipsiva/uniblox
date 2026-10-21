@@ -248,3 +248,58 @@ mod on_disk {
         assert_eq!(bundle.entry_source, "fn update(a) { a }");
     }
 }
+
+// ── Re-review follow-ups (2026-10-21) ──
+
+/// More reserved Windows names: COM0/LPT0, the superscript-digit forms, CONIN$/CONOUT$, and a
+/// space before the extension (Windows strips it).
+#[test]
+fn more_windows_device_names_are_rejected() {
+    for bad in [
+        "COM0",
+        "lpt0",
+        "COM¹",
+        "LPT²",
+        "lpt³",
+        "CONIN$",
+        "conout$.txt",
+        "con .rhai",
+        "nul .txt",
+    ] {
+        let json = manifest(bad, &[(bad, content_id(b"x").to_hex())]);
+        let err = load_bundle(&json, |_| Some(b"x".to_vec())).unwrap_err();
+        assert!(matches!(err, BundleError::BadPath(_)), "{bad:?}: {err:?}");
+    }
+}
+
+/// A manifest named by a bare relative path (`UNIBLOX_BUNDLE=manifest.json`) loads from the current
+/// directory. The test changes the working directory, so it runs in its own process.
+#[test]
+fn a_bare_relative_manifest_path_loads() {
+    if std::env::var_os("BUNDLE_RELATIVE_CHILD").is_some() {
+        let bundle = load_bundle_dir(Path::new("manifest.json")).unwrap();
+        assert_eq!(bundle.entry_source, SCRIPT);
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.rhai"), SCRIPT).unwrap();
+    std::fs::write(
+        dir.path().join("manifest.json"),
+        manifest(
+            "a.rhai",
+            &[("a.rhai", content_id(SCRIPT.as_bytes()).to_hex())],
+        ),
+    )
+    .unwrap();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "a_bare_relative_manifest_path_loads",
+            "--nocapture",
+        ])
+        .env("BUNDLE_RELATIVE_CHILD", "1")
+        .current_dir(dir.path())
+        .status()
+        .unwrap();
+    assert!(status.success());
+}

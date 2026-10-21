@@ -212,3 +212,41 @@ fn player_controlled_and_opted_out_entities_are_never_scripted() {
         );
     }
 }
+
+/// A finite f64 that overflows f32 (narrowing gives infinity) is clamped back to the maximum speed.
+#[test]
+fn an_f32_overflowing_velocity_is_clamped() {
+    let engine =
+        ScriptEngine::from_source("fn update(a) { a.vx = 1.0e300; a.vy = -1.0e300; a }").unwrap();
+    let mut world = world_with(Some(engine));
+    let e = spawn(&mut world, LOCAL, true);
+    run(&mut world);
+    assert_eq!(
+        *world.get::<Velocity>(e).unwrap(),
+        Velocity {
+            x: MAX_SCRIPT_SPEED,
+            y: -MAX_SCRIPT_SPEED
+        }
+    );
+}
+
+/// An entity despawned in the same tick that marks it must not panic the schedule.
+#[test]
+fn marking_tolerates_an_entity_despawned_in_the_same_tick() {
+    fn despawn_unmarked(
+        mut commands: Commands,
+        q: Query<Entity, (With<Owner>, Without<Scripted>)>,
+    ) {
+        for e in &q {
+            commands.entity(e).despawn();
+        }
+    }
+    let mut world = world_with(None);
+    enable_scripts(&mut world, ScriptEngine::from_source(SET_VX).unwrap());
+    spawn(&mut world, OTHER, false);
+    let mut schedule = Schedule::default();
+    // The despawn's commands flush before the marking's, with no sync point in between: the
+    // order in which inserting on a despawned entity would panic.
+    schedule.add_systems((despawn_unmarked, run_entity_scripts).chain_ignore_deferred());
+    schedule.run(&mut world);
+}
