@@ -241,7 +241,9 @@ fn the_frame_budget_caps_the_cost_across_entities() {
         stats.ops, 200_001,
         "the cut-off call stopped one operation past the budget"
     );
+    assert!(engine.frame_budget_spent());
     engine.begin_frame();
+    assert!(!engine.frame_budget_spent());
     assert!(
         engine.update_component(Health { hp: 0 }).is_ok(),
         "a new frame starts fresh"
@@ -442,23 +444,43 @@ fn too_many_functions_are_rejected_at_compile_time() {
 
 /// The language intrinsics a script can use (not shown by `gen_fn_signatures`): reviewed. A Rhai
 /// upgrade that changes one of them breaks this list. `Fn`, `call` and `curry` are disabled (see
-/// `object_maps_function_pointers_and_currying_are_disabled`).
+/// `object_maps_function_pointers_and_currying_are_disabled`). Every case writes a result the test
+/// reads, so the optimizer cannot remove it and make the case pass vacuously.
 #[test]
 fn the_reviewed_intrinsics_work() {
-    for body in [
-        "let t = type_of(1);",
-        "let x = 1; let d = is_def_var(\"x\");",
-        "let d = is_def_fn(\"double\", 1);",
-        "try { throw 1; } catch (e) { }",
-        "for i in 0..3 { }",
-        "let s = `${[1, 2]}`;",
-        "let a = [3, 1, 2]; a.sort(); let b = a.filter(\"positive\");",
-        "let s = switch 1 { 1 => 2, _ => 3 };",
+    for (body, expected) in [
+        ("h.hp = if type_of(1) == \"i64\" { 1 } else { -1 };", 1),
+        (
+            "let x = 1; h.hp = if is_def_var(\"x\") { 2 } else { -1 };",
+            2,
+        ),
+        ("h.hp = if is_def_fn(\"double\", 1) { 3 } else { -1 };", 3),
+        ("try { throw 4; } catch (e) { h.hp = e; }", 4),
+        ("let n = 0; for i in 0..4 { n += i; } h.hp = n;", 6),
+        ("let n = 0; for i in 0..=4 { n += i; } h.hp = n;", 10),
+        (
+            "let r = 2..5; let n = 0; for i in r { n += i; } h.hp = n;",
+            9,
+        ),
+        ("let n = 0; for x in [10, 20, 30] { n += x; } h.hp = n;", 60),
+        (
+            "let s = `${[1, 2]}`; h.hp = if s == \"[1, 2]\" { 5 } else { -1 };",
+            5,
+        ),
+        (
+            "let a = [3, 1, 2]; a.sort(); let b = a.filter(\"positive\"); h.hp = a[0] * 100 + b.len();",
+            103,
+        ),
+        ("let k = h.hp + 1; h.hp = switch k { 1 => 7, _ => -1 };", 7),
+        ("h.hp = double(4);", 8),
     ] {
         let src = format!(
             "fn double(x) {{ x * 2 }} fn positive(x) {{ x > 0 }} fn update(h) {{ {body} h }}"
         );
-        assert!(run(&src).is_ok(), "{body} should work");
+        match run(&src) {
+            Ok(h) => assert_eq!(h.hp, expected, "{body}"),
+            Err(err) => panic!("{body} should work: {err:?}"),
+        }
     }
 }
 
