@@ -55,3 +55,52 @@ fn mint_token_prints_a_token_for_the_room() {
         .expect("run the binary");
     assert_eq!(without.status.code(), Some(2), "minting needs the secret");
 }
+
+/// `mint-token` refuses what the gate would refuse: an over-long lifetime (or one that overflows)
+/// and a room the gate rejects.
+#[test]
+fn mint_token_refuses_what_the_gate_refuses() {
+    for args in [
+        vec!["mint-token", "m3~1.0~0~arena", "18446744073709551615"],
+        vec!["mint-token", "m3~1.0~0~arena", "604800"],
+        vec!["mint-token", "a#0"],
+        vec!["mint-token", ""],
+        vec!["mint-token", "m3~bad"],
+    ] {
+        let out = services()
+            .env("UNIBLOX_SIGNALING_SECRET", SECRET)
+            .args(&args)
+            .output()
+            .expect("run the binary");
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+    }
+}
+
+/// The secret is taken as raw bytes, UTF-8 or not.
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_secret_is_used_as_bytes() {
+    use std::os::unix::ffi::OsStrExt;
+    let raw: Vec<u8> = (0u8..40).map(|b| b ^ 0xA5).collect();
+    let out = services()
+        .env("UNIBLOX_SIGNALING_SECRET", std::ffi::OsStr::from_bytes(&raw))
+        .args(["mint-token", "room"])
+        .output()
+        .expect("run the binary");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let token = String::from_utf8(out.stdout).unwrap();
+    let key = JoinTokenKey::new(&raw).unwrap();
+    assert_eq!(key.verify(token.trim(), "room", unix_now()), Ok(()));
+}
+
+/// Asking for the token endpoint without a secret is a configuration error, not a silent no-op.
+#[test]
+fn issuing_tokens_needs_a_secret() {
+    let out = services()
+        .env("UNIBLOX_SIGNALING_INSECURE", "1")
+        .env("UNIBLOX_ISSUE_TOKENS", "1")
+        .output()
+        .expect("run the binary");
+    assert_eq!(out.status.code(), Some(2));
+}
+

@@ -84,6 +84,12 @@ async fn assigned_id(ws: &mut Ws) -> PeerId {
 
 /// A plain HTTP/1.1 GET; returns the status and body.
 async fn http_get(addr: SocketAddr, path_and_query: &str) -> (u16, String) {
+    let (status, _headers, body) = http_get_full(addr, path_and_query).await;
+    (status, body)
+}
+
+/// A plain HTTP/1.1 GET; returns the status, the lowercased header block and the body.
+async fn http_get_full(addr: SocketAddr, path_and_query: &str) -> (u16, String, String) {
     let mut stream = TcpStream::connect(addr).await.expect("tcp connect");
     let request =
         format!("GET {path_and_query} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
@@ -99,11 +105,11 @@ async fn http_get(addr: SocketAddr, path_and_query: &str) -> (u16, String) {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .expect("status line");
-    let body = text
+    let (headers, body) = text
         .split_once("\r\n\r\n")
-        .map(|(_, b)| b.to_string())
+        .map(|(h, b)| (h.to_lowercase(), b.to_string()))
         .unwrap_or_default();
-    (status, body)
+    (status, headers, body)
 }
 
 /// Count the signaling events that arrive on `ws` within `dur`.
@@ -178,6 +184,21 @@ fn a_token_verifies_only_for_its_room_and_lifetime() {
     }
 }
 
+/// A token has exactly one spelling: no leading zeros in the expiry, a lowercase tag.
+#[test]
+fn a_token_has_one_spelling() {
+    let key = key();
+    let now = 1_800_000_000;
+    let token = key.mint(ROOM, now + 60);
+    assert_eq!(key.verify(&token, ROOM, now), Ok(()));
+    let padded = token.replacen("v1.", "v1.0", 1);
+    assert_eq!(key.verify(&padded, ROOM, now), Err(TokenError::Malformed));
+    let (head, tag) = token.rsplit_once('.').unwrap();
+    let upper = format!("{head}.{}", tag.to_uppercase());
+    assert_ne!(upper, token);
+    assert_eq!(key.verify(&upper, ROOM, now), Err(TokenError::Malformed));
+}
+
 #[test]
 fn a_short_key_is_refused() {
     assert_eq!(
@@ -230,8 +251,9 @@ async fn the_token_endpoint_issues_working_tokens() {
         ..authed()
     })
     .await;
-    let (status, body) = http_get(addr, &format!("{TOKEN_PATH}?room={ROOM}")).await;
+    let (status, headers, body) = http_get_full(addr, &format!("{TOKEN_PATH}?room={ROOM}")).await;
     assert_eq!(status, 200, "{body}");
+    assert!(headers.contains("cache-control: no-store"), "a token is never cached: {headers}");
     let json: serde_json::Value = serde_json::from_str(&body).expect("json");
     let token = json["token"].as_str().expect("a token");
     let expires = json["expires"].as_u64().expect("an expiry");
@@ -336,8 +358,24 @@ async fn a_signal_flood_is_dropped_and_then_closed() {
     assert!(closed.is_ok(), "the flooding socket is closed");
 }
 
+/// Wait until the server closes `ws` (the stream ends, errors or yields a Close frame).
+async fn closed_by_server(ws: &mut Ws, within: Duration) -> bool {
+    tokio::time::timeout(within, async {
+        loop {
+            match ws.next().await {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
+                Some(Ok(_)) => continue,
+            }
+        }
+    })
+    .await
+    .is_ok()
+}
+
+/// A message over the cap is refused by the WebSocket layer itself, before it is buffered whole:
+/// the connection is closed and nothing is relayed.
 #[tokio::test]
-async fn an_oversized_signal_is_dropped() {
+async fn an_oversized_message_closes_the_connection() {
     let (_reg, addr) = boot_with(SignalingConfig {
         limits: SignalingLimits {
             max_signal_bytes: 1024,
@@ -347,18 +385,114 @@ async fn an_oversized_signal_is_dropped() {
     })
     .await;
     let (mut a, mut b, b_id) = pair(addr, &format!("{ROOM}?engine=1")).await;
-    a.send(signal(b_id, &"x".repeat(2048))).await.unwrap();
-    a.send(signal(b_id, "small")).await.unwrap();
-    match next_event(&mut b).await {
-        JsonPeerEvent::Signal { data, .. } => {
-            assert_eq!(
-                data,
-                serde_json::json!({ "Offer": "small" }),
-                "the big one was dropped"
-            );
+    let _ = a.send(signal(b_id, &"x".repeat(2048))).await;
+    assert!(closed_by_server(&mut a, Duration::from_secs(5)).await);
+    assert_eq!(count_signals(&mut b, Duration::from_millis(300)).await, 0);
+}
+
+/// An unfinished fragmented message cannot grow past the cap either (the audit's 77 MiB per
+/// connection): its fragments count against the message limit as they arrive.
+#[tokio::test]
+async fn an_unfinished_fragmented_message_is_bounded() {
+    use tokio_tungstenite::tungstenite::protocol::frame::Frame;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data, OpCode};
+    let (_reg, addr) = boot_with(SignalingConfig {
+        limits: SignalingLimits {
+            max_signal_bytes: 1024,
+            ..SignalingLimits::default()
+        },
+        ..SignalingConfig::default()
+    })
+    .await;
+    let mut a = connect(addr, &format!("{ROOM}?engine=1")).await;
+    let _ = assigned_id(&mut a).await;
+    let first = Frame::message(vec![b'x'; 600], OpCode::Data(Data::Text), false);
+    let more = Frame::message(vec![b'x'; 600], OpCode::Data(Data::Continue), false);
+    let _ = a.send(Message::Frame(first)).await;
+    let _ = a.send(Message::Frame(more)).await;
+    assert!(closed_by_server(&mut a, Duration::from_secs(5)).await);
+}
+
+#[tokio::test]
+async fn concurrent_connections_per_ip_are_capped() {
+    let (_reg, addr) = boot_with(SignalingConfig {
+        limits: SignalingLimits {
+            max_connections_per_ip: 2,
+            ..SignalingLimits::default()
+        },
+        ..SignalingConfig::default()
+    })
+    .await;
+    let path = format!("{ROOM}?engine=1");
+    let mut first = connect(addr, &path).await;
+    let _ = assigned_id(&mut first).await;
+    let mut second = connect(addr, &path).await;
+    let _ = assigned_id(&mut second).await;
+    let (status, body) = refused(addr, &path).await;
+    assert_eq!(status, 429, "{body}");
+    // A slot frees when a connection ends.
+    drop(first);
+    let mut admitted = false;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if let Ok((mut ws, _)) = connect_async(format!("ws://{addr}/{path}")).await {
+            let _ = assigned_id(&mut ws).await;
+            admitted = true;
+            break;
         }
-        other => panic!("expected the small signal, got {other:?}"),
     }
+    assert!(admitted, "a new connection is admitted once one closes");
+}
+
+#[tokio::test]
+async fn an_idle_connection_is_closed() {
+    let (_reg, addr) = boot_with(SignalingConfig {
+        limits: SignalingLimits {
+            idle_timeout: Duration::from_millis(300),
+            ..SignalingLimits::default()
+        },
+        ..SignalingConfig::default()
+    })
+    .await;
+    let mut a = connect(addr, &format!("{ROOM}?engine=1")).await;
+    let _ = assigned_id(&mut a).await;
+    assert!(closed_by_server(&mut a, Duration::from_secs(3)).await);
+}
+
+/// A peer whose socket is not read cannot make the server queue without bound (the audit's
+/// 1.35 MiB/s per connection): once its outbound queue is full it is disconnected.
+#[tokio::test]
+async fn a_peer_that_does_not_read_is_disconnected() {
+    let (reg, addr) = boot_with(SignalingConfig {
+        limits: SignalingLimits {
+            max_outbound_queue: 4,
+            signals_burst: 100_000,
+            signals_per_sec: 100_000,
+            ..SignalingLimits::default()
+        },
+        ..SignalingConfig::default()
+    })
+    .await;
+    let (mut a, _b, b_id) = pair(addr, &format!("{ROOM}?engine=1")).await;
+    // B never reads. Enough data to fill the kernel's socket buffers and then the queue.
+    let payload = "y".repeat(30 * 1024);
+    for _ in 0..1000 {
+        if a.send(signal(b_id, &payload)).await.is_err() {
+            break;
+        }
+        if reg.peer_count(ROOM) < 2 {
+            break;
+        }
+    }
+    let mut evicted = false;
+    for _ in 0..250 {
+        if reg.peer_count(ROOM) == 1 {
+            evicted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(evicted, "the non-reading peer was disconnected");
 }
 
 #[tokio::test]
