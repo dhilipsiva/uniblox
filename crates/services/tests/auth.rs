@@ -149,6 +149,90 @@ async fn pair(addr: SocketAddr, room: &str) -> (Ws, Ws, PeerId) {
     (a, b, b_id)
 }
 
+/// Join `room`; the connection and its assigned id.
+async fn join(addr: SocketAddr, room: &str) -> (Ws, PeerId) {
+    let mut ws = connect(addr, room).await;
+    let id = assigned_id(&mut ws).await;
+    (ws, id)
+}
+
+/// Whether an event matching `found` arrives on `ws` within `within`.
+async fn saw(ws: &mut Ws, within: Duration, found: impl Fn(&JsonPeerEvent) -> bool) -> bool {
+    let deadline = tokio::time::Instant::now() + within;
+    while let Ok(Some(Ok(msg))) = tokio::time::timeout_at(deadline, ws.next()).await {
+        if let Message::Text(txt) = msg
+            && txt
+                .as_str()
+                .parse::<JsonPeerEvent>()
+                .is_ok_and(|e| found(&e))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// The size of each relayed flood signal. A whole number of them fills each byte budget below exactly.
+const EVENT: usize = 16 * 1024;
+
+/// A signal to `to` whose relayed event (a `Signal` from `from`) is exactly [`EVENT`] bytes.
+fn exact_signal(from: PeerId, to: PeerId) -> Message {
+    let overhead = JsonPeerEvent::Signal {
+        sender: from,
+        data: serde_json::json!({ "Offer": "" }),
+    }
+    .to_string()
+    .len();
+    signal(to, &"e".repeat(EVENT - overhead))
+}
+
+/// Send `bytes` of exact-size signals from `ws` (peer `from`) to `to`.
+async fn flood(ws: &mut Ws, from: PeerId, to: PeerId, bytes: usize) {
+    let msg = exact_signal(from, to);
+    for _ in 0..bytes / EVENT {
+        if ws.send(msg.clone()).await.is_err() {
+            break;
+        }
+    }
+}
+
+/// The first flood of a receiver that does not read: far more than the kernel's socket buffers and
+/// the WebSocket write buffer hold, so its queue is left holding what the limits let through.
+const PAST_THE_BUFFERS: usize = 48 << 20;
+
+/// Limits for the flood tests: no frame-rate or drop-count limit gets in the way, and a receiver
+/// that does not read is not disconnected while a test runs.
+fn flood_limits(max_outbound_queue: usize, max_outbound_bytes: usize) -> SignalingConfig {
+    SignalingConfig {
+        limits: SignalingLimits {
+            max_outbound_queue,
+            max_outbound_bytes,
+            signals_burst: 1_000_000,
+            signals_per_sec: 1_000_000,
+            abuse_close_after: 1_000_000,
+            writer_stall_timeout: Duration::from_secs(60),
+            ..SignalingLimits::default()
+        },
+        ..SignalingConfig::default()
+    }
+}
+
+/// B, then five flooders that flood B until its queue holds what they may take.
+async fn five_flooders_fill(addr: SocketAddr, path: &str) -> (Ws, Vec<(Ws, PeerId)>) {
+    let (b, b_id) = join(addr, path).await;
+    let mut flooders = Vec::new();
+    for _ in 0..5 {
+        flooders.push(join(addr, path).await);
+    }
+    for (i, (ws, id)) in flooders.iter_mut().enumerate() {
+        let bytes = if i == 0 { PAST_THE_BUFFERS } else { 2 << 20 };
+        flood(ws, *id, b_id, bytes).await;
+    }
+    // Let the relay catch up with what was sent.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    (b, flooders)
+}
+
 // ── Join tokens ──────────────────────────────────────────────────────────────
 
 #[test]
@@ -607,82 +691,101 @@ async fn keepalives_do_not_save_a_flooder() {
     );
 }
 
-/// A flooded peer still learns who joins: control events have capacity a sender cannot take.
+/// A flooded peer still learns who joins: signals leave an eighth of the queue's messages to control
+/// events. Five flooders' shares add up to more than the whole queue, so without that reserve the
+/// `NewPeer` would find it full. (The byte budget is out of reach here; the next test covers bytes.)
 #[tokio::test]
 async fn a_flooded_peer_still_learns_of_newcomers() {
-    let (_reg, addr) = boot_with(SignalingConfig {
-        limits: SignalingLimits {
-            max_outbound_queue: 64,
-            signals_burst: 100_000,
-            signals_per_sec: 100_000,
-            abuse_close_after: 1_000_000,
-            ..SignalingLimits::default()
-        },
-        ..SignalingConfig::default()
-    })
-    .await;
+    let (_reg, addr) = boot_with(flood_limits(64, 64 << 20)).await;
     let path = format!("{ROOM}?engine=1");
-    let (mut a, mut b, b_id) = pair(addr, &path).await;
-    let payload = "n".repeat(16 * 1024);
-    for _ in 0..500 {
-        if a.send(signal(b_id, &payload)).await.is_err() {
-            break;
-        }
-    }
-    let mut c = connect(addr, &path).await;
-    let c_id = assigned_id(&mut c).await;
-    let learned = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if let JsonPeerEvent::NewPeer(id) = next_event(&mut b).await
-                && id == c_id
-            {
-                return;
-            }
-        }
-    })
-    .await
-    .is_ok();
-    assert!(learned, "B was told about C despite A's flood");
+    let (mut b, _flooders) = five_flooders_fill(addr, &path).await;
+    let (_c, c_id) = join(addr, &path).await;
+    let learned = saw(
+        &mut b,
+        Duration::from_secs(30),
+        |e| matches!(e, JsonPeerEvent::NewPeer(id) if *id == c_id),
+    )
+    .await;
+    assert!(learned, "B was told about C despite the flood");
+}
+
+/// The same for bytes: signals leave an eighth of the byte budget to control events. The five
+/// flooders' byte shares cover the whole budget, and their signals are sized to fill it exactly.
+#[tokio::test]
+async fn a_peer_flooded_to_its_byte_budget_still_learns_of_newcomers() {
+    let (_reg, addr) = boot_with(flood_limits(1024, 1 << 20)).await;
+    let path = format!("{ROOM}?engine=1");
+    let (mut b, _flooders) = five_flooders_fill(addr, &path).await;
+    let (_c, c_id) = join(addr, &path).await;
+    let learned = saw(
+        &mut b,
+        Duration::from_secs(30),
+        |e| matches!(e, JsonPeerEvent::NewPeer(id) if *id == c_id),
+    )
+    .await;
+    assert!(learned, "B was told about C despite the flood");
 }
 
 /// One sender gets only a share of a receiver's queue: an honest sender's signal still reaches a
-/// peer another sender floods, and the honest sender is not charged.
+/// peer another sender floods, and the honest sender is not charged. Here the message share binds
+/// (the byte budget is out of reach).
 #[tokio::test]
 async fn an_honest_sender_keeps_its_share_during_a_flood() {
-    let (_reg, addr) = boot_with(SignalingConfig {
-        limits: SignalingLimits {
-            max_outbound_queue: 64,
-            signals_burst: 100_000,
-            signals_per_sec: 100_000,
-            abuse_close_after: 1_000_000,
-            ..SignalingLimits::default()
-        },
-        ..SignalingConfig::default()
+    let (_reg, addr) = boot_with(flood_limits(64, 64 << 20)).await;
+    let path = format!("{ROOM}?engine=1");
+    let (mut b, b_id) = join(addr, &path).await;
+    let (mut a, a_id) = join(addr, &path).await;
+    let (mut c, _) = join(addr, &path).await;
+    flood(&mut a, a_id, b_id, PAST_THE_BUFFERS).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    c.send(signal(b_id, "from-c")).await.unwrap();
+    let got_c = saw(&mut b, Duration::from_secs(30), |e| {
+        matches!(e, JsonPeerEvent::Signal { data, .. } if *data == serde_json::json!({ "Offer": "from-c" }))
     })
     .await;
-    let path = format!("{ROOM}?engine=1");
-    let (mut a, mut b, b_id) = pair(addr, &path).await;
-    let mut c = connect(addr, &path).await;
-    let _ = assigned_id(&mut c).await;
-    let payload = "f".repeat(16 * 1024);
-    for _ in 0..500 {
-        if a.send(signal(b_id, &payload)).await.is_err() {
-            break;
-        }
-    }
-    c.send(signal(b_id, "from-c")).await.unwrap();
-    let got_c = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if let JsonPeerEvent::Signal { data, .. } = next_event(&mut b).await
-                && data == serde_json::json!({ "Offer": "from-c" })
-            {
-                return;
-            }
-        }
-    })
-    .await
-    .is_ok();
     assert!(got_c, "C's signal reached B through A's flood");
+}
+
+/// The final re-review's single flooder: a share is bounded in bytes as well as messages. One sender
+/// sending large signals and then tiny ones, all well inside its message share, cannot take the bytes
+/// an honest sender needs.
+#[tokio::test]
+async fn one_sender_cannot_take_a_receivers_signal_bytes() {
+    let (_reg, addr) = boot_with(flood_limits(1024, 1 << 20)).await;
+    let path = format!("{ROOM}?engine=1");
+    let (mut b, b_id) = join(addr, &path).await;
+    let (mut a, a_id) = join(addr, &path).await;
+    let (mut c, _) = join(addr, &path).await;
+    flood(&mut a, a_id, b_id, PAST_THE_BUFFERS).await;
+    for _ in 0..150 {
+        a.send(signal(b_id, "t")).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    c.send(signal(b_id, "from-c")).await.unwrap();
+    let got_c = saw(&mut b, Duration::from_secs(30), |e| {
+        matches!(e, JsonPeerEvent::Signal { data, .. } if *data == serde_json::json!({ "Offer": "from-c" }))
+    })
+    .await;
+    assert!(got_c, "C's signal reached B through A's flood");
+}
+
+/// A share is released as the receiver reads: a sender may send many times its share, in messages
+/// and in bytes, to a peer that keeps up.
+#[tokio::test]
+async fn a_peer_that_reads_does_not_hold_a_sender_to_its_share() {
+    // A share of 16 messages and 16 KiB.
+    let (_reg, addr) = boot_with(flood_limits(64, 64 * 1024)).await;
+    let (mut a, mut b, b_id) = pair(addr, &format!("{ROOM}?engine=1")).await;
+    let payload = "r".repeat(1024);
+    for i in 0..100 {
+        let data = format!("{i}:{payload}");
+        a.send(signal(b_id, &data)).await.unwrap();
+        let arrived = saw(&mut b, Duration::from_secs(5), |e| {
+            matches!(e, JsonPeerEvent::Signal { data: d, .. } if *d == serde_json::json!({ "Offer": data }))
+        })
+        .await;
+        assert!(arrived, "signal {i} arrived");
+    }
 }
 
 /// Relaying re-encodes a signal; one that would come out larger than the cap (the review measured

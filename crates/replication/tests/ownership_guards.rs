@@ -174,6 +174,35 @@ fn a_rank_cannot_jump_to_the_top() {
     );
 }
 
+/// A resync of an entity the receiver already holds may not jump its rank either: that path sets the
+/// rank directly, so the jump check is its only guard. A plausible resync re-anchors the owner.
+#[test]
+fn a_resync_cannot_jump_a_known_entity_to_the_top() {
+    let mut owner = Peer::new(2);
+    let mut b = Peer::new(4);
+    let id = announce(&mut owner, &mut b);
+    let (m, b_id) = (PeerId(3), b.id);
+    let resync = move |seq: u64| {
+        signed(
+            m,
+            b_id,
+            NetEvent::ResyncSpawn {
+                id,
+                pos: QVec2 { x: 0, y: 0 },
+                vel: QVec2 { x: 0, y: 0 },
+                seq: OwnerSeq {
+                    seq,
+                    coordinator: m,
+                },
+            },
+        )
+    };
+    b.repl.apply_events(&mut b.world, m, &resync((1 << 32) + 1));
+    assert_eq!(b.owner(), owner.id, "a jump is refused");
+    b.repl.apply_events(&mut b.world, m, &resync(1));
+    assert_eq!(b.owner(), m, "a plausible resync re-anchors the owner");
+}
+
 /// A resync may not create an orphan proxy at an implausible rank either.
 #[test]
 fn an_orphan_resync_at_an_implausible_rank_is_refused() {

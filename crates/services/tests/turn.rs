@@ -104,18 +104,53 @@ async fn an_authenticated_client_gets_a_time_limited_credential() {
     let username = json["username"].as_str().expect("username");
     let credential = json["credential"].as_str().expect("credential");
     assert_eq!(json["urls"][0], "turn:turn.example:3478?transport=udp");
-    assert_eq!(json["ttl"], 600);
+    // The expiry is rounded down to a grid of half the TTL (see the next test).
+    let ttl = json["ttl"].as_u64().expect("ttl");
+    assert!(
+        (301..=600).contains(&ttl),
+        "between half the TTL and the TTL: {ttl}"
+    );
     let (expiry, label) = username.split_once(':').expect("<expiry>:<label>");
     let expiry: u64 = expiry.parse().expect("a unix expiry");
     let now = unix_now();
     assert!(
-        (now + 590..=now + 610).contains(&expiry),
-        "expires in the TTL: {expiry}"
+        (now + 299..=now + 600).contains(&expiry),
+        "expires within the TTL: {expiry}"
     );
     assert!(!label.is_empty());
     assert_eq!(
         credential,
         turn_credential(TURN_SECRET, label, expiry).credential
+    );
+}
+
+/// A token that outlives the TTL keeps its username too: the expiry is rounded down to a grid of half
+/// the TTL, so two fetches a second apart get the same username (or, across a grid line, usernames one
+/// step apart), and a token has at most two valid usernames at a time.
+#[tokio::test]
+async fn a_long_lived_token_keeps_its_username() {
+    let addr = boot(configured()).await;
+    let token = JoinTokenKey::new(SECRET)
+        .unwrap()
+        .mint(ROOM, unix_now() + 3600);
+    let fetch = || {
+        let token = token.clone();
+        async move {
+            let (status, _, body) =
+                get(addr, &format!("{TURN_PATH}?room={ROOM}&token={token}")).await;
+            assert_eq!(status, 200, "{body}");
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            json["username"].as_str().unwrap().to_string()
+        }
+    };
+    let expiry = |u: &str| u.split_once(':').unwrap().0.parse::<u64>().unwrap();
+    let first = fetch().await;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let second = fetch().await;
+    assert_eq!(expiry(&first) % 300, 0, "on the grid: {first}");
+    assert!(
+        second == first || expiry(&second) == expiry(&first) + 300,
+        "{first} then {second}"
     );
 }
 
