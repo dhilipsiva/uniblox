@@ -172,7 +172,7 @@ Load-bearing current facts the build docs rely on. **Re-verify before pinning ve
 
 Project-relevant only (not a profile):
 - Strong Rust / systems / distributed-systems background — the design leans minimal-abstraction and first-principles deliberately, matching a YAGNI, directness-over-comfort working style. Keep the abstractions thin.
-- **`nibli`** (github.com/dhilipsiva/nibli) already implements a **WebRTC P2P gossip transport** (NAT traversal, browser-native, no central relay) — this is directly reusable prior art for the transport/signaling layer, and the P2P-first instinct throughout this design traces to it.
+- Correction (2026-10-21): an earlier note here called `nibli` (github.com/dhilipsiva/nibli) reusable prior art for a WebRTC P2P gossip transport. nibli contains no WebRTC or gossip code, so the transport was built on matchbox and str0m directly (ADR-0012, ADR-0015); the P2P-first design rests on its own rationale (§2).
 - Preference for metric units and for explicit epistemic labeling (fact / inference / assumption / speculation) with stated confidence — this doc and the build docs follow that; maintain it.
 
 ---

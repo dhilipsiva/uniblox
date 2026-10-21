@@ -54,7 +54,7 @@ The toolchain (Rust 1.96 with the wasm32 target, wasm-bindgen, wasm-opt, brotli,
 
 ```bash
 nix develop                  # or `direnv allow` once; .envrc uses the flake
-just ci                      # the gate CI runs: fmt, clippy -D warnings, every test, cargo deny, the Mode-1 net-free check
+just ci                      # the gate CI runs: fmt, clippy and rustdoc with -D warnings, every test, cargo deny, the Mode-1 net-free check
 just test                    # the tests that need no external service (not --release: that profile aborts on panic)
 just wasm                    # both browser builds into dist/, ending with the 8 MB brotli size gate
 git config core.hooksPath scripts/git-hooks   # once per clone: the pre-commit hook (fmt, clippy, tests)

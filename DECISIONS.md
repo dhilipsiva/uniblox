@@ -937,7 +937,7 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   ADR-0022 render split — receivers **interpolate** entities owned by others and **predict** only entities they
   own. A direct consequence: when two *remotely-owned* entities interact, EVERY observer sees BOTH through
   interpolation and predicts NEITHER, so remote-vs-remote interactions carry inherently higher latency (≈ one
-  interpolation delay + RTT). This was captured in the raw research (`docs/claude.txt`: "the Mode-2 quality gap
+  interpolation delay + RTT). This was captured in the raw research (`docs/research/claude.txt`: "the Mode-2 quality gap
   is intrinsic, not a bug") and as a `TODO.md` tradeoff-ledger row, but was not yet recorded as a decision in
   the canonical "why" docs — leaving a future contributor/agent free to try to "helpfully" close it by
   re-simulating others locally, which would reintroduce the rejected lockstep/determinism.

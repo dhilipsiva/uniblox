@@ -374,12 +374,12 @@ impl Replication {
 
     /// One network tick of the SENDER, PER PEER (ADR-0021 interest management).
     /// Returns a per-peer outbox for every tracked peer that has something to
-    /// send. Each peer sees only entities in its AOI (set via [`set_aoi`];
+    /// send. Each peer sees only entities in its AOI (set via [`set_aoi`](Self::set_aoi);
     /// unset ⇒ unbounded/sees-all), and gets its OWN delta baseline + seq
     /// stream. Out-of-AOI entities are withheld in BOTH state AND existence
     /// (spawn-on-enter / despawn-on-exit) — the structural read-cheat defense.
     ///
-    /// PRECONDITION: only TRACKED peers ([`track_peer`]/[`on_peer_connected`])
+    /// PRECONDITION: only TRACKED peers ([`track_peer`](Self::track_peer)/[`on_peer_connected`](Self::on_peer_connected))
     /// get outboxes; the pump must track every connected peer.
     ///
     /// One snapshot per call. Peer processing order is load-bearing:
@@ -1507,9 +1507,9 @@ impl Replication {
     }
 
     /// Add a peer to the tracked set (ADR-0020/0021). Only tracked peers get
-    /// outboxes from [`collect_all`], so the pump MUST track every connected
+    /// outboxes from [`collect_all`](Self::collect_all), so the pump MUST track every connected
     /// peer. Per-peer state (`known`/`send_state`/`next_seq`) defaults lazily on
-    /// the first collect; set the peer's AOI via [`set_aoi`] (unset ⇒ sees-all).
+    /// the first collect; set the peer's AOI via [`set_aoi`](Self::set_aoi) (unset ⇒ sees-all).
     pub fn track_peer(&mut self, peer: PeerId) {
         self.peers.insert(peer);
     }
@@ -1527,7 +1527,7 @@ impl Replication {
     ///
     /// This sets a SINGLE radius (the degenerate hysteresis band `inner ==
     /// outer`) — the pre-ADR-0023 single-boundary behavior. For flicker-free
-    /// edges use [`set_aoi_hysteresis`].
+    /// edges use [`set_aoi_hysteresis`](Self::set_aoi_hysteresis).
     pub fn set_aoi(&mut self, peer: PeerId, center: (f32, f32), radius: f32) {
         self.aoi.insert(
             peer,
@@ -1542,7 +1542,7 @@ impl Replication {
     /// Set (or update) a peer's AOI with a HYSTERESIS band (ADR-0023 b): an
     /// entity ENTERS at `dist ≤ r_inner` and EXITS only at `dist > r_outer`, so
     /// one oscillating across the boundary doesn't churn Spawn/Despawn. Same
-    /// FAIL-OPEN caveat as [`set_aoi`] (unset ⇒ unbounded). `r_inner ≤ r_outer`.
+    /// FAIL-OPEN caveat as [`set_aoi`](Self::set_aoi) (unset ⇒ unbounded). `r_inner ≤ r_outer`.
     pub fn set_aoi_hysteresis(
         &mut self,
         peer: PeerId,
@@ -1660,7 +1660,7 @@ impl Replication {
     /// Mode 2 it MUST be called only when `local` is the coordinator (or in Mode 1,
     /// where `local` is the sole peer). A NON-coordinator using it in Mode 2
     /// concurrently with a coordinator commit reopens the equal-seq push/pull
-    /// collision — a Mode-2 non-coordinator owner MUST use [`request_transfer`]
+    /// collision — a Mode-2 non-coordinator owner MUST use [`request_transfer`](Self::request_transfer)
     /// instead (which routes through the coordinator, the sole minter). It is not
     /// guarded because it is also the low-level primitive the coordinator's own
     /// handoff and the replication-mechanics tests build on (a hard guard would
@@ -1772,7 +1772,7 @@ impl Replication {
 
     /// REQUEST a PUSH handoff of an entity WE own, ROUTED through the coordinator
     /// (ADR-0028 sole-minter) — the Mode-2 push. Unlike the direct
-    /// [`transfer_ownership`] (Mode 1 / the coordinator's own handoff / mechanics),
+    /// [`transfer_ownership`](Self::transfer_ownership) (Mode 1 / the coordinator's own handoff / mechanics),
     /// a NON-coordinator owner uses this so the coordinator is the SOLE `OwnerSeq`
     /// minter and a concurrent push+pull can never double-mint at equal seq.
     /// Returns `(coordinator, TransferRequest bytes)` to `send_event`; `None` if the
@@ -1934,7 +1934,7 @@ impl Replication {
     }
 
     /// A peer connected: track it (ADR-0021). Its entities are announced by the
-    /// next [`collect_all`] via AOI-ENTER — only the ones inside its AOI, so the
+    /// next [`collect_all`](Self::collect_all) via AOI-ENTER — only the ones inside its AOI, so the
     /// read-cheat holds even at join time. There is deliberately NO blanket
     /// all-owned Spawn replay anymore (that would leak the existence of
     /// out-of-AOI entities). Per-peer state defaults lazily on the first collect.

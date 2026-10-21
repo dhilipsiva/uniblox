@@ -6,10 +6,9 @@
 # Each variant is FULLY processed (bindgen -> wasm-opt -> brotli) before the next
 # `cargo build` overwrites target/.../client.wasm.
 #
-# Status: the toolchain (wasm-bindgen/wasm-opt/brotli/twiggy) is provided by the flake devShell
-# (ADR-0010), so this runs end-to-end. On the current stub client (no Bevy) the two builds are
-# byte-identical and the sizes are meaningless; it becomes meaningful once the client renders
-# (built later in Phase 1). See TODO.md Phase 1 (Instrumentation) and DECISIONS.md ADR-0002.
+# The toolchain (wasm-bindgen/wasm-opt/brotli/twiggy) comes from the flake devShell (ADR-0010). The
+# Bevy client renders (ADR-0017), so the two builds differ and their sizes are real; the run ends
+# with the brotli size gate (scripts/slice-check.sh --gate). See DECISIONS.md ADR-0002.
 set -euo pipefail
 cd "$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
 

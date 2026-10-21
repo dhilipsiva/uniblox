@@ -27,6 +27,10 @@ lint:
     cargo fmt --all -- --check
     cargo clippy --locked --workspace --all-targets -- -D warnings
 
+# Build the docs, with warnings as errors.
+doc:
+    RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
+
 # Advisories, bans, licences and sources against the committed deny.toml.
 deny:
     cargo deny check advisories bans licenses sources
@@ -40,4 +44,4 @@ wasm:
     scripts/build-wasm.sh
 
 # The local gate: what CI checks, except the WASM builds (`just wasm`, its own CI job).
-ci: lint test-all deny net-free
+ci: lint test-all doc deny net-free

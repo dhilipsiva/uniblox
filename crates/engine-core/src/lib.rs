@@ -96,7 +96,7 @@ pub struct Snapshot {
 
 /// Ring buffer of received snapshots for a REMOTE, non-controlled (interpolated)
 /// entity — the interpolation source. The receiver pushes on each applied
-/// snapshot; capped at [`INTERP_BUFFER_CAP`]. Presence of this component is what
+/// snapshot; capped at `INTERP_BUFFER_CAP`. Presence of this component is what
 /// marks an entity "interpolated" (owned/predicted entities never have it).
 #[derive(Component, Default)]
 pub struct InterpBuffer(pub VecDeque<Snapshot>);
@@ -157,7 +157,7 @@ pub struct ControlledBy(pub PeerId);
 
 /// CLIENT (ADR-0022): applied-but-unacked inputs on the controlled avatar,
 /// replayed each [`predict`] tick from the authoritative anchor. Pruned by the
-/// reconciliation marker; capped ([`INPUT_CAP`]) — bounded prediction error if
+/// reconciliation marker; capped (`INPUT_CAP`) — bounded prediction error if
 /// the authority stalls.
 #[derive(Component, Default)]
 pub struct InputHistory(pub VecDeque<Input>);
@@ -377,7 +377,7 @@ fn sample_buffer(buf: &VecDeque<Snapshot>, target: f64) -> Option<(f32, f32)> {
 }
 
 /// Push a received snapshot into an interpolation buffer, evicting the oldest
-/// past [`INTERP_BUFFER_CAP`]. The receiver calls this on each applied snapshot.
+/// past `INTERP_BUFFER_CAP`. The receiver calls this on each applied snapshot.
 /// DROPS a snapshot whose tick is not strictly newer than the buffer's back, so
 /// the buffer stays tick-monotonic by construction (a buggy/reordered sender
 /// can't warp the lerp with an out-of-order or duplicate tick — auditor NIT).
@@ -487,7 +487,7 @@ pub fn apply_input(
 }
 
 /// SERVER receiver helper (ADR-0022): queue a received input for its controlled
-/// entity, capping the jitter buffer at [`INPUT_CAP`].
+/// entity, capping the jitter buffer at `INPUT_CAP`.
 pub fn push_pending_input(pending: &mut PendingInputs, entity: Entity, input: Input) {
     let queue = pending.0.entry(entity).or_default();
     queue.push_back(input);
@@ -511,7 +511,7 @@ enum RenderRole {
 
 /// Maintain each entity's render role on a CHANGE — the handoff interplay
 /// (ADR-0022 Stage C). Diffs the desired role (from `authority × Controlled`)
-/// against a cached [`RenderRole`] and, on a transition, runs the flush/seed:
+/// against a cached `RenderRole` and, on a transition, runs the flush/seed:
 /// - **→ Owned** (adopt / spawn-owned): drop `InterpBuffer`; clear
 ///   `InputHistory` (now authoritative — no reconcile).
 /// - **→ Predicted** (relinquish-but-keep-control / Mode-3 avatar): drop

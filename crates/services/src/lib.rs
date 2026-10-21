@@ -13,7 +13,7 @@
 //! malformed scope / bad `?engine` / bad `?next`. A plain path (no `~`) is a
 //! legacy room (no engine gate).
 //!
-//! **Session-SIZE grouping (`?next=N`, ADR-0039):** [`NextTopology`] is a custom
+//! **Session-SIZE grouping (`?next=N`, ADR-0039):** `NextTopology` is a custom
 //! [`SignalingTopology`] — a full-mesh SDP/ICE relay (matchbox `FullMesh`
 //! re-implemented from its contract) GENERALIZED with size grouping. `?next`
 //! absent ⇒ ONE unbounded session per room (behaviourally identical to FullMesh);
@@ -172,7 +172,7 @@ impl fmt::Display for ScopeError {
 
 impl std::error::Error for ScopeError {}
 
-/// Parse a scoped room path. Only meaningful for a path containing [`SCOPE_SEP`]
+/// Parse a scoped room path. Only meaningful for a path containing `SCOPE_SEP`
 /// — a plain path (no `~`) is a legacy room, not a scope.
 pub fn parse_scope(path: &str) -> Result<Scope, ScopeError> {
     let mut it = path.split(SCOPE_SEP);
@@ -259,7 +259,7 @@ struct RegistryInner {
 }
 
 /// The signaling node's session state — the [`SignalingState`] backing
-/// [`NextTopology`] (ADR-0040). Two layers:
+/// `NextTopology` (ADR-0040). Two layers:
 ///
 /// * **node-local relay** (`local`): each session's peers + live relay senders +
 ///   the `?next` grouping bookkeeping. Drives the relay; never leaves the process.
@@ -603,7 +603,7 @@ fn broadcast(channels: &[SignalingChannel], event: &JsonPeerEvent) {
     }
 }
 
-/// Build the uniblox signaling server: the custom [`NextTopology`] (scoped rooms
+/// Build the uniblox signaling server: the custom `NextTopology` (scoped rooms
 /// isolated structurally by the path; `?next=N` session-SIZE grouping) + a gate
 /// implementing the ASYMMETRIC version filter (admit `?engine >= min`, reasoned
 /// 426/400 otherwise) that also stashes `?next` + the `registry` as the shared

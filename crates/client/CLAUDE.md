@@ -45,8 +45,8 @@ reload tab → L restores the world (also B4's real end-to-end proof). Native ma
   `web/index.html` and `../../scripts/build-wasm.sh`.
 - **Single-threaded at launch — do NOT enable SharedArrayBuffer/threads or set
   COOP/COEP headers.** Cross-origin isolation breaks the OAuth/payment popups Mode 3 needs.
-- The `webgpu` cargo feature is a no-op until Bevy lands; it exists so the
-  two-build invocation is valid today.
+- The `webgpu` cargo feature enables `bevy/webgpu` for the WebGPU build; the default build is
+  WebGL2. They are two separate builds (`scripts/build-wasm.sh`), never one.
 
 ## Rules
 Inherit all root invariants and always-do rules from `../../CLAUDE.md`.

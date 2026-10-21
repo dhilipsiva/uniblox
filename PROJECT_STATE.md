@@ -4,8 +4,10 @@ Living snapshot of where uniblox is. Update it when a phase's status changes.
 The **why** behind decisions lives in `DECISIONS.md`; the **what/how** lives in
 `docs/final-buildspec.md`; the backlog lives in `TODO.md`.
 
-**Current phase: PHASE 1 COMPLETE; PHASE 2 (transport hardening) COMPLETE bar the deploy-gated telemetry
-numbers; PHASE 3 (replication depth, HIGH) HAS BEGUN; PHASE 4 (Mode 1 Standalone) UNDERWAY (A1 — the
+**Current phase (2026-10-21): PHASES 1 AND 4 COMPLETE; PHASE 2 COMPLETE bar the deploy-gated telemetry
+numbers; the PHASE 3 replication core DONE (only the deferred ADR-0029 throughput follow-up remains); PHASE 5
+(central services) UNDERWAY — ADR-0037 to ADR-0040 done, the Mode-2 coordinator peer service next.** History:
+PHASE 4 (Mode 1 Standalone) delivered (A1 — the
 net-free `standalone` runtime — DONE, ADR-0030; A2 — browser-playable Mode 1 in the client — DONE, ADR-0031;
 B1 `ContentId`/blake3 — DONE, ADR-0032; B2 `persistence` save/load — DONE, ADR-0033; B3 native `FileStore` —
 DONE, ADR-0034; B4 browser `IdbStore` — DONE, ADR-0035; C1 client save/load keybinds — DONE, ADR-0036 —
@@ -157,7 +159,7 @@ signaling+registry+scoping, same-mode/same-version, version-triple/asymmetric, `
 bullets. Remaining Phase-5: the Mode-2 coordinator peer service.
 
 ## Done
-- **Cargo workspace** — virtual manifest, 10 crates under `crates/*` (glob members),
+- **Cargo workspace** — virtual manifest, 11 crates under `crates/*` (glob members),
   size-optimized `[profile.release]`. `cargo build` + `cargo test` green.
 - **Single-threaded stance** — no COOP/COEP anywhere (serve script + capability page + ADR-0003).
 - **AI-workflow scaffolding** — per-crate `CLAUDE.md`, `DECISIONS.md`, four subagents
@@ -166,7 +168,8 @@ bullets. Remaining Phase-5: the Mode-2 coordinator peer service.
   four hooks (`.claude/settings.json` + `scripts/hooks/`), git pre-commit gate.
 - **Build-pipeline scaffolding** — `scripts/build-wasm.sh`, `scripts/slice-check.sh`,
   `scripts/serve.sh`, `crates/client/web/index.html` (capability detection). `build-wasm.sh`
-  runs end-to-end (tools via the flake); output is meaningless until a rendering Bevy client exists.
+  runs end-to-end (tools via the flake) and ends with the 8 MB brotli gate; the sizes are real since the
+  client renders (ADR-0017).
 - **`.mcp.json`** scaffold (github, read-only postgres, docs/Context7, playwright).
 - **Nix flake devShell + direnv** (ADR-0010) — `flake.nix`/`flake.lock`/`.envrc` provide a pinned
   Rust toolchain (1.96.1, wasm32 target) + `wasm-bindgen`/`wasm-opt`/`brotli`/`twiggy`/`node`,
@@ -327,11 +330,12 @@ bullets. Remaining Phase-5: the Mode-2 coordinator peer service.
 - **STUN-only connection success rate** — real-network peers (Phase-2 telemetry bullet).
 
 ## Next
-Phase 2 (transport hardening) is underway — str0m is landed; remaining Phase-2 items: two-channel config
-parameterization, STUN/TURN, reconnect/ICE-restart, plus the browser-pairing residuals. Other candidates:
-the **Bevy client rendering work** (closes every Phase-1 residual: real WASM sizes, cold-load, browser
-metrics, Web Audio); Phases 4–8 are LOW/MIXED and delegate-friendly. Phase 3 (replication depth) and
-Phase 12 (sandbox hardening) each need a human-owned HIGH pass.
+- **Phase 5:** the Mode-2 coordinator peer service (MIXED: the election logic needs human review), then the
+  deferred registry work (atomic updates, TTL crash cleanup, autoscaling, rate limiting and authentication).
+- **Phase 2 residual:** real-network STUN-only success rate and RTT/jitter, once peers run on real networks.
+- **Repository hygiene and CI:** a CI workflow runs `just ci` and the WASM builds; dependency currency
+  (Bevy, str0m, redis, webrtc, and the matchbox TLS stack behind the dated `deny.toml` ignores) comes next.
+- Phase 3 depth beyond the core and Phase 12 (sandbox hardening) each need a human-owned HIGH pass.
 
 ## Toolchain notes
 **The toolchain comes from the Nix flake devShell** (ADR-0010): pinned Rust 1.96.1 (edition 2024, wasm32
