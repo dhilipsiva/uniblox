@@ -9,11 +9,16 @@ Chromium (WebGL2 through SwiftShader):
 2. save and reload: K saves the world to IndexedDB, the page reloads, L loads the same content ID
    (`[uniblox-save] saved <id>` then `[uniblox-save] loaded <id>`);
 3. two tabs: two browsers in the same signaling room each receive the other's packets on both
-   channels (`[uniblox-demo][STATE] from` and `[uniblox-demo][EVENT] from`).
+   channels (`[uniblox-demo][STATE] from` and `[uniblox-demo][EVENT] from`);
+4. Mode 2 (P2P): three tabs join a scoped room on a second, authenticated signaling server (a join
+   token from its endpoint), replicate each other's entities, and agree on the coordinator. Two of
+   them claim the same entity inside the arbitration window: the lower id wins the commit, the other
+   gets `ClaimRejected`. The coordinator's tab closes: the survivors agree on the new coordinator and
+   re-tag the departed peer's entity to it (host migration), and a claim then commits under it.
 
 Environment: CHROMEDRIVER and UNIBLOX_CHROMIUM (set by the dev shell), UNIBLOX_SERVICES (the
 signaling binary; default: `cargo run --locked -p services`), UNIBLOX_DIST (default dist).
-Exit 0 = all three pass.
+Exit 0 = all four pass.
 """
 
 import contextlib
@@ -127,6 +132,9 @@ class Session:
             time.sleep(0.25)
         raise TimeoutError(f"timed out waiting for {what}")
 
+    def execute(self, script, *args):
+        return self.call("POST", "/execute/sync", {"script": script, "args": list(args)})
+
     def press(self, key):
         """A key press on the canvas, which Bevy's winit backend reads keyboard input from (so focus it first)."""
         canvas = self.call(
@@ -166,6 +174,21 @@ class QuietHandler(http.server.SimpleHTTPRequestHandler):
 
 def marker(text):
     return lambda line: text in line and line
+
+
+MODE2 = "[uniblox-mode2] "
+
+
+def mode2_value(kind):
+    """The value after `[uniblox-mode2] <kind> ` in a line, else None."""
+    tag = f"{MODE2}{kind} "
+
+    def find(line):
+        if tag in line:
+            return line.split(tag, 1)[1].split()[0].strip('"\\')
+        return None
+
+    return find
 
 
 def saved_id(line):
@@ -280,6 +303,78 @@ def main():
         finally:
             for s in (a, b):
                 s.close()
+
+        # Mode 2 on an authenticated signaling server: the client fetches a join token from its
+        # endpoint (cross-origin, as the hosted demo would) and joins the scoped room with it.
+        secure_port = free_port()
+        procs.append(
+            subprocess.Popen(
+                cmd,
+                cwd=root,
+                env={
+                    **os.environ,
+                    "UNIBLOX_SIGNALING_PORT": str(secure_port),
+                    "UNIBLOX_SIGNALING_SECRET": os.urandom(32).hex(),
+                    "UNIBLOX_ISSUE_TOKENS": "1",
+                },
+            )
+        )
+        wait_for_port(secure_port, time.monotonic() + 300)
+        room = "m2~1.0~0~e2e"
+        mode2_url = (
+            f"{url}?mode2={room}&signal=http://127.0.0.1:{secure_port}"
+            "&engine=1&entities=2&arbitrate=2000"
+        )
+        tabs = [driver.session(chromium, os.path.join(tmp, f"m{i}")) for i in range(3)]
+        try:
+            for tab in tabs:
+                tab.goto(mode2_url)
+            deadline = time.monotonic() + TIMEOUT_S
+            ids = [int(tab.wait_for(mode2_value("id"), "a peer id", deadline)) for tab in tabs]
+            for tab in tabs:
+                tab.wait_for(marker(f"{MODE2}entities 6"), "all six entities", deadline)
+            coord = min(ids)
+            for tab in tabs:
+                tab.wait_for(marker(f"{MODE2}coordinator {coord}"), "the coordinator", deadline)
+            by_id = dict(zip(ids, tabs))
+            winner, loser = sorted(i for i in ids if i != coord)
+            for claimant in (winner, loser):
+                by_id[claimant].execute("location.hash = arguments[0]", "claim1")
+            deadline = time.monotonic() + TIMEOUT_S
+            by_id[winner].wait_for(
+                marker(f" {coord} -> {winner}"), "the winner's commit", deadline
+            )
+            by_id[loser].wait_for(
+                marker(f"{MODE2}claim rejected"), "the loser's rejection", deadline
+            )
+            print("PASS mode 2: a contested claim commits to the lower id, the other is rejected")
+
+            for i in (winner, loser):
+                by_id[i].lines.clear()
+            by_id[coord].close()
+            deadline = time.monotonic() + TIMEOUT_S
+            for i in (winner, loser):
+                by_id[i].wait_for(
+                    marker(f"{MODE2}coordinator {winner}"), "the new coordinator", deadline
+                )
+                by_id[i].wait_for(
+                    marker(f" {coord} -> {winner}"), "the orphan re-tagged", deadline
+                )
+            print("PASS mode 2: host migration (new coordinator, orphan re-tagged)")
+
+            by_id[loser].lines.clear()
+            by_id[loser].execute("location.hash = arguments[0]", "claim2")
+            by_id[loser].wait_for(
+                marker(f" {winner} -> {loser}"),
+                "a commit under the new coordinator",
+                time.monotonic() + TIMEOUT_S,
+            )
+            print("PASS mode 2: a claim commits under the new coordinator")
+        except Exception as err:
+            failures.append(f"mode 2: {err}")
+        finally:
+            for tab in tabs:
+                tab.close()
     finally:
         for p in procs:
             p.terminate()
