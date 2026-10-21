@@ -100,11 +100,13 @@ fn callbacks_by_name_still_work() {
 
 #[test]
 fn tight_loops_hit_the_operation_limit() {
-    let err = run("fn update(h) { let i = 0; while true { i += 1; } h }").unwrap_err();
-    assert!(
-        matches!(*err, EvalAltResult::ErrorTooManyOperations(..)),
-        "{err:?}"
-    );
+    for src in [
+        "fn update(h) { let i = 0; while true { i += 1; } h }",
+        "fn update(h) { let n = 0; for i in 0..9223372036854775807 { n += 1; } h.hp = n; h }",
+    ] {
+        let err = run(src).unwrap_err();
+        assert!(is_operation_cap(&err), "{src}: {err:?}");
+    }
 }
 
 #[test]

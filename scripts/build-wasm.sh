@@ -29,7 +29,8 @@ done
 RAW="${CARGO_TARGET_DIR:-target}/wasm32-unknown-unknown/release/client.wasm"
 # An 8 MiB stack instead of the 1 MiB wasm32 default: the worst native recursion a script can reach
 # needs ~0.45 MiB in a native release build (ADR-0046, `just stack-check`); this keeps a wide margin
-# for wasm frame sizes. A stack overflow in wasm traps and kills the client.
+# for wasm frame sizes, extrapolated from native rather than measured in wasm. A stack overflow in
+# wasm traps and kills the client tab.
 STACK="-C link-arg=-zstack-size=8388608"
 
 emit () {

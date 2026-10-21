@@ -1772,7 +1772,9 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   two arrays nested to the container cap at the bottom (`worst_case_stack_scripts`, three shapes). Measured
   (x86-64): at most 448 KiB in release and 2.6 MiB in debug. `just stack-check` runs them on 1 MiB in release,
   and a test runs them on 4 MiB in debug. The browser builds also link with an 8 MiB stack
-  (`scripts/build-wasm.sh`) as margin for wasm frame sizes.
+  (`scripts/build-wasm.sh`) as margin for wasm frame sizes. That margin is extrapolated from native, not
+  measured in wasm; measuring it is due when the browser client first loads content. A wasm stack overflow
+  traps and ends the player's own tab, not the machine.
 - **Decision — budgets:** `ScriptLimits` (defaults in brackets):
   - a source cap checked before compile [256 KiB], with `from_file` and hot reload reading bounded;
   - a wall-clock watchdog per call through `on_progress` [50 ms], checked every 64 operations on
@@ -1790,8 +1792,9 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   custom syntax there is changing the sandbox.
 - **Memory:** an index assignment still checks only the new item, so a script can grow an array tree in place,
   one checked value (up to about 2 KiB of elements) per assignment, until the operation cap ends the call.
-  Measured, the heaviest shape peaks at 13 MiB per call, all of it freed on return, because the scope is rewound
-  and scripts keep no state. `tests/memory.rs` counts every allocation and bounds it at 64 MiB.
+  Measured, the heaviest shapes peak at 13 MiB per call (16 MiB in the re-audit, comparing two such trees with
+  `==`), all of it freed on return, because the scope is rewound and scripts keep no state. `tests/memory.rs`
+  counts every allocation and bounds it at 64 MiB.
 - **Decision — the feature guard:** `scripts/check-rhai-features.sh`, which `just ci` (and so CI) runs, fails if
   rhai's `unchecked` (which compiles out every limit) or `internals` is resolved for any target. Mutation-tested:
   enabling either fails it.
@@ -1799,8 +1802,10 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   the array package, the `Health` example, the `Agent` API and the FLOAT unary minus. A test compares
   `sandbox_engine()` with it, and another checks that `print`, `debug`, `exit`, `sleep`, `open`, `read_file`,
   `system`, `timestamp` and `parse_json` are not callable. The language intrinsics a script keeps (`type_of`,
-  `is_def_var`, `is_def_fn`, `try`/`catch`/`throw`, ranges, interpolation, `switch`) are listed in a test too.
-  A change to either list is a sandbox change.
+  `is_def_var`, `is_def_fn`, `try`/`catch`/`throw`, `for` over arrays and integer ranges, interpolation,
+  `switch`) are listed in a test that reads each one's result. The raw engine has no range iterator; the
+  sandbox registers one for `a..b` and `a..=b` (lazy, one operation per step). A change to either list is a
+  sandbox change.
 - **Decision — the escape-hatch ladder and its trigger:** a script too slow for its job steps down: Rhai → a
   registered Rust host function → a native Bevy system → (last resort) an engine release. The trigger is script
   time above 10–20% of the frame budget. `just script-cost` (the `script_cost` example) measures it: the sample
@@ -1812,5 +1817,12 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
 - **Consequences:** `cargo test -p scripting` runs the adversarial matrix (23 tests) and the memory bound, plus the
   agent and bridge tests; engine-core adds the rotation test. `just ci` adds the feature guard and the stack
   check. Scripts lose object maps and function pointers; the sample game uses neither.
+- **Audit record:** a fresh sandbox auditor reviewed 6b566fd (REQUEST CHANGES: the native stack within the caps,
+  uncounted callback operations, function-count compile cost, the map gap, doc overclaims, unlocked intrinsics).
+  All were fixed, and the two memory bombs above were found while fixing them. A second fresh auditor reviewed
+  19aa76f: **APPROVE WITH NITS**. It re-derived the stack (nothing above ~450 KiB release), the memory bound, the
+  map and function-pointer lockout (no bypass), the operation counting and the guards. Its MEDIUM, that range
+  loops did not run and the intrinsics test passed vacuously for them, and its nits (the memory figure, the wasm
+  margin, one wasted refused call per spent frame) are fixed or recorded here.
 - **Status:** Proposed (2026-10-21) on branch `todo/P4-UNIBLOX-04`. This is the HIGH-risk pass the repository
   reserves for a human owner (TODO.md "Staged next steps" 4): accepted only after the owner's review.

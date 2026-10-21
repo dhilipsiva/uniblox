@@ -90,7 +90,8 @@ fn hostile_scripts() -> Vec<String> {
 }
 
 /// The bound ADR-0046 documents: one call stays under 64 MiB above where it started (measured
-/// ~13 MiB for the heaviest shape), and everything is freed when the call returns.
+/// 13 MiB for the heaviest shape here, 16 MiB at most in the re-audit), and everything is freed when
+/// the call returns.
 #[test]
 fn one_hostile_call_stays_under_the_documented_memory_bound() {
     const BOUND: usize = 64 * 1024 * 1024;

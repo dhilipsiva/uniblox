@@ -410,7 +410,8 @@ pub fn run_entity_scripts(
                 });
             }
             Ok(_) => log::warn!("script returned a non-finite velocity; ignored"),
-            Err(err) if engine.frame_stats().skipped > 0 => {
+            // The call that crossed the frame budget was cut off: stop here, not one call later.
+            Err(err) if engine.frame_budget_spent() => {
                 log::warn!(
                     "script frame budget spent; the remaining entities run next tick ({err})"
                 );

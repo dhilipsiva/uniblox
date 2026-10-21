@@ -251,6 +251,12 @@ impl ScriptEngine {
         self.frame
     }
 
+    /// Whether this frame's budget is spent, so the next call would be refused.
+    pub fn frame_budget_spent(&self) -> bool {
+        self.frame.ops >= self.limits.frame_ops_budget
+            || self.frame.elapsed >= self.limits.frame_time_budget
+    }
+
     /// Run one guarded call: refuse it once the frame budget is spent, give it a deadline (the
     /// sooner of its own time budget and what the frame has left), and account its cost.
     fn guarded<T>(
@@ -258,9 +264,7 @@ impl ScriptEngine {
         call: impl FnOnce(&Engine, &mut Scope<'static>, &AST) -> Result<T, Box<EvalAltResult>>,
     ) -> Result<T, Box<EvalAltResult>> {
         let limits = self.limits;
-        if self.frame.ops >= limits.frame_ops_budget
-            || self.frame.elapsed >= limits.frame_time_budget
-        {
+        if self.frame_budget_spent() {
             self.frame.skipped += 1;
             return Err(Box::new(EvalAltResult::ErrorRuntime(
                 Dynamic::from(FRAME_BUDGET_TOKEN),
@@ -347,6 +351,10 @@ fn register_whitelist(engine: &mut Engine) {
     // `set_max_array_size` has something to guard. Numeric/bool/string operators are
     // built-in even in a raw engine — no package needed for `h.hp += 1`.
     engine.register_global_module(rhai::packages::BasicArrayPackage::new().as_shared_module());
+    // `for i in a..b` and `a..=b`: the raw engine has no range iterator. Iterating a range allocates
+    // nothing, and each step is an operation (ADR-0046).
+    engine.register_iterator::<std::ops::Range<rhai::INT>>();
+    engine.register_iterator::<std::ops::RangeInclusive<rhai::INT>>();
     register_api(engine);
     register_agent(engine);
 }
