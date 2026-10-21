@@ -1,0 +1,7 @@
+{
+  "version": { "engine": 1, "content": 1, "schema": 1 },
+  "entry": "arena.rhai",
+  "assets": [
+    { "path": "arena.rhai", "id": "64eafe156c547e3ed8e6c04c17e51a38982adefd893133829aa0323afc6ef283" }
+  ]
+}
