@@ -11,9 +11,9 @@ members  = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-# The stable toolchain the flake provides (CONVENTIONS.md, MSRV policy: it moves only with a
-# CHANGELOG line, and CI builds on it).
-rust-version = "1.96"
+# The exact toolchain the flake pins (CONVENTIONS.md, MSRV policy: it moves deliberately, recorded in
+# DECISIONS.md, and CI builds on it). Bevy 0.20 needs >= 1.97.1.
+rust-version = "1.99"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/dhilipsiva/uniblox"
 homepage = "https://github.com/dhilipsiva/uniblox"
@@ -25,16 +25,16 @@ homepage = "https://github.com/dhilipsiva/uniblox"
 # default-features off drops `ahash/runtime-rng` (needs entropy on wasm) → fixed hash keys,
 # WASM-safe. `unchecked`/`internals` are NOT defaults and MUST stay off (they void the sandbox).
 rhai     = { version = "1.25", default-features = false, features = ["std"] }
-bevy_ecs = { version = "0.19" }
+bevy_ecs = { version = "0.20" }
 # headless server runtime (ADR-0014): standalone app/time crates — NOT the `bevy`
 # umbrella (MinimalPlugins lives in bevy_internal; we assemble the equivalent).
-bevy_app  = { version = "0.19" }
-bevy_time = { version = "0.19" }
+bevy_app  = { version = "0.20" }
+bevy_time = { version = "0.20" }
 # The full engine — CLIENT wasm32 ONLY (ADR-0017): native Bevy would drag
 # alsa/udev/X11 into the devShell and every native test run; native parity is
 # Phase 14. Feature-pruned per build in crates/client (2d collection; webgpu
 # overrides webgl2 — two builds, ADR-0002).
-bevy = { version = "0.19", default-features = false }
+bevy = { version = "0.20", default-features = false }
 log      = { version = "0.4" }
 # replication wire format (ADR-0013): postcard varint encoding, wasm-safe.
 serde    = { version = "1", default-features = false, features = ["derive", "alloc"] }
@@ -60,9 +60,9 @@ str0m       = { version = "0.24", default-features = false, features = ["rust-cr
 tungstenite = { version = "0.29" }          # blocking WS client for the str0m signaling thread
 tokio-tungstenite = { version = "0.29" }    # async WS client for the services signaling tests (ADR-0037)
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# wasm client glue. wasm-bindgen is pinned EXACTLY to match the flake's
-# wasm-bindgen-cli (0.2.121) — CLI and crate versions must agree.
-wasm-bindgen         = { version = "=0.2.121" }
+# wasm client glue. wasm-bindgen is pinned EXACTLY to the flake's wasm-bindgen-cli
+# (`wasm-bindgen-cli_0_2_129` in flake.nix): CLI and crate versions must agree.
+wasm-bindgen         = { version = "=0.2.129" }   # must equal the flake CLI (flake.nix asserts it)
 wasm-bindgen-futures = { version = "0.4" }
 web-sys              = { version = "0.3" }
 js-sys               = { version = "0.3" }   # Uint8Array <-> bytes for the browser IdbStore (ADR-0035)
