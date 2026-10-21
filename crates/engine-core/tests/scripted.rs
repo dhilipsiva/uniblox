@@ -250,3 +250,23 @@ fn marking_tolerates_an_entity_despawned_in_the_same_tick() {
     schedule.add_systems((despawn_unmarked, run_entity_scripts).chain_ignore_deferred());
     schedule.run(&mut world);
 }
+
+/// The frame budget is shared fairly: when it cannot cover every entity in one tick, the start
+/// rotates, so over a few ticks every entity runs.
+#[test]
+fn a_tight_frame_budget_still_reaches_every_entity_over_ticks() {
+    let limits = scripting::ScriptLimits {
+        frame_ops_budget: 60_000,
+        ..scripting::ScriptLimits::default()
+    };
+    let src = "fn update(a) { let i = 0; while i < 5000 { i += 1; } a.vx = 5.0; a }";
+    let mut world = world_with(Some(ScriptEngine::from_source_with(src, limits).unwrap()));
+    let entities: Vec<Entity> = (0..12).map(|_| spawn(&mut world, LOCAL, true)).collect();
+    for _ in 0..12 {
+        world.resource_mut::<engine_core::Tick>().0 += 1;
+        run(&mut world);
+    }
+    for e in entities {
+        assert_eq!(world.get::<Velocity>(e).unwrap().x, 5.0, "{e:?} never ran");
+    }
+}

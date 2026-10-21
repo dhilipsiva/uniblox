@@ -54,7 +54,7 @@ impl ScriptEngine {
         source_path: Option<PathBuf>,
         last_modified: Option<SystemTime>,
     ) -> Result<Self, ScriptError> {
-        let engine = build_engine();
+        let engine = sandbox_engine();
         let ast = engine.compile(src)?;
         let scope = Scope::new();
         let scope_template_len = scope.len();
@@ -134,8 +134,9 @@ impl ScriptEngine {
 }
 
 /// Build the locked-down raw engine: nothing by default, an explicit whitelist,
-/// every resource limit set, `eval` disabled. No eval / filesystem / network.
-fn build_engine() -> Engine {
+/// every resource limit set, `eval` disabled. No eval / filesystem / network. Public so a test can
+/// enumerate the exact whitelist (and a host can inspect it); scripts cannot reach it.
+pub fn sandbox_engine() -> Engine {
     let mut engine = Engine::new_raw();
 
     // Arrays are a bounded script data type; register just the array package so

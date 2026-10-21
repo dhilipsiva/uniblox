@@ -19,6 +19,6 @@ mod system;
 
 pub use agent::{Agent, register_agent};
 pub use component::{Health, register_api};
-pub use engine::ScriptEngine;
+pub use engine::{ScriptEngine, sandbox_engine};
 pub use error::ScriptError;
 pub use system::{hot_reload_system, insert_scripting, run_scripts};

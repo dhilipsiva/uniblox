@@ -1,0 +1,91 @@
+!=(array1: &mut array, array2: array) -> Result<bool, Box<EvalAltResult>>
++(array1: array, array2: array) -> Array
+-(_: f64) -> f64
+==(array1: &mut array, array2: array) -> Result<bool, Box<EvalAltResult>>
+all(array: &mut array, filter: Fn) -> Result<bool, Box<EvalAltResult>>
+all(array: &mut array, filter: string) -> Result<bool, Box<EvalAltResult>>
+append(array: &mut array, new_array: array)
+chop(array: &mut array, len: i64)
+clampi(_: i64, _: i64, _: i64) -> i64
+clear(array: &mut array)
+contains(array: &mut array, value: Dynamic) -> Result<bool, Box<EvalAltResult>>
+dedup(array: &mut array)
+dedup(array: &mut array, comparer: Fn)
+dedup(array: &mut array, comparer: string) -> Result<(), Box<EvalAltResult>>
+drain(array: &mut array, filter: Fn) -> Result<Array, Box<EvalAltResult>>
+drain(array: &mut array, filter: string) -> Result<Array, Box<EvalAltResult>>
+drain(array: &mut array, range: range) -> Array
+drain(array: &mut array, range: range=) -> Array
+drain(array: &mut array, start: i64, len: i64) -> Array
+extract(array: &mut array, range: range) -> Array
+extract(array: &mut array, range: range=) -> Array
+extract(array: &mut array, start: i64) -> Array
+extract(array: &mut array, start: i64, len: i64) -> Array
+filter(array: &mut array, filter: Fn) -> Result<Array, Box<EvalAltResult>>
+filter(array: &mut array, filter_func: string) -> Result<Array, Box<EvalAltResult>>
+find(array: &mut array, filter: Fn) -> Result<Dynamic, Box<EvalAltResult>>
+find(array: &mut array, filter: Fn, start: i64) -> Result<Dynamic, Box<EvalAltResult>>
+find_map(array: &mut array, filter: Fn) -> Result<Dynamic, Box<EvalAltResult>>
+find_map(array: &mut array, filter: Fn, start: i64) -> Result<Dynamic, Box<EvalAltResult>>
+for_each(array: &mut array, map: Fn) -> Result<(), Box<EvalAltResult>>
+get$contacts(_: &mut Agent) -> i64
+get$hp(_: &mut Health) -> i64
+get$is_empty(array: &mut array) -> bool
+get$len(array: &mut array) -> i64
+get$tick(_: &mut Agent) -> i64
+get$vx(_: &mut Agent) -> f64
+get$vy(_: &mut Agent) -> f64
+get$x(_: &mut Agent) -> f64
+get$y(_: &mut Agent) -> f64
+get(array: &mut array, index: i64) -> Dynamic
+index_of(array: &mut array, filter: Fn) -> Result<i64, Box<EvalAltResult>>
+index_of(array: &mut array, filter: Fn, start: i64) -> Result<i64, Box<EvalAltResult>>
+index_of(array: &mut array, filter: string) -> Result<i64, Box<EvalAltResult>>
+index_of(array: &mut array, filter: string, start: i64) -> Result<i64, Box<EvalAltResult>>
+index_of(array: &mut array, value: Dynamic) -> Result<i64, Box<EvalAltResult>>
+index_of(array: &mut array, value: Dynamic, start: i64) -> Result<i64, Box<EvalAltResult>>
+insert(array: &mut array, index: i64, item: Dynamic)
+is_empty(array: &mut array) -> bool
+len(array: &mut array) -> i64
+map(array: &mut array, map: Fn) -> Result<Array, Box<EvalAltResult>>
+map(array: &mut array, mapper: string) -> Result<Array, Box<EvalAltResult>>
+order(array: &mut array) -> Result<Array, Box<EvalAltResult>>
+order(array: &mut array, comparer: Fn) -> Result<Array, Box<EvalAltResult>>
+order_by(array: &mut array, comparer: Fn) -> Result<Array, Box<EvalAltResult>>
+order_desc(array: &mut array) -> Result<Array, Box<EvalAltResult>>
+pad(array: &mut array, len: i64, item: Dynamic) -> Result<(), Box<EvalAltResult>>
+pop(array: &mut array) -> Dynamic
+push(array: &mut array, item: Dynamic)
+reduce(array: &mut array, reducer: Fn) -> Result<Dynamic, Box<EvalAltResult>>
+reduce(array: &mut array, reducer: Fn, initial: Dynamic) -> Result<Dynamic, Box<EvalAltResult>>
+reduce(array: &mut array, reducer: string) -> Result<Dynamic, Box<EvalAltResult>>
+reduce(array: &mut array, reducer: string, initial: Dynamic) -> Result<Dynamic, Box<EvalAltResult>>
+reduce_rev(array: &mut array, reducer: Fn) -> Result<Dynamic, Box<EvalAltResult>>
+reduce_rev(array: &mut array, reducer: Fn, initial: Dynamic) -> Result<Dynamic, Box<EvalAltResult>>
+reduce_rev(array: &mut array, reducer: string) -> Result<Dynamic, Box<EvalAltResult>>
+reduce_rev(array: &mut array, reducer: string, initial: Dynamic) -> Result<Dynamic, Box<EvalAltResult>>
+remove(array: &mut array, index: i64) -> Dynamic
+retain(array: &mut array, filter: Fn) -> Result<Array, Box<EvalAltResult>>
+retain(array: &mut array, filter: string) -> Result<Array, Box<EvalAltResult>>
+retain(array: &mut array, range: range) -> Array
+retain(array: &mut array, range: range=) -> Array
+retain(array: &mut array, start: i64, len: i64) -> Array
+reverse(array: &mut array)
+set$hp(_: &mut Health, _: i64)
+set$vx(_: &mut Agent, _: f64)
+set$vy(_: &mut Agent, _: f64)
+set(array: &mut array, index: i64, value: Dynamic)
+shift(array: &mut array) -> Dynamic
+some(array: &mut array, filter: Fn) -> Result<bool, Box<EvalAltResult>>
+some(array: &mut array, filter: string) -> Result<bool, Box<EvalAltResult>>
+sort(array: &mut array) -> Result<(), Box<EvalAltResult>>
+sort(array: &mut array, comparer: Fn) -> Result<(), Box<EvalAltResult>>
+sort(array: &mut array, comparer: string) -> Result<(), Box<EvalAltResult>>
+sort_by(array: &mut array, comparer: Fn) -> Result<(), Box<EvalAltResult>>
+sort_desc(array: &mut array) -> Result<(), Box<EvalAltResult>>
+splice(array: &mut array, range: range, replace: array)
+splice(array: &mut array, range: range=, replace: array)
+splice(array: &mut array, start: i64, len: i64, replace: array)
+split(array: &mut array, index: i64) -> Array
+truncate(array: &mut array, len: i64)
+zip(array1: &mut array, array2: array, map: Fn) -> Result<Array, Box<EvalAltResult>>

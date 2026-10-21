@@ -14,8 +14,10 @@ bevy_ecs.workspace = true
 log.workspace = true
 
 [dev-dependencies]
-# integration tests (tests/) are separate crates — they need rhai/bevy_ecs directly.
-rhai.workspace = true
+# integration tests (tests/) are separate crates — they need rhai/bevy_ecs directly. `metadata` (tests
+# only; resolver 3 keeps dev-dependency features out of normal builds) lets the API-lock test enumerate
+# the whitelist.
+rhai = { workspace = true, features = ["metadata"] }
 bevy_ecs.workspace = true
 tempfile.workspace = true
 filetime.workspace = true
