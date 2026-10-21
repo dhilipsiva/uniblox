@@ -142,10 +142,14 @@ fn a_rank_cannot_jump_to_the_top() {
         )
     };
     for far in [TOP - 1, (1 << 32) + 1] {
-        coord.repl.apply_events(&mut coord.world, owner.id, &transfer(far));
+        coord
+            .repl
+            .apply_events(&mut coord.world, owner.id, &transfer(far));
         assert_eq!(coord.owner(), owner.id, "a jump to {far} is refused");
     }
-    coord.repl.apply_events(&mut coord.world, owner.id, &transfer(1));
+    coord
+        .repl
+        .apply_events(&mut coord.world, owner.id, &transfer(1));
     assert_eq!(coord.owner(), PeerId(6), "an honest next rank applies");
     // The coordinator then mints normally: a claim commits at the next rank.
     let claimant = PeerId(5);
@@ -161,7 +165,10 @@ fn a_rank_cannot_jump_to_the_top() {
     assert!(
         minted.iter().any(|e| matches!(
             e,
-            NetEvent::OwnershipCommit { seq: OwnerSeq { seq: 2, .. }, .. }
+            NetEvent::OwnershipCommit {
+                seq: OwnerSeq { seq: 2, .. },
+                ..
+            }
         )),
         "{minted:?}"
     );
@@ -192,7 +199,11 @@ fn an_orphan_resync_at_an_implausible_rank_is_refused() {
     );
     b.repl.apply_events(&mut b.world, m, &resync);
     let mut q = b.world.query::<&Owner>();
-    assert_eq!(q.iter(&b.world).count(), 0, "no phantom proxy at an implausible rank");
+    assert_eq!(
+        q.iter(&b.world).count(),
+        0,
+        "no phantom proxy at an implausible rank"
+    );
 }
 
 /// The coordinator honours a `TransferRequest` only from the entity's current owner (the rule the

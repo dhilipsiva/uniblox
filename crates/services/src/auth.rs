@@ -90,6 +90,11 @@ impl JoinTokenKey {
 
     /// Check `token` for `room` at time `now` (unix seconds).
     pub fn verify(&self, token: &str, room: &str, now: u64) -> Result<(), TokenError> {
+        self.verify_expiry(token, room, now).map(|_| ())
+    }
+
+    /// [`Self::verify`], returning the token's expiry (unix seconds).
+    pub fn verify_expiry(&self, token: &str, room: &str, now: u64) -> Result<u64, TokenError> {
         let mut parts = token.split('.');
         let (Some(VERSION), Some(expires), Some(tag), None) =
             (parts.next(), parts.next(), parts.next(), parts.next())
@@ -114,7 +119,7 @@ impl JoinTokenKey {
         if expires - now > MAX_TOKEN_LIFETIME_SECS {
             return Err(TokenError::TooLong);
         }
-        Ok(())
+        Ok(expires)
     }
 }
 

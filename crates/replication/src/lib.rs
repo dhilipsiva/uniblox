@@ -90,6 +90,16 @@ pub const SIGNATURE_BYTES: usize = SIG_KEY_BYTES + 64;
 /// no forged rank can make the next mint overflow (ADR-0049 audit).
 const RANK_CEILING: u64 = u64::MAX;
 
+/// The furthest one owner change may move a rank. Honest ranks climb by one per change, so a jump
+/// this large is forged; refusing it keeps a forger from parking an entity at the top of the range,
+/// where no honest rank could follow (it would take 2^32 accepted forgeries to get there).
+const MAX_RANK_JUMP: u64 = 1 << 32;
+
+/// Whether `seq` is a plausible successor of the held rank `held` (at most [`MAX_RANK_JUMP`] above).
+fn plausible_rank(held: u64, seq: u64) -> bool {
+    seq <= held.saturating_add(MAX_RANK_JUMP)
+}
+
 /// The rank after `seq` that `minter` mints, or `None` at the ceiling.
 fn next_rank(seq: u64, minter: PeerId) -> Option<OwnerSeq> {
     seq.checked_add(1)
@@ -1290,7 +1300,8 @@ impl Replication {
                         if current != from {
                             // Owner-change heal — rank-gated.
                             let rec_seq = self.map.by_entity.get(&proxy).map(|r| r.owner_seq);
-                            if !matches!(rec_seq, Some(rs) if seq >= rs) {
+                            if !matches!(rec_seq, Some(rs) if seq >= rs && plausible_rank(rs.seq, seq.seq))
+                            {
                                 log::warn!(
                                     "stale resync for {id:?} (rank {seq:?} < {rec_seq:?}) — dropped"
                                 );
@@ -1328,6 +1339,14 @@ impl Replication {
                         // which always heals a real proxy via the correct-branch
                         // above). Only the correct-branch may touch our-namespace ids.
                         if id.spawner == local {
+                            return;
+                        }
+                        // An orphan is born at `{0, spawner}`: its asserted rank must be a plausible
+                        // successor of that.
+                        if !plausible_rank(0, seq.seq) {
+                            log::warn!(
+                                "orphan resync for {id:?} at implausible rank {seq:?} — dropped"
+                            );
                             return;
                         }
                         // Orphan: create the proxy owned by `from` at the asserted
@@ -1413,7 +1432,9 @@ impl Replication {
                     return;
                 }
                 // Only the current owner may hand an entity off (the sender side's rule, enforced
-                // here too). The coordinator mints every Mode-2 owner change, so its view is current.
+                // here too). The coordinator mints most Mode-2 owner changes, so its view is usually
+                // current; when it lags (a host migration not yet seen, a mechanic's direct
+                // transfer) an honest request is dropped and the owner may simply ask again.
                 let owner = self
                     .map
                     .by_id
@@ -1451,7 +1472,7 @@ impl Replication {
         let Some(rec_seq) = self.map.by_entity.get(&proxy).map(|r| r.owner_seq) else {
             return false;
         };
-        if seq <= rec_seq {
+        if seq <= rec_seq || !plausible_rank(rec_seq.seq, seq.seq) {
             return false;
         }
         if let Some(mut owner) = world.get_mut::<Owner>(proxy) {

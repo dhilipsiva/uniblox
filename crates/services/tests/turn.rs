@@ -92,9 +92,10 @@ async fn an_unauthenticated_request_gets_no_credential() {
 #[tokio::test]
 async fn an_authenticated_client_gets_a_time_limited_credential() {
     let addr = boot(configured()).await;
+    // A token that outlives the TURN TTL, so the TTL is what bounds the credential.
     let token = JoinTokenKey::new(SECRET)
         .unwrap()
-        .mint(ROOM, unix_now() + 60);
+        .mint(ROOM, unix_now() + 3600);
     let (status, headers, body) =
         get(addr, &format!("{TURN_PATH}?room={ROOM}&token={token}")).await;
     assert_eq!(status, 200, "{body}");
@@ -134,12 +135,24 @@ async fn a_credential_is_bound_to_its_token() {
     let first = fetch(token.clone()).await;
     let username = first["username"].as_str().unwrap().to_string();
     let (expiry, label) = username.split_once(':').unwrap();
-    assert!(expiry.parse::<u64>().unwrap() <= token_expiry, "capped at the token's expiry");
+    assert!(
+        expiry.parse::<u64>().unwrap() <= token_expiry,
+        "capped at the token's expiry"
+    );
     assert!(first["ttl"].as_u64().unwrap() <= 60);
     let again = fetch(token.clone()).await;
-    assert_eq!(again["username"], first["username"], "the same token, the same username");
+    assert_eq!(
+        again["username"], first["username"],
+        "the same token, the same username"
+    );
     let other = fetch(key.mint(ROOM, unix_now() + 61)).await;
-    let other_label = other["username"].as_str().unwrap().split_once(':').unwrap().1.to_string();
+    let other_label = other["username"]
+        .as_str()
+        .unwrap()
+        .split_once(':')
+        .unwrap()
+        .1
+        .to_string();
     assert_ne!(other_label, label, "another token, another username");
 }
 
@@ -148,7 +161,10 @@ async fn turn_refusals_carry_cors() {
     let addr = boot(configured()).await;
     let (status, headers, _) = get(addr, &format!("{TURN_PATH}?room={ROOM}")).await;
     assert_eq!(status, 401);
-    assert!(headers.contains("access-control-allow-origin: *"), "{headers}");
+    assert!(
+        headers.contains("access-control-allow-origin: *"),
+        "{headers}"
+    );
 }
 
 #[tokio::test]

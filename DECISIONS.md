@@ -1866,12 +1866,18 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
     a larger one closes the connection;
   - a connection that sends no complete message for [60 s] is closed (matchbox clients send a keep-alive every
     10 s);
-  - frames per connection, a token bucket [burst 1,024, 100/s], sized for a newcomer answering a full session;
-    a frame over it is dropped. After [256] drops (net of the frames delivered since) the connection is closed;
-  - each peer's outbound queue [1,024 messages, 1 MiB] and WebSocket write buffer [1 MiB]. A message to a full
-    queue is dropped and charged to its SENDER's drop count, so a flooder is closed and its victim stays: a
-    receiver's queue is something any sender can fill. A peer that does not read is found by its writer
-    instead: no write progress for [10 s] disconnects it;
+  - frames per connection, a token bucket [burst 1,024, 100/s], sized for a newcomer answering a full session.
+    A frame over it is dropped and counted; so is a signal its receiver's queue cannot take, or whose relayed
+    form would exceed the size cap (re-encoding can grow it). Only a signal that is delivered earns one drop
+    back; keep-alives and other frames earn nothing. After [256] drops the connection is closed;
+  - each peer's outbound queue [1,024 messages, 1 MiB] and WebSocket write buffer [1 MiB]:
+    - one sending peer may hold at most a quarter of a receiver's queue;
+    - signals leave an eighth free for control events (`IdAssigned`, `NewPeer`, `PeerLeft`), so a flooded peer
+      still learns who comes and goes;
+    - a signal that does not fit is dropped and charged to its SENDER, never to the receiver, whose queue any
+      sender can fill;
+    - a peer that does not read is found by its writer instead: a message (at most the size cap, so a reader
+      slower than about 3 KB/s) not taken within [10 s] disconnects it;
   - peers per session [64]: the gate refuses a full unbounded session with `503`, and `?next` above the cap
     with `400`; `join_local` enforces the cap again against a race. A signal to oneself is dropped.
 - **Also fixed:**
@@ -1900,14 +1906,19 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   filled, which the sender controls. Any member could evict any other. Now the overflow is charged to the
   sender, non-readers are found by writer stall, and the queue is bounded in bytes too. Operators behind NAT-heavy
   networks can raise the per-IP caps (`UNIBLOX_MAX_CONNECTIONS_PER_IP`, `UNIBLOX_CONNECTS_BURST`).
+
+  A final review found that keep-alives earned a flooder its drops back (so it was never closed) and that a
+  full queue starved the victim of `NewPeer`/`PeerLeft`. It also measured 3.8x growth when a signal is
+  re-encoded. Now only delivered signals earn a drop back, each sender has a share, control events have a
+  reserve, and the relayed size is capped.
 - **Known limits:**
   - the per-IP limits are per node, not shared through the Redis registry;
   - a client that rotates through many IPv6 /64s or IPv4 addresses gets a bucket and 16 connections for
     each, and clients behind one NAT share theirs;
-  - while a flooder fills a victim's queue (before it is closed), other senders' messages to that victim are
-    dropped too;
-  - a client may stay within twice the sustained frame rate indefinitely: the drop count is net of what it
-    delivers;
+  - several cooperating flooders (four or more, each with its own share) can still fill a victim's signal
+    capacity until their drop counts close them; control events keep their reserve;
+  - a reader that takes each message within the stall timeout is never disconnected, however slowly it
+    drains overall; its memory stays within the queue and write-buffer bounds;
   - the browser client does not fetch tokens yet (its demo room URL is compiled in), so `just browser-e2e`
     runs the open development server. The client's join through the scoped service, with a token from the
     endpoint, is follow-up work.
@@ -1993,14 +2004,17 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   - the top rank (`u64::MAX`) is reserved: refused on receipt and never minted. A forged rank can no longer
     overflow the coordinator's next mint, which was a panic in debug builds and a silent wrap that locked the
     entity in release;
+  - no owner change may move a rank more than 2^32 above the one held (an orphan resync: above its birth
+    rank). Honest ranks climb by one, and parking an entity at the top, where no honest rank can follow, now
+    takes 2^32 accepted forgeries;
   - the coordinator honours a `TransferRequest` only from the entity's current owner;
-  - `LocalPeer` is re-read by every method that has the world, so a host may insert it after
+  - `LocalPeer` is re-read by every method that signs and has the world, so a host may insert it after
     `Replication::new`.
 - **What this does not do:** it authenticates events; it does not authorize them. Concretely, a malicious peer
   can still:
   - mint a higher rank in its own name and take any entity. In Mode 3 this includes the server's own entities:
     the Transfer and Commit arms have no own-authority guard;
-  - lock an entity by minting the highest accepted rank, so no honest rank can follow;
+  - push an entity's rank up by up to 2^32 per forged change;
   - re-anchor an entity it claims with a `ResyncSpawn` at a rank no lower than the receiver's, or create a
     phantom proxy for any third-party id it is not yet known by, which also blocks that id's later Spawn;
   - claim any entity: claims are open by design, and the lowest-id claimant wins;
@@ -2071,14 +2085,22 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   - a bad room gets `400`;
   - the endpoint is off (`404`) without TURN or a signaling key.
   
-  The answer is `{urls, username, credential, ttl}`, with `Cache-Control: no-store` and the same per-IP rate
-  limit as the other endpoints. The binary reads `UNIBLOX_TURN_SECRET`, `UNIBLOX_TURN_URLS` and
-  `UNIBLOX_TURN_TTL_SECS` (default an hour, at most a day). It refuses to start with TURN but no signaling
-  secret.
+  The answer is `{urls, username, credential, ttl}`, with `Cache-Control: no-store`, CORS on refusals too, and
+  the same per-IP rate limit as the other endpoints.
+  - A credential never outlives the join token that admitted it.
+  - Its label is derived from the token (a hash), so one token is one coturn user: redeeming it again yields
+    the same username, and coturn's per-user quota binds per token.
+  - The binary reads `UNIBLOX_TURN_SECRET` (at least 32 bytes, since a credential allows an offline guess at a
+    weak secret), `UNIBLOX_TURN_URLS` (`turn:`, `turns:` or `stun:` only) and `UNIBLOX_TURN_TTL_SECS`
+    (default an hour, at most a day).
+  - It refuses to start with TURN but no signaling secret.
+  - It also refuses TURN together with the open token endpoint (`UNIBLOX_ISSUE_TOKENS`, which admits anyone,
+    making TURN an open relay) unless the operator sets `UNIBLOX_TURN_FOR_OPEN_TOKENS=1`.
 - **Known limits:**
   - a credential is a bearer credential until it expires: whoever holds it can relay through the TURN server.
-    Quotas per user or session are coturn's own settings (`user-quota`, `total-quota`, bandwidth caps), and the
-    operator sets them;
+    Quotas are coturn's own settings (`user-quota` per token, `total-quota`, bandwidth caps), and the operator
+    sets them. With the open token endpoint (opted into), anyone can get credentials within the per-IP rate
+    limit, and those quotas are the only bound;
   - the browser client does not request credentials yet: the client's join path is follow-up work, as for join
     tokens;
   - "paid-only" returns as an entitlement check in this endpoint if a billing path (D10 = B) is ever taken.

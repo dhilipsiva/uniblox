@@ -18,6 +18,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use futures::{SinkExt, StreamExt};
 use matchbox_protocol::{JsonPeerEvent, JsonPeerRequest, PeerId};
+use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, mpsc};
 use uuid::Uuid;
 
@@ -32,14 +33,48 @@ use crate::{
 /// How long a closing peer's writer may take to flush before it is cut off.
 const WRITER_GRACE: Duration = Duration::from_secs(1);
 
-/// One peer's outbound side: a queue to its socket writer, bounded in messages and in bytes. Cheap to
+/// One message on its way to a peer, with what it counts against.
+pub(crate) struct Outbound {
+    msg: Message,
+    len: usize,
+    /// The peer whose signal this is (it holds a share of the queue); `None` for a control event.
+    from: Option<PeerId>,
+}
+
+/// A peer's outbound accounting, shared by its senders and its writer.
+#[derive(Default)]
+struct Budget {
+    /// Bytes queued and not yet written.
+    bytes: AtomicUsize,
+    /// Messages queued per sending peer (their share of this queue).
+    per_sender: Mutex<HashMap<PeerId, usize>>,
+}
+
+impl Budget {
+    /// The writer wrote (or dropped) `out`: release what it held.
+    fn release(&self, out: &Outbound) {
+        self.bytes.fetch_sub(out.len, Ordering::Relaxed);
+        if let Some(from) = out.from
+            && let Ok(mut shares) = self.per_sender.lock()
+            && let Some(n) = shares.get_mut(&from)
+        {
+            *n -= 1;
+            if *n == 0 {
+                shares.remove(&from);
+            }
+        }
+    }
+}
+
+/// One peer's outbound side: a queue to its socket writer, bounded in messages and in bytes, with
+/// room kept for control events (`NewPeer`, `PeerLeft`) and a share per sending peer. Cheap to
 /// clone; the registry holds one per session member.
 #[derive(Clone)]
 pub(crate) struct PeerTx {
-    tx: mpsc::Sender<Message>,
-    /// Bytes queued and not yet written, shared with the writer.
-    queued: Arc<AtomicUsize>,
+    tx: mpsc::Sender<Outbound>,
+    budget: Arc<Budget>,
     max_bytes: usize,
+    max_msgs: usize,
 }
 
 /// A message's size against the byte budget.
@@ -54,32 +89,63 @@ fn msg_len(msg: &Message) -> usize {
 impl PeerTx {
     /// A handle whose queue nothing drains (unit tests of the registry).
     #[cfg(test)]
-    pub(crate) fn detached() -> (Self, mpsc::Receiver<Message>) {
+    pub(crate) fn detached() -> (Self, mpsc::Receiver<Outbound>) {
         let (tx, rx) = mpsc::channel(1);
         (
             Self {
                 tx,
-                queued: Arc::default(),
+                budget: Arc::default(),
                 max_bytes: usize::MAX,
+                max_msgs: 1,
             },
             rx,
         )
     }
 
-    /// Queue `msg` for the peer; whether it was queued. A full queue drops the message: the SENDER
-    /// is charged for it (the relay counts it against the sender's abuse budget), never the
-    /// receiver, whose queue a sender can fill at will. A receiver that does not read is found by
-    /// its writer stalling instead.
-    pub(crate) fn send(&self, msg: Message) -> bool {
+    fn enqueue(&self, msg: Message, from: Option<PeerId>, byte_cap: usize) -> bool {
         let len = msg_len(&msg);
-        if self.queued.fetch_add(len, Ordering::Relaxed) + len > self.max_bytes {
-            self.queued.fetch_sub(len, Ordering::Relaxed);
+        if self.budget.bytes.fetch_add(len, Ordering::Relaxed) + len > byte_cap {
+            self.budget.bytes.fetch_sub(len, Ordering::Relaxed);
             return false;
         }
-        if self.tx.try_send(msg).is_err() {
-            self.queued.fetch_sub(len, Ordering::Relaxed);
+        if self.tx.try_send(Outbound { msg, len, from }).is_err() {
+            self.budget.bytes.fetch_sub(len, Ordering::Relaxed);
             return false;
         }
+        true
+    }
+
+    /// Queue a control event (`IdAssigned`, `NewPeer`, `PeerLeft`): it may use the whole queue,
+    /// including the room signals cannot take, so a flooded peer still learns who comes and goes.
+    pub(crate) fn send_control(&self, msg: Message) -> bool {
+        self.enqueue(msg, None, self.max_bytes)
+    }
+
+    /// Queue `from`'s signal; whether it was queued. It is dropped when `from` already holds its share
+    /// (a quarter of the queue) or when only the control reserve (an eighth) is left. The relay
+    /// charges a dropped signal to its SENDER, never to this receiver, whose queue a sender can fill
+    /// at will; a receiver that does not read is found by its writer stalling instead.
+    pub(crate) fn send_signal(&self, from: PeerId, msg: Message) -> bool {
+        let share = (self.max_msgs / 4).max(1);
+        let reserve = (self.max_msgs / 8).max(1);
+        if self.tx.capacity() <= reserve {
+            return false;
+        }
+        let Ok(mut shares) = self.budget.per_sender.lock() else {
+            return false;
+        };
+        let held = shares.entry(from).or_insert(0);
+        if *held >= share {
+            return false;
+        }
+        let byte_cap = self.max_bytes - self.max_bytes / 8;
+        if !self.enqueue(msg, Some(from), byte_cap) {
+            if *held == 0 {
+                shares.remove(&from);
+            }
+            return false;
+        }
+        *held += 1;
         true
     }
 }
@@ -91,7 +157,7 @@ pub(crate) fn broadcast(peers: &[PeerTx], event: &JsonPeerEvent) {
     }
     let text = event.to_string();
     for peer in peers {
-        let _ = peer.send(Message::Text(text.clone().into()));
+        let _ = peer.send_control(Message::Text(text.clone().into()));
     }
 }
 
@@ -293,13 +359,19 @@ impl Shared {
         let Some(token) = query.get(TOKEN_PARAM) else {
             return unauthorized("missing join token");
         };
-        if let Err(err) = key.verify(token, room, unix_now()) {
-            return unauthorized(err);
-        }
-        let ttl = turn.ttl.as_secs().clamp(1, MAX_TURN_TTL_SECS);
-        // A fresh label per credential: coturn needs no state, and two clients never share one.
-        let label = Uuid::new_v4().simple().to_string();
-        let credential = turn_credential(&turn.secret, &label, unix_now() + ttl);
+        let now = unix_now();
+        let token_expiry = match key.verify_expiry(token, room, now) {
+            Ok(expiry) => expiry,
+            Err(err) => return unauthorized(err),
+        };
+        // Never outlive the token that admitted the client.
+        let expiry = (now + turn.ttl.as_secs().clamp(1, MAX_TURN_TTL_SECS)).min(token_expiry);
+        let ttl = expiry.saturating_sub(now);
+        // The label is derived from the token: one token is one coturn user, so coturn's per-user
+        // quota binds per token, and redeeming a token again yields the same username.
+        let digest = Sha256::digest(token.as_bytes());
+        let label: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
+        let credential = turn_credential(&turn.secret, &label, expiry);
         let body = serde_json::json!({
             "urls": turn.urls,
             "username": credential.username,
@@ -384,17 +456,18 @@ async fn run_peer(s: Arc<Shared>, socket: WebSocket, room: String, admit: Admit)
     let limits = s.limits;
     let peer = PeerId(Uuid::new_v4());
     let (mut sink, mut stream) = socket.split();
-    let (tx, mut rx) = mpsc::channel::<Message>(limits.max_outbound_queue.max(1));
-    let queued = Arc::new(AtomicUsize::new(0));
+    let max_msgs = limits.max_outbound_queue.max(1);
+    let (tx, mut rx) = mpsc::channel::<Outbound>(max_msgs);
+    let budget = Arc::new(Budget::default());
     let kill = Arc::new(Notify::new());
     let writer_kill = Arc::clone(&kill);
-    let writer_queued = Arc::clone(&queued);
+    let writer_budget = Arc::clone(&budget);
     let stall = limits.writer_stall_timeout;
     let mut writer = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            let len = msg_len(&msg);
+        while let Some(mut out) = rx.recv().await {
+            let msg = std::mem::replace(&mut out.msg, Message::Close(None));
             let sent = tokio::time::timeout(stall, sink.send(msg)).await;
-            writer_queued.fetch_sub(len, Ordering::Relaxed);
+            writer_budget.release(&out);
             match sent {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => break,
@@ -411,10 +484,11 @@ async fn run_peer(s: Arc<Shared>, socket: WebSocket, room: String, admit: Admit)
     });
     let me = PeerTx {
         tx,
-        queued,
+        budget,
         max_bytes: limits.max_outbound_bytes,
+        max_msgs,
     };
-    let _ = me.send(Message::Text(
+    let _ = me.send_control(Message::Text(
         JsonPeerEvent::IdAssigned(peer).to_string().into(),
     ));
 
@@ -485,8 +559,10 @@ async fn relay(
             }
             continue;
         }
-        // Whether this frame was dropped for a full receiver queue; only a frame that was not earns
-        // back one drop (a drop must never be cancelled by its own frame).
+        // A relayed signal either reached its receiver's queue (earning back one drop) or overflowed it
+        // (charged as a drop). Every other frame (a keep-alive, a malformed one, a signal to oneself or
+        // to no one) does neither: only delivering earns a drop back.
+        let mut delivered = false;
         let mut overflowed = false;
         match msg {
             Message::Text(text) => match text.as_str().parse::<JsonPeerRequest>() {
@@ -494,9 +570,15 @@ async fn relay(
                     if receiver != peer
                         && let Some(target) = s.registry.target(peer, receiver)
                     {
-                        let event = JsonPeerEvent::Signal { sender: peer, data };
-                        // A full receiver queue is the sender's cost, not the receiver's.
-                        overflowed = !target.send(Message::Text(event.to_string().into()));
+                        let event = JsonPeerEvent::Signal { sender: peer, data }.to_string();
+                        // Re-encoding can grow a signal (number formatting); never relay past the cap.
+                        if event.len() > limits.max_signal_bytes
+                            || !target.send_signal(peer, Message::Text(event.into()))
+                        {
+                            overflowed = true;
+                        } else {
+                            delivered = true;
+                        }
                     }
                     // A signal to oneself, or to an unknown or cross-session receiver, silently
                     // drops: the isolation boundary.
@@ -508,12 +590,10 @@ async fn relay(
         }
         if overflowed {
             if charge(&mut dropped) {
-                tracing::warn!(
-                    "closing signaling peer {peer:?}: it overflows another peer's queue"
-                );
+                tracing::warn!("closing signaling peer {peer:?}: it overflows other peers' queues");
                 return;
             }
-        } else {
+        } else if delivered {
             dropped = dropped.saturating_sub(1);
         }
     }

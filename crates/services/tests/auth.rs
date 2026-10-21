@@ -596,11 +596,15 @@ async fn keepalives_do_not_save_a_flooder() {
     let payload = "k".repeat(16 * 1024);
     let keepalive = Message::text(JsonPeerRequest::KeepAlive.to_string());
     for _ in 0..2000 {
-        if a.send(signal(b_id, &payload)).await.is_err() || a.send(keepalive.clone()).await.is_err() {
+        if a.send(signal(b_id, &payload)).await.is_err() || a.send(keepalive.clone()).await.is_err()
+        {
             break;
         }
     }
-    assert!(closed_by_server(&mut a, Duration::from_secs(5)).await, "the flooder is closed");
+    assert!(
+        closed_by_server(&mut a, Duration::from_secs(5)).await,
+        "the flooder is closed"
+    );
 }
 
 /// A flooded peer still learns who joins: control events have capacity a sender cannot take.
@@ -701,12 +705,19 @@ async fn a_signal_that_grows_past_the_cap_is_not_relayed() {
     .to_string();
     let numbers = vec!["9e15"; 2500].join(",");
     let grows = template.replacen("\"X\"", &format!("[{numbers}]"), 1);
-    assert!(grows.len() < 16 * 1024, "the request itself is under the cap");
+    assert!(
+        grows.len() < 16 * 1024,
+        "the request itself is under the cap"
+    );
     a.send(Message::text(grows)).await.unwrap();
     a.send(signal(b_id, "small")).await.unwrap();
     match next_event(&mut b).await {
         JsonPeerEvent::Signal { data, .. } => {
-            assert_eq!(data, serde_json::json!({ "Offer": "small" }), "the grown one was dropped");
+            assert_eq!(
+                data,
+                serde_json::json!({ "Offer": "small" }),
+                "the grown one was dropped"
+            );
         }
         other => panic!("expected the small signal, got {other:?}"),
     }

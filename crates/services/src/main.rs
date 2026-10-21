@@ -20,7 +20,9 @@
 //! TURN (ADR-0050): with `UNIBLOX_TURN_SECRET` (coturn's `static-auth-secret`) and `UNIBLOX_TURN_URLS`
 //! (comma-separated `turn:` URLs), `GET /_uniblox/turn?room=<room>&token=<join token>` hands a client
 //! with a valid join token a credential valid for `UNIBLOX_TURN_TTL_SECS` (default 3600, at most a
-//! day). It needs the signaling secret.
+//! day, and never past the join token's expiry). It needs the signaling secret (32 bytes or more, as
+//! does the TURN secret). Combined with `UNIBLOX_ISSUE_TOKENS=1` TURN is open to anyone, so the
+//! binary refuses it unless `UNIBLOX_TURN_FOR_OPEN_TOKENS=1`.
 //!
 //! Clients behind one NAT share the per-IP limits; `UNIBLOX_MAX_CONNECTIONS_PER_IP` (default 16) and
 //! `UNIBLOX_CONNECTS_BURST` (default 30) raise them for large groups.
@@ -36,9 +38,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use services::{
-    ClientIp, JoinTokenKey, MAX_TOKEN_LIFETIME_SECS, MAX_TURN_TTL_SECS, RedisRegistryStore,
-    SessionRegistry, SignalingConfig, SignalingLimits, TurnConfig, build_signaling_server_with,
-    unix_now, validate_room,
+    ClientIp, JoinTokenKey, MAX_TOKEN_LIFETIME_SECS, MAX_TURN_TTL_SECS, MIN_KEY_BYTES,
+    RedisRegistryStore, SessionRegistry, SignalingConfig, SignalingLimits, TurnConfig,
+    build_signaling_server_with, unix_now, validate_room,
 };
 
 /// matchbox's conventional signaling port.
@@ -78,8 +80,9 @@ fn env_number<T: std::str::FromStr + Default + PartialEq>(name: &str) -> Option<
 /// with the reason. `None` without a TURN secret.
 fn turn_from_env() -> Option<TurnConfig> {
     let secret = std::env::var_os("UNIBLOX_TURN_SECRET")?;
-    if secret.is_empty() {
-        eprintln!("[signaling] UNIBLOX_TURN_SECRET is empty");
+    if secret.len() < MIN_KEY_BYTES {
+        // Anyone holding one credential can guess a weak shared secret offline.
+        eprintln!("[signaling] UNIBLOX_TURN_SECRET must be at least {MIN_KEY_BYTES} bytes");
         std::process::exit(2);
     }
     let urls: Vec<String> = std::env::var("UNIBLOX_TURN_URLS")
@@ -93,6 +96,14 @@ fn turn_from_env() -> Option<TurnConfig> {
         eprintln!(
             "[signaling] UNIBLOX_TURN_SECRET needs UNIBLOX_TURN_URLS (comma-separated turn: URLs)"
         );
+        std::process::exit(2);
+    }
+    if let Some(bad) = urls.iter().find(|u| {
+        !["turn:", "turns:", "stun:"]
+            .iter()
+            .any(|s| u.starts_with(s))
+    }) {
+        eprintln!("[signaling] UNIBLOX_TURN_URLS: {bad:?} is not a turn:, turns: or stun: URL");
         std::process::exit(2);
     }
     let ttl = match std::env::var("UNIBLOX_TURN_TTL_SECS")
@@ -192,6 +203,14 @@ async fn main() {
         },
     };
     let turn = turn_from_env();
+    if turn.is_some() && issue_tokens && !flag("UNIBLOX_TURN_FOR_OPEN_TOKENS") {
+        // The open token endpoint admits anyone, so TURN behind it is an open relay.
+        eprintln!(
+            "[signaling] TURN with UNIBLOX_ISSUE_TOKENS=1 is an open relay (anyone can get a token); \
+             set UNIBLOX_TURN_FOR_OPEN_TOKENS=1 to accept that (and cap it with coturn's quotas)"
+        );
+        std::process::exit(2);
+    }
     if turn.is_some() && auth.is_none() {
         eprintln!(
             "[signaling] UNIBLOX_TURN_SECRET needs UNIBLOX_SIGNALING_SECRET (credentials go to authenticated clients only)"
