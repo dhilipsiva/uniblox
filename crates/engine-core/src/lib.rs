@@ -372,7 +372,8 @@ pub fn run_entity_scripts(
         return;
     };
     for e in &unmarked {
-        commands.entity(e).insert(Scripted);
+        // `try_insert`: the entity may be despawned before the command applies.
+        commands.entity(e).try_insert(Scripted);
     }
     for (owner, pos, mut vel, contacts) in &mut q {
         if authority_of(owner.0, local.0) != Authority::Local {

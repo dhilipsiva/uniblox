@@ -1723,5 +1723,24 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   infinity and made the quantizer panic in debug builds, and `load_bundle_dir` followed symlinks out of the
   bundle and blocked on a FIFO. Three LOW findings: Windows device names, player avatars outside Mode 3 not
   excluded, and a mode proof that could not see a script running on a receiver. Regression tests came first
-  (751d7eb), then the fixes described above.
+  (751d7eb), then the fixes described above. A re-review of the fix delta (SOUND WITH NOTES) confirmed all three
+  closed and found:
+  - a regression: a bare relative manifest path no longer loaded;
+  - more Windows names: COM0, LPT0, the superscript-digit forms, CONIN$ and CONOUT$, a space before the
+    extension;
+  - a latent panic: marking an entity despawned in the same tick.
+  2c30cdd holds tests for those three, and the next commit fixes them: an empty parent is read as `.`, the
+  extra names are rejected, the marking uses `try_insert`, and the opened handle is re-checked to be a
+  regular file. Recorded, not fixed:
+  - A hard link to an outside file is read; its bytes must still match the listed id.
+  - A writer racing the loader inside the bundle directory could still swap in a FIFO between the checks
+    and `open`, which is outside this local loader's threat model.
+  - There is no total cap across assets (Phase 12).
+  - The opt-out markers (`Unscripted`, `Controlled`, `ControlledBy`) are local, so a player avatar handed
+    off or migrated in Mode 2 would be scripted on its new owner. No live path does that yet; it needs
+    a wire-level control marker when Mode-2 avatars exist.
+  - The clamp also caps a scripted entity's velocity the script did not change.
+  - The server tests in 751d7eb did not compile, because of a borrow error in the handoff test that
+    51e9711 fixed, so they never failed for the reason they claim. The engine-core and protocol tests
+    did fail as intended.
 - **Status:** Proposed (2026-10-21) on branch `todo/P4-UNIBLOX-03`; accepted when merged.

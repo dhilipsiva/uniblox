@@ -106,21 +106,37 @@ struct RawAsset {
 }
 
 /// Windows device names, reserved in any directory and with any extension (`aux.rhai` opens `AUX`).
-const WINDOWS_DEVICES: &[&str] = &[
-    "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
-    "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
-];
+const WINDOWS_DEVICES: &[&str] = &["con", "prn", "aux", "nul", "conin$", "conout$"];
+
+/// `COM` or `LPT` followed by one digit, including `0` and the superscripts Windows also reserves.
+fn is_port_device(stem: &str) -> bool {
+    let rest = stem
+        .strip_prefix("com")
+        .or_else(|| stem.strip_prefix("lpt"));
+    let mut chars = rest.unwrap_or("").chars();
+    matches!(
+        (chars.next(), chars.next()),
+        (Some('0'..='9' | '¹' | '²' | '³'), None)
+    )
+}
 
 /// One path segment that is safe on every platform: non-empty, not `.` or `..`, not ending in a
 /// dot or a space (Windows strips them), and not a Windows device name.
 fn plain_segment(seg: &str) -> bool {
-    let stem = seg.split('.').next().unwrap_or("").to_ascii_lowercase();
+    // Windows ignores spaces before the extension too: `con .rhai` opens `CON`.
+    let stem = seg
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_end()
+        .to_lowercase();
     !seg.is_empty()
         && seg != "."
         && seg != ".."
         && !seg.ends_with('.')
         && !seg.ends_with(' ')
         && !WINDOWS_DEVICES.contains(&stem.as_str())
+        && !is_port_device(&stem)
 }
 
 /// A plain relative path inside the bundle: `/`-separated plain segments ([`plain_segment`]), no
@@ -237,10 +253,15 @@ fn read_regular(
             limit,
         });
     }
+    let file = std::fs::File::open(&real).map_err(|_| missing())?;
+    // Re-check on the open handle: a file swapped for something else after the path checks is
+    // refused here. (Swapping in a FIFO between the checks and `open` could still block; a writer
+    // racing the loader inside the bundle directory is outside this local loader's threat model.)
+    if !file.metadata().map_err(|_| missing())?.is_file() {
+        return Err(missing());
+    }
     let mut bytes = Vec::new();
-    std::fs::File::open(&real)
-        .map_err(|_| missing())?
-        .take(limit + 1)
+    file.take(limit + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| missing())?;
     if bytes.len() as u64 > limit {
@@ -255,12 +276,18 @@ fn read_regular(
 /// Native convenience: load the bundle whose manifest is the file at `manifest_path`, reading assets
 /// relative to the manifest's directory. Only regular files that resolve inside that directory are
 /// read (no symlinks, FIFOs or devices), each at most [`MAX_ASSET_BYTES`]; the manifest itself at most
-/// [`MAX_MANIFEST_BYTES`].
+/// [`MAX_MANIFEST_BYTES`]. A hard link to a file outside the bundle cannot be told apart by path and is
+/// read; its bytes must still match the listed id. There is no total cap across assets yet (TODO.md
+/// Phase 12).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn load_bundle_dir(manifest_path: &std::path::Path) -> Result<Bundle, BundleError> {
     let manifest_err =
         |e: &dyn fmt::Display| BundleError::Manifest(format!("{}: {e}", manifest_path.display()));
-    let dir = manifest_path.parent().unwrap_or(std::path::Path::new("."));
+    // A bare file name has an empty parent: that is the current directory.
+    let dir = match manifest_path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => std::path::Path::new("."),
+    };
     let root = dir.canonicalize().map_err(|e| manifest_err(&e))?;
     let json =
         read_regular(&root, manifest_path, "manifest", MAX_MANIFEST_BYTES).map_err(
