@@ -29,4 +29,4 @@ The root `members = ["crates/*"]` glob includes it automatically — do NOT edit
 Add **no** third-party dependencies unless the task explicitly requires them; new version pins go
 in the root `[workspace.dependencies]`, not the member crate. Then verify:
 
-`wsl -d Ubuntu -e bash -lc "cd ~/projects/dhilipsiva/uniblox && cargo build -p $1 && cargo test -p $1"`
+`direnv exec . cargo build -p $1 && direnv exec . cargo test -p $1`

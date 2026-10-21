@@ -11,13 +11,13 @@ Rules:
 - For HIGH-RISK crates (`replication`, `scripting`, anything crypto/billing/anti-cheat)
   the human dictates the test cases. Implement exactly those — do not invent scope.
 - To edit anything under a `tests/` directory you must first create the sentinel:
-  `wsl -d Ubuntu -e bash -lc "cd ~/projects/dhilipsiva/uniblox && touch .claude/allow-test-edits"`
+  `touch .claude/allow-test-edits` (from the repository root)
   (the `guard-tests` PreToolUse hook blocks `tests/` edits otherwise). Remove it when done.
 - **Commit tests before implementation** so `git diff tests/` across the implementation
   commit proves the tests were not tampered with.
 - Prefer round-trip / property / boundary tests for wire formats and quantization.
   For netcode, encode the subtle-but-wrong cases (double-ownership, stale generation,
   orphaned entity, resync desync) as explicit tests.
-- Run tests through the WSL wrapper: `wsl -d Ubuntu -e bash -lc "cd ~/projects/dhilipsiva/uniblox && cargo test <name>"`.
+- Run tests in the flake env: `direnv exec . cargo test <name>`.
 
 Honor every invariant and always-do rule in the root `CLAUDE.md`.

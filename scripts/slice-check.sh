@@ -1,11 +1,52 @@
 #!/usr/bin/env bash
-# Print the slice instrumentation table (TODO.md §"Measurement gaps to instrument").
+# Print the slice instrumentation table (TODO.md §"Measurement gaps to instrument") and apply the
+# WASM size-budget gate.
 # Size columns come from the last dist/ build; runtime rows come from
 # target/slice-metrics.json, written by the measurement harness:
 #   direnv exec . cargo run --release -p replication --example slice_metrics
-# Fails gracefully when artifacts/metrics are missing.
+# Missing metrics are reported, not fatal.
+#
+# Exit status: non-zero when a built brotli artifact exceeds the budget. With --gate (what
+# build-wasm.sh and CI run) only the gate is printed, and a missing artifact fails too.
+# UNIBLOX_SIZE_BUDGET_BYTES (default 8000000, the ~8 MB budget) and UNIBLOX_DIST (default dist)
+# override the budget and the directory.
 set -euo pipefail
-cd "$HOME/projects/dhilipsiva/uniblox"
+cd "$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
+
+GATE_ONLY=0
+if [ "${1:-}" = "--gate" ]; then GATE_ONLY=1; fi
+BUDGET="${UNIBLOX_SIZE_BUDGET_BYTES:-8000000}"
+DIST="${UNIBLOX_DIST:-dist}"
+
+gate () {
+  echo "-- Size-budget gate (brotli, per build; budget ${BUDGET} bytes) --"
+  local status=0 variant br size
+  for variant in webgl2 webgpu; do
+    br="${DIST}/${variant}/client_bg.wasm.br"
+    if [ ! -f "${br}" ]; then
+      if [ "${GATE_ONLY}" = 1 ]; then
+        printf '  %-8s FAIL: %s is missing\n' "${variant}" "${br}"
+        status=1
+      else
+        printf '  %-8s not built (run /build-wasm)\n' "${variant}"
+      fi
+      continue
+    fi
+    size="$(stat -c%s "${br}")"
+    if [ "${size}" -le "${BUDGET}" ]; then
+      printf '  %-8s PASS: %s bytes\n' "${variant}" "${size}"
+    else
+      printf '  %-8s FAIL: %s bytes is over the budget\n' "${variant}" "${size}"
+      status=1
+    fi
+  done
+  return "${status}"
+}
+
+if [ "${GATE_ONLY}" = 1 ]; then
+  gate
+  exit $?
+fi
 
 echo "=== uniblox slice-check — instrumentation table ==="
 echo
@@ -19,16 +60,16 @@ size_row () {  # $1=label  $2=path
 }
 
 echo "-- WASM size (per build; served artifact = wasm-opt output; gate: <= ~8 MB brotli) --"
-size_row "webgl2 wasm-opt"  "dist/webgl2/client_bg.wasm"
-size_row "webgl2 brotli"    "dist/webgl2/client_bg.wasm.br"
-size_row "webgpu wasm-opt"  "dist/webgpu/client_bg.wasm"
-size_row "webgpu brotli"    "dist/webgpu/client_bg.wasm.br"
+size_row "webgl2 wasm-opt"  "${DIST}/webgl2/client_bg.wasm"
+size_row "webgl2 brotli"    "${DIST}/webgl2/client_bg.wasm.br"
+size_row "webgpu wasm-opt"  "${DIST}/webgpu/client_bg.wasm"
+size_row "webgpu brotli"    "${DIST}/webgpu/client_bg.wasm.br"
 echo
 
 echo "-- Measured (native slice, loopback) --"
 METRICS=target/slice-metrics.json
 if [ -f "$METRICS" ]; then
-  /usr/bin/python3 - "$METRICS" <<'PYEOF'
+  python3 - "$METRICS" <<'PYEOF'
 import json, sys
 m = json.load(open(sys.argv[1]))
 bw, rtt, ed = m["bandwidth"], m["rtt"], m["ed25519"]
@@ -49,15 +90,17 @@ else
 fi
 echo
 
-echo "-- Measured (in-browser; re-measure per release) --"
+echo "-- Recorded in-browser measurements (dated; re-measure per release) --"
 printf '  %-36s %s\n' "ed25519 sign (wasm, browser)"   "19.6-25.0 us/op  (2026-07-11, release + opt-level=3 crypto override)"
 printf '  %-36s %s\n' "ed25519 verify (wasm, browser)" "44.0-45.6 us/op  (~1.7x native 25.7 us; 8-peer mesh @30Hz ~= 1% of a core)"
 printf '  %-36s %s\n' "crypto wasm size cost"          "+106 KB wasm-opt / +55 KB brotli (dalek+override delta, pre-Bevy stub)"
 printf '  %-36s %s\n' "cold-load: wasm instantiate"    "351 ms local (headless webgl2, optimized artifact, 2026-07-11)"
 printf '  %-36s %s\n' "cold-load: first Bevy frame"    "381 ms local; + download: ~2.7 s @10 Mbps / ~5.4 s @5 Mbps (3.4 MB brotli)"
-printf '  %-36s %s\n' "size-budget gate"               "PASS: 3.38/3.40 MB brotli <= ~8 MB; first frame ~3.1 s @10 Mbps (in target), ~5.8 s @5 Mbps (marginal)"
 echo
 
 echo "-- Pending (environment-gated) --"
 printf '  %-36s %s\n' "STUN-only connection success"  "INSTRUMENT+AGGREGATION ready (ADR-0018): Str0mPeer::telemetry() per peer + FleetMetrics::aggregate → success fraction / kind breakdown / RTT distribution; real NUMBERS need a real-network fleet (loopback = 100% host, ~0.6ms)"
 printf '  %-36s %s\n' "  └ browser-side classification" "getStats() candidate-pair type not yet surfaced by matchbox-wasm (follow-up)"
+echo
+
+gate

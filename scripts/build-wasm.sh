@@ -11,12 +11,11 @@
 # byte-identical and the sizes are meaningless; it becomes meaningful once the client renders
 # (built later in Phase 1). See TODO.md Phase 1 (Instrumentation) and DECISIONS.md ADR-0002.
 set -euo pipefail
-cd "$HOME/projects/dhilipsiva/uniblox"
+cd "$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
 
-# Self-activate the flake devShell (DECISIONS.md ADR-0010) so wasm-bindgen/wasm-opt/
-# brotli/twiggy + the pinned cargo resolve however this script is invoked; falls back
-# to ambient rustup if the env is unavailable (graceful).
-eval "$(direnv export bash 2>/dev/null)" 2>/dev/null || true
+# Run inside the flake devShell (DECISIONS.md ADR-0010) so wasm-bindgen/wasm-opt/brotli/twiggy and the
+# pinned cargo resolve however this script is invoked.
+source scripts/lib/flake-env.sh
 
 for t in wasm-bindgen wasm-opt brotli; do
   if ! command -v "$t" >/dev/null 2>&1; then
@@ -28,7 +27,7 @@ for t in wasm-bindgen wasm-opt brotli; do
   fi
 done
 
-RAW="target/wasm32-unknown-unknown/release/client.wasm"
+RAW="${CARGO_TARGET_DIR:-target}/wasm32-unknown-unknown/release/client.wasm"
 
 emit () {
   local variant="$1" cargo_args="$2" rustflags="${3:-}"
@@ -76,3 +75,5 @@ emit webgpu "--features webgpu" "--cfg=web_sys_unstable_apis"  # WebGPU build
 # Stage the capability-detection page at the served root.
 cp crates/client/web/index.html dist/index.html
 echo "Done. Artifacts: dist/webgl2/ and dist/webgpu/ (+ index.html). Serve with scripts/serve.sh (no COOP/COEP)."
+# The size budget: fail the build when either brotli artifact is over it.
+scripts/slice-check.sh --gate

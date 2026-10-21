@@ -20,16 +20,14 @@ anything.
 
 ## Environment
 
-This project lives on WSL2 (Ubuntu); the Windows working dir is a UNC view of the Linux filesystem, and
-git run from the Windows side fails with "dubious ownership." Run shell commands through the wrapper:
+Run shell commands from the repository root:
 
 ```
-# general (git, file, python3) commands:
-wsl -d Ubuntu -e bash -lc "cd ~/projects/dhilipsiva/uniblox && <CMD>"
+# general (git, file, python3) commands: run them directly.
 
-# cargo / WASM-tool / npx commands — prefix with `direnv exec .` to enter the flake env:
-wsl -d Ubuntu -e bash -lc "cd ~/projects/dhilipsiva/uniblox && direnv exec . <CMD>"
-# compound cargo chains: direnv exec . bash -lc '<a && b>'  (bare `direnv exec . a && b` runs b OUTSIDE the env)
+# cargo / WASM-tool / npx commands: prefix with `direnv exec .` to enter the flake env (or work in `nix develop`):
+direnv exec . <CMD>
+# compound cargo chains: direnv exec . bash -c '<a && b>'  (bare `direnv exec . a && b` runs b OUTSIDE the env)
 ```
 
 Toolchain notes (these differ from nibli — do not copy nibli's habits):
@@ -37,8 +35,8 @@ Toolchain notes (these differ from nibli — do not copy nibli's habits):
 - **The toolchain comes from a Nix flake devShell** (`flake.nix`, `DECISIONS.md` ADR-0010): pinned Rust
   (cargo/rustc/clippy/rustfmt, wasm32 target, currently 1.96) + `wasm-bindgen`/`wasm-opt`/`brotli`/`twiggy`/
   `node`, all pinned by `flake.lock`. Run **`direnv allow`** once per clone. Interactive `cd` auto-activates
-  (direnv + nix-direnv, already installed); the WSL wrapper enters it via the `direnv exec .` prefix above.
-  Ambient rustup (cargo 1.92) is a benign fallback for un-routed commands. No `just` here.
+  (direnv + nix-direnv); non-interactive shells enter it via the `direnv exec .` prefix above.
+  Without it, an ambient rustup may resolve cargo instead, so keep the prefix. No `just` here.
 - The **two-WASM-build** pipeline (`scripts/build-wasm.sh`) + `/build-wasm` and `/slice-check` are
   **scaffolded**; the WASM tools are present (via the flake), so `build-wasm.sh` **runs end-to-end**; on the
   current stub the output is byte-identical, KB-sized wasm — **meaningless** for the size budget until the Bevy
@@ -87,9 +85,8 @@ Toolchain notes (these differ from nibli — do not copy nibli's habits):
    doc changes together.
 
 6. **Commit & push (uniblox repo, branch `main`; remote `origin` = `git@github.com:dhilipsiva/uniblox.git`).**
-   - Write the commit message to a temp file and `git commit -F /tmp/msg.txt`. Heredocs and `-m` mangle
-     backticks / `?` / quotes inside the double-quoted `bash -lc` wrapper — the file avoids that. (Use the
-     Write tool to author the message at `\\wsl.localhost\Ubuntu\tmp\msg.txt`, i.e. `/tmp/msg.txt`.)
+   - Write the commit message to a temp file and `git commit -F /tmp/msg.txt`; the file avoids quoting
+     problems with backticks, `?` and quotes. (Use the Write tool to author it at `/tmp/msg.txt`.)
    - End the message with the `Co-Authored-By: Claude … <noreply@anthropic.com>` trailer the harness
      specifies for the model actually doing the work — do **not** hardcode a model name here (it goes stale).
    - Scope the commit to the files this item touched (`git add <those files>`). Never sweep in unrelated

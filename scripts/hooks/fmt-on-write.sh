@@ -5,7 +5,7 @@ set -euo pipefail
 
 payload="$(cat)"
 fp="$(printf '%s' "$payload" \
-  | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin).get("tool_input",{}).get("file_path",""))' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin).get("tool_input",{}).get("file_path",""))' \
   2>/dev/null || true)"
 
 # Only fmt after .rs edits (skip .md/.toml/.json writes).
@@ -14,7 +14,7 @@ case "$fp" in
   *)    exit 0 ;;
 esac
 
-cd "$HOME/projects/dhilipsiva/uniblox"
+cd "$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
 # Self-activate the flake devShell (ADR-0010) so `cargo fmt` uses the pinned
 # rustfmt; falls back to ambient rustup if unavailable (graceful).
 eval "$(direnv export bash 2>/dev/null)" 2>/dev/null || true

@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "wsl -d Ubuntu -e bash -lc \"cd ~/projects/dhilipsiva/uniblox && ./scripts/hooks/fmt-on-write.sh\""
+            "command": "\"$CLAUDE_PROJECT_DIR\"/scripts/hooks/fmt-on-write.sh"
           }
         ]
       }
@@ -18,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "wsl -d Ubuntu -e bash -lc \"cd ~/projects/dhilipsiva/uniblox && ./scripts/hooks/deny-destructive.sh\""
+            "command": "\"$CLAUDE_PROJECT_DIR\"/scripts/hooks/deny-destructive.sh"
           }
         ]
       },
@@ -27,7 +27,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "wsl -d Ubuntu -e bash -lc \"cd ~/projects/dhilipsiva/uniblox && ./scripts/hooks/guard-tests.sh\""
+            "command": "\"$CLAUDE_PROJECT_DIR\"/scripts/hooks/guard-tests.sh"
           }
         ]
       }
@@ -37,7 +37,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "wsl -d Ubuntu -e bash -lc \"cd ~/projects/dhilipsiva/uniblox && ./scripts/hooks/gate-clippy.sh\""
+            "command": "\"$CLAUDE_PROJECT_DIR\"/scripts/hooks/gate-clippy.sh"
           }
         ]
       }

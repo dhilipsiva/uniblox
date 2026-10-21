@@ -3,18 +3,18 @@ description: Print the slice instrumentation table (measured native metrics + la
 allowed-tools: Bash
 ---
 
-Print the instrumentation table through the WSL wrapper and report it verbatim:
+Print the instrumentation table from the repository root and report it verbatim:
 
-`wsl -d Ubuntu -e bash -lc "cd ~/projects/dhilipsiva/uniblox && ./scripts/slice-check.sh"`
+`./scripts/slice-check.sh`
 
 If the measured rows say "no metrics yet", generate them first (a ~10 s native
 run: bandwidth session + ping/echo + ed25519 micro-bench), then re-print:
 
-`wsl -d Ubuntu -e bash -lc "cd ~/projects/dhilipsiva/uniblox && direnv exec . cargo run --release -p replication --example slice_metrics"`
+`direnv exec . cargo run --release -p replication --example slice_metrics`
 
 Notes when reporting:
-- The WASM size rows are the STUB client until Bevy renders — never quote them
-  as the size-budget measurement.
+- The WASM size rows are the last `dist/` build. The gate line compares both brotli
+  sizes with the 8 MB budget, and the script exits non-zero on a breach.
 - Measured rows are native/loopback (annotated); the pending rows list their
   concrete environment blockers (browser client, desktop browser, real network).
 - ed25519 verify depends on the crypto opt-level=3 override in the workspace

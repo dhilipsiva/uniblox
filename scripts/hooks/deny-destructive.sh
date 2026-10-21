@@ -7,7 +7,7 @@
 set -euo pipefail
 
 cmd="$(cat \
-  | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin).get("tool_input",{}).get("command",""))' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin).get("tool_input",{}).get("command",""))' \
   2>/dev/null || true)"
 
 if printf '%s' "$cmd" | grep -Eiq \

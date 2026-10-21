@@ -8,7 +8,7 @@
 # WASM at launch — see DECISIONS.md ADR-0003. python3's http.server sets no such
 # headers by default, which is exactly what we want.
 set -euo pipefail
-cd "$HOME/projects/dhilipsiva/uniblox"
+cd "$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
 
 if [ ! -d dist ]; then
   echo "dist/ not found — run scripts/build-wasm.sh first."
@@ -17,4 +17,4 @@ fi
 
 PORT="${1:-8080}"
 echo "Serving dist/ on http://localhost:${PORT}/ with NO COOP/COEP (single-threaded)."
-exec /usr/bin/python3 -m http.server "${PORT}" --directory dist
+exec python3 -m http.server "${PORT}" --directory dist

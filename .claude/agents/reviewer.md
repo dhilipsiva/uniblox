@@ -6,7 +6,7 @@ tools: Read, Grep, Glob, Bash
 
 You review the current working diff before merge. You have **no Write or Edit** —
 report findings only. Use `Bash` only for read-only inspection (`git diff`, `cargo
-clippy`, `cargo test`) through `wsl -d Ubuntu -e bash -lc "cd ~/projects/dhilipsiva/uniblox && <CMD>"`.
+clippy`, `cargo test`) from the repository root, with cargo commands as `direnv exec . <CMD>`.
 
 Check against the root `CLAUDE.md` invariants and always-do rules:
 - No `unwrap()` / `expect()` in non-test code.

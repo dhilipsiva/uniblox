@@ -334,12 +334,10 @@ metrics, Web Audio); Phases 4–8 are LOW/MIXED and delegate-friendly. Phase 3 (
 Phase 12 (sandbox hardening) each need a human-owned HIGH pass.
 
 ## Toolchain notes
-WSL2 Ubuntu. **The toolchain comes from the Nix flake devShell** (ADR-0010): pinned Rust 1.96.1
-(edition 2024, wasm32 target) + `wasm-bindgen`/`wasm-opt`/`brotli`/`twiggy`/`node`/`coturn`. Run `direnv allow`
-once per clone. Interactive `cd` auto-activates; for the WSL wrapper, prefix cargo/WASM-tool/npx
-commands with `direnv exec .`:
-`wsl -d Ubuntu -e bash -lc "cd ~/projects/dhilipsiva/uniblox && direnv exec . <CMD>"` (compound chains:
-`direnv exec . bash -lc '<a && b>'`). Pure git/file commands use the plain wrapper. Ambient rustup
-(cargo 1.92) still exists as a fallback for un-routed commands. Hook/build scripts self-activate the
-flake and parse event JSON with `/usr/bin/python3` (the rye shim fails non-interactively; `jq` is absent).
+**The toolchain comes from the Nix flake devShell** (ADR-0010): pinned Rust 1.96.1 (edition 2024, wasm32
+target) + `wasm-bindgen`/`wasm-opt`/`brotli`/`twiggy`/`node`/`coturn`/`redis`. Run `direnv allow` once per
+clone, or work inside `nix develop`. Interactive `cd` auto-activates; in non-interactive shells prefix
+cargo/WASM-tool/npx commands with `direnv exec .` (compound chains: `direnv exec . bash -c '<a && b>'`).
+Git and file commands need no prefix. Hook and build scripts find the repository root themselves,
+self-activate the flake, and parse event JSON with the `python3` on PATH.
 No `just` here.
