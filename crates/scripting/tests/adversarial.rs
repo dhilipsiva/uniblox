@@ -294,3 +294,104 @@ fn nesting_to_the_cap_does_not_overflow_a_small_stack() {
         );
     }
 }
+
+// ── Audit follow-ups (2026-10-21, ADR-0046) ──────────────────────────────────
+
+/// The deepest native recursion content can reach: recursion at the call-depth cap, each body at
+/// the function-body depth cap with the call innermost, and at the bottom an `==` of two arrays
+/// nested to the container cap. It must end inside the documented stack (debug build, 4 MiB; release
+/// is ~4x smaller and `just stack-check` runs it on 1 MiB).
+#[test]
+fn the_worst_case_recursion_and_nesting_fit_the_documented_stack() {
+    let src = scripting::worst_case_stack_script();
+    let joined = std::thread::Builder::new()
+        .stack_size(4 * 1024 * 1024)
+        .spawn(move || {
+            let limits = ScriptLimits {
+                call_time_budget: Duration::from_secs(60),
+                frame_time_budget: Duration::from_secs(60),
+                ..ScriptLimits::default()
+            };
+            let mut engine = ScriptEngine::from_source_with(&src, limits).expect("it compiles");
+            engine.update_component(Health { hp: 0 }).map(|h| h.hp)
+        })
+        .unwrap()
+        .join();
+    let outcome = joined.expect("no stack overflow");
+    assert!(outcome.is_ok(), "the worst case runs within the limits: {outcome:?}");
+}
+
+/// Array-package callbacks (`map`, `filter`, `sort`, ...) run in a cloned state whose operations
+/// Rhai does not add to the caller's; they must still count against the per-call cap.
+#[test]
+fn callbacks_count_against_the_operation_cap() {
+    let src = "fn burn(x) { let i = 0; while i < 30000 { i += 1; } x }
+               fn update(h) { let a = []; let i = 0; while i < 100 { a.push(i); i += 1; } a.map(\"burn\"); h }";
+    let err = run(src).unwrap_err();
+    assert!(
+        matches!(
+            *err,
+            EvalAltResult::ErrorTerminated(..) | EvalAltResult::ErrorTooManyOperations(..)
+        ),
+        "{err:?}"
+    );
+}
+
+/// ... and against the frame budget, which `frame_stats` reports truthfully.
+#[test]
+fn callbacks_count_against_the_frame_budget() {
+    let limits = ScriptLimits {
+        call_time_budget: Duration::from_secs(60),
+        frame_time_budget: Duration::from_secs(60),
+        frame_ops_budget: 50_000,
+        ..ScriptLimits::default()
+    };
+    let src = "fn burn(x) { let i = 0; while i < 2000 { i += 1; } x }
+               fn update(h) { let a = []; let i = 0; while i < 100 { a.push(i); i += 1; } a.map(\"burn\"); h }";
+    let mut engine = ScriptEngine::from_source_with(src, limits).unwrap();
+    engine.begin_frame();
+    assert!(engine.update_component(Health { hp: 0 }).is_err(), "the frame budget stops it");
+    let ops = engine.frame_stats().ops;
+    assert!((50_000..60_000).contains(&ops), "counted ops {ops}");
+}
+
+/// Compile time grows with the number of functions, and parsing is not op-counted: the number of
+/// functions in a script is capped.
+#[test]
+fn too_many_functions_are_rejected_at_compile_time() {
+    let many: String = (0..500).map(|i| format!("fn f{i}() {{ {i} }}\n")).collect();
+    let err = ScriptEngine::from_source(&format!("{many}fn update(h) {{ h }}")).unwrap_err();
+    assert!(matches!(err, ScriptError::Parse(..)), "{err:?}");
+}
+
+/// The language intrinsics a script can use (not shown by `gen_fn_signatures`): reviewed. A Rhai
+/// upgrade that changes one of them breaks this list.
+#[test]
+fn the_reviewed_intrinsics_work() {
+    for body in [
+        "let t = type_of(1);",
+        "let f = Fn(\"update\");",
+        "let f = Fn(\"double\"); let y = f.call(2);",
+        "let f = Fn(\"add\"); let g = f.curry(1); let y = g.call(2);",
+        "let x = 1; let d = is_def_var(\"x\");",
+        "let d = is_def_fn(\"double\", 1);",
+        "try { throw 1; } catch (e) { }",
+        "for i in 0..3 { }",
+        "let s = `${[1, 2]}`;",
+    ] {
+        let src = format!(
+            "fn double(x) {{ x * 2 }} fn add(a, b) {{ a + b }} fn update(h) {{ {body} h }}"
+        );
+        assert!(run(&src).is_ok(), "{body} should work");
+    }
+}
+
+/// Strings are capped at 1 KiB (it bounds what each operation can allocate, so the memory one call
+/// can reach through the map index-insert gap).
+#[test]
+fn the_string_cap_is_one_kibibyte() {
+    assert!(run(r#"fn update(h) { let s = "x"; let i = 0; while i < 10 { s += s; i += 1; } h }"#).is_ok());
+    let err = run(r#"fn update(h) { let s = "x"; let i = 0; while i < 11 { s += s; i += 1; } h }"#)
+        .unwrap_err();
+    assert!(matches!(*err, EvalAltResult::ErrorDataTooLarge(..)), "{err:?}");
+}
