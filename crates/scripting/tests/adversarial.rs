@@ -5,7 +5,9 @@
 use std::time::{Duration, Instant};
 
 use rhai::EvalAltResult;
-use scripting::{Health, ScriptEngine, ScriptError, ScriptLimits, sandbox_engine};
+use scripting::{
+    Health, OPS_BUDGET_TOKEN, ScriptEngine, ScriptError, ScriptLimits, sandbox_engine,
+};
 
 /// Run one call with generous TIME budgets, so the resource limit under test is the one that fires
 /// (the watchdog has its own test below; in a debug build it would otherwise stop the slow map cases
@@ -21,6 +23,19 @@ fn run(src: &str) -> Result<Health, Box<EvalAltResult>> {
         .update_component(Health { hp: 0 })
 }
 
+/// The operation cap fired: Rhai's own counter, or the engine's count of every operation (callbacks
+/// included), whichever saw the cap first. Unwraps the error a callback's caller (`map`, ...) adds.
+fn is_operation_cap(err: &EvalAltResult) -> bool {
+    match err {
+        EvalAltResult::ErrorInFunctionCall(_, _, inner, _) => is_operation_cap(inner),
+        EvalAltResult::ErrorTooManyOperations(..) => true,
+        EvalAltResult::ErrorTerminated(token, _) => {
+            token.clone().into_immutable_string().ok().as_deref() == Some(OPS_BUDGET_TOKEN)
+        }
+        _ => false,
+    }
+}
+
 // ── Resource limits ──────────────────────────────────────────────────────────
 
 #[test]
@@ -33,13 +48,13 @@ fn deep_recursion_hits_the_call_depth_limit() {
 }
 
 #[test]
-fn huge_strings_arrays_and_maps_are_refused() {
+fn huge_strings_and_arrays_are_refused() {
     for src in [
         r#"fn update(h) { let s = "x"; loop { s += s; } }"#,
         "fn update(h) { let a = []; loop { a.push(0); } }",
         // Copying a container into itself doubles it each step: the size check must stop it.
-        "fn update(h) { let m = #{ a: 1 }; let i = 0; loop { m[`k${i}`] = m; i += 1; } }",
         "fn update(h) { let a = [1]; loop { a.push(a); } }",
+        "fn update(h) { let a = [1, 2]; loop { a[0] = a; } }",
     ] {
         let err = run(src).unwrap_err();
         assert!(
@@ -49,29 +64,38 @@ fn huge_strings_arrays_and_maps_are_refused() {
     }
 }
 
-/// A known Rhai gap (ADR-0046): inserting NEW keys into a map by index is not checked against the
-/// map-size limit. The operation cap still ends the call (measured: under 10,000 keys, under 1 MB,
-/// freed when the call returns, because the scope is rewound and scripts keep no state).
+/// Object maps, function pointers and currying are not part of the language (ADR-0046). Rhai's size
+/// check counts neither map keys nor what a function pointer carries, and a new map key assigned by
+/// index skips the map-size check. Found by the audit and its follow-up: one call reached ~1 GB by
+/// cloning a 127-key map into new keys, and `p = p.curry(p)` doubled an uncounted value until the
+/// allocator failed and the process aborted. All of these must fail to compile.
 #[test]
-fn map_index_inserts_are_bounded_by_the_operation_cap() {
-    let err = run("fn update(h) { let m = #{}; let i = 0; loop { m[`k${i}`] = i; i += 1; } }")
-        .unwrap_err();
-    assert!(
-        matches!(*err, EvalAltResult::ErrorTooManyOperations(..)),
-        "{err:?}"
-    );
+fn object_maps_function_pointers_and_currying_are_disabled() {
+    for body in [
+        "let m = #{};",
+        "let m = #{ a: 1 };",
+        r#"let f = Fn("update");"#,
+        "let p = 1; let q = curry(p, p);",
+        "let p = 1; let q = p.curry(p);",
+        "let p = 1; let q = call(p, 1);",
+        "let p = 1; let q = p.call(1);",
+        // The two memory bombs, verbatim.
+        r#"let p = Fn("update"); let i = 0; while i < 40 { p = p.curry(p); i += 1; }"#,
+        "let v = #{}; let j = 0; while j < 127 { v[`${j}`] = 0; j += 1; } \
+         let m = #{}; let i = 0; loop { m[`k${i}`] = v; i += 1; }",
+    ] {
+        let src = format!("fn update(h) {{ {body} h }}");
+        let err = ScriptEngine::from_source(&src).unwrap_err();
+        assert!(matches!(err, ScriptError::Parse(..)), "{body}: {err:?}");
+    }
 }
 
+/// Callbacks by name still work: the array package takes a function's name as a string.
 #[test]
-fn deeply_nested_maps_terminate() {
-    let err = run("fn update(h) { let m = #{}; loop { m = #{ inner: m }; } }").unwrap_err();
-    assert!(
-        matches!(
-            *err,
-            EvalAltResult::ErrorTooManyOperations(..) | EvalAltResult::ErrorDataTooLarge(..)
-        ),
-        "{err:?}"
-    );
+fn callbacks_by_name_still_work() {
+    let src = "fn double(x) { x * 2 }
+               fn update(h) { let a = [1, 2, 3].map(\"double\"); h.hp = a[2]; h }";
+    assert_eq!(run(src).unwrap().hp, 6);
 }
 
 #[test]
@@ -182,8 +206,9 @@ fn a_host_api_cannot_loosen_the_limits() {
 
 // ── The per-frame budget across entities ─────────────────────────────────────
 
-/// Each call stays under the per-call cap, but together they would burn the frame: once the frame
-/// budget is spent, later calls in the same frame are refused, and the next frame starts fresh.
+/// Each call stays under the per-call cap, but together they would burn the frame: the call that
+/// crosses the frame budget is cut off there, later calls in the same frame are refused, and the
+/// next frame starts fresh.
 #[test]
 fn the_frame_budget_caps_the_cost_across_entities() {
     let limits = ScriptLimits {
@@ -206,9 +231,9 @@ fn the_frame_budget_caps_the_cost_across_entities() {
         "after the budget is spent, nothing runs"
     );
     let stats = engine.frame_stats();
-    assert_eq!(stats.calls as usize, ran);
-    assert_eq!(stats.skipped as usize, 40 - ran);
-    assert!(stats.ops >= 200_000);
+    assert_eq!(stats.calls as usize, ran + 1, "the ones that finished, and the one cut off");
+    assert_eq!(stats.skipped as usize, 40 - ran - 1);
+    assert_eq!(stats.ops, 200_001, "the cut-off call stopped one operation past the budget");
     engine.begin_frame();
     assert!(
         engine.update_component(Health { hp: 0 }).is_ok(),
@@ -272,14 +297,14 @@ fn no_state_bleeds_between_engines_or_across_a_reload() {
     );
 }
 
-/// Regression (found by this matrix, ADR-0046): nesting maps or arrays up to the size cap must not
-/// overflow the native stack, even on a 1 MiB thread (the wasm32 default) in a debug build. An
-/// overflow aborts the whole process, so this test cannot pass by accident.
+/// Regression (found by this matrix, ADR-0046): nesting arrays up to the size cap must not overflow
+/// the native stack, even on a 1 MiB thread (the wasm32 default) in a debug build. An overflow aborts
+/// the whole process, so this test cannot pass by accident.
 #[test]
 fn nesting_to_the_cap_does_not_overflow_a_small_stack() {
     for src in [
-        "fn update(h) { let m = #{}; loop { m = #{ inner: m }; } }",
         "fn update(h) { let a = []; loop { a = [a]; } }",
+        "fn update(h) { let a = [0]; loop { a[0] = [a[0]]; } }",
     ] {
         let src = src.to_string();
         let joined = std::thread::Builder::new()
@@ -297,28 +322,63 @@ fn nesting_to_the_cap_does_not_overflow_a_small_stack() {
 
 // ── Audit follow-ups (2026-10-21, ADR-0046) ──────────────────────────────────
 
-/// The deepest native recursion content can reach: recursion at the call-depth cap, each body at
-/// the function-body depth cap with the call innermost, and at the bottom an `==` of two arrays
-/// nested to the container cap. It must end inside the documented stack (debug build, 4 MiB; release
-/// is ~4x smaller and `just stack-check` runs it on 1 MiB).
+/// The deepest native recursion content can reach: a top-level expression at the depth cap around a
+/// recursion at the call-depth cap, each body at the function-body depth cap with the call
+/// innermost, and at the bottom an `==` of two arrays nested to the container cap. Each shape must
+/// end inside the documented stack (debug build, 4 MiB; release needs ~6x less and
+/// `just stack-check` runs it on 1 MiB).
 #[test]
 fn the_worst_case_recursion_and_nesting_fit_the_documented_stack() {
-    let src = scripting::worst_case_stack_script();
-    let joined = std::thread::Builder::new()
-        .stack_size(4 * 1024 * 1024)
-        .spawn(move || {
-            let limits = ScriptLimits {
-                call_time_budget: Duration::from_secs(60),
-                frame_time_budget: Duration::from_secs(60),
-                ..ScriptLimits::default()
-            };
-            let mut engine = ScriptEngine::from_source_with(&src, limits).expect("it compiles");
-            engine.update_component(Health { hp: 0 }).map(|h| h.hp)
-        })
-        .unwrap()
-        .join();
-    let outcome = joined.expect("no stack overflow");
-    assert!(outcome.is_ok(), "the worst case runs within the limits: {outcome:?}");
+    for (name, src) in scripting::worst_case_stack_scripts() {
+        let joined = std::thread::Builder::new()
+            .stack_size(4 * 1024 * 1024)
+            .spawn(move || {
+                let limits = ScriptLimits {
+                    call_time_budget: Duration::from_secs(60),
+                    frame_time_budget: Duration::from_secs(60),
+                    ..ScriptLimits::default()
+                };
+                let mut engine =
+                    ScriptEngine::from_source_with(&src, limits).expect("it compiles");
+                engine
+                    .update_component(Health { hp: 0 })
+                    .map(|h| h.hp)
+                    .map_err(|e| e.to_string())
+            })
+            .unwrap()
+            .join();
+        let outcome = joined.expect("no stack overflow");
+        assert!(outcome.is_ok(), "{name}: the worst case runs within the limits: {outcome:?}");
+    }
+}
+
+/// The worst-case scripts really sit at the caps: one more level of nesting does not compile, and
+/// one more level of recursion is refused.
+#[test]
+fn the_worst_case_scripts_sit_at_the_limits() {
+    for (name, src) in scripting::worst_case_stack_scripts() {
+        let deeper_body = src.replacen(
+            "fn deep(a, b, n) { if n <= 0 { return if a == b { 1 } else { 0 }; } ",
+            "fn deep(a, b, n) { if n <= 0 { return if a == b { 1 } else { 0 }; } (",
+            1,
+        );
+        let deeper_body = deeper_body.replacen(" }\nfn update", ") }\nfn update", 1);
+        assert_eq!(deeper_body.len(), src.len() + 2, "{name}: both edits applied");
+        assert!(sandbox_engine().compile(&deeper_body).is_err(), "{name}: body depth");
+        let deeper_call = src.replace(
+            &format!("deep(a, b, {})", scripting::MAX_CALL_LEVELS - 1),
+            &format!("deep(a, b, {})", scripting::MAX_CALL_LEVELS),
+        );
+        assert_ne!(deeper_call, src);
+        let joined = std::thread::Builder::new()
+            .stack_size(4 * 1024 * 1024)
+            .spawn(move || run(&deeper_call).map(|_| ()).map_err(|e| format!("{e:?}")))
+            .unwrap()
+            .join()
+            .expect("no stack overflow");
+        let err = joined.unwrap_err();
+        assert!(err.contains("ErrorStackOverflow"), "{name}: call depth: {err}");
+    }
 }
 
 /// Array-package callbacks (`map`, `filter`, `sort`, ...) run in a cloned state whose operations
@@ -328,13 +388,7 @@ fn callbacks_count_against_the_operation_cap() {
     let src = "fn burn(x) { let i = 0; while i < 30000 { i += 1; } x }
                fn update(h) { let a = []; let i = 0; while i < 100 { a.push(i); i += 1; } a.map(\"burn\"); h }";
     let err = run(src).unwrap_err();
-    assert!(
-        matches!(
-            *err,
-            EvalAltResult::ErrorTerminated(..) | EvalAltResult::ErrorTooManyOperations(..)
-        ),
-        "{err:?}"
-    );
+    assert!(is_operation_cap(&err), "{err:?}");
 }
 
 /// ... and against the frame budget, which `frame_stats` reports truthfully.
@@ -365,22 +419,22 @@ fn too_many_functions_are_rejected_at_compile_time() {
 }
 
 /// The language intrinsics a script can use (not shown by `gen_fn_signatures`): reviewed. A Rhai
-/// upgrade that changes one of them breaks this list.
+/// upgrade that changes one of them breaks this list. `Fn`, `call` and `curry` are disabled (see
+/// `object_maps_function_pointers_and_currying_are_disabled`).
 #[test]
 fn the_reviewed_intrinsics_work() {
     for body in [
         "let t = type_of(1);",
-        "let f = Fn(\"update\");",
-        "let f = Fn(\"double\"); let y = f.call(2);",
-        "let f = Fn(\"add\"); let g = f.curry(1); let y = g.call(2);",
         "let x = 1; let d = is_def_var(\"x\");",
         "let d = is_def_fn(\"double\", 1);",
         "try { throw 1; } catch (e) { }",
         "for i in 0..3 { }",
         "let s = `${[1, 2]}`;",
+        "let a = [3, 1, 2]; a.sort(); let b = a.filter(\"positive\");",
+        "let s = switch 1 { 1 => 2, _ => 3 };",
     ] {
         let src = format!(
-            "fn double(x) {{ x * 2 }} fn add(a, b) {{ a + b }} fn update(h) {{ {body} h }}"
+            "fn double(x) {{ x * 2 }} fn positive(x) {{ x > 0 }} fn update(h) {{ {body} h }}"
         );
         assert!(run(&src).is_ok(), "{body} should work");
     }
