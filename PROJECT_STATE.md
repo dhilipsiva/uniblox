@@ -340,4 +340,4 @@ clone, or work inside `nix develop`. Interactive `cd` auto-activates; in non-int
 cargo/WASM-tool/npx commands with `direnv exec .` (compound chains: `direnv exec . bash -c '<a && b>'`).
 Git and file commands need no prefix. Hook and build scripts find the repository root themselves,
 self-activate the flake, and parse event JSON with the `python3` on PATH.
-No `just` here.
+`just ci` (Justfile) is the local gate and what CI runs; `just test-all` includes the #[ignore]d coturn/redis tests.

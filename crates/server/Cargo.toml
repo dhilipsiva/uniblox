@@ -9,10 +9,10 @@ homepage.workspace = true
 description = "The uniblox Mode-3 runtime: the headless authoritative server that runs the shared simulation"
 
 [dependencies]
-protocol = { path = "../protocol" }
-engine-core = { path = "../engine-core" }
-replication = { path = "../replication" }
-transport = { path = "../transport" }
+protocol = { path = "../protocol", version = "0.1.0" }
+engine-core = { path = "../engine-core", version = "0.1.0" }
+replication = { path = "../replication", version = "0.1.0" }
+transport = { path = "../transport", version = "0.1.0" }
 bevy_app.workspace = true
 bevy_time.workspace = true
 bevy_ecs.workspace = true

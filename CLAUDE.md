@@ -59,6 +59,8 @@ direnv exec . cargo clippy --all-targets -- -D warnings
 direnv exec . cargo fmt
 ```
 
+`just ci` is the gate CI runs (fmt, clippy, every test including the `#[ignore]`d coturn/redis ones, `cargo deny`, the Mode-1 net-free check); `just --list` shows the rest.
+
 Do **not** run `cargo test --release` — `[profile.release]` sets `panic="abort"`, which the test harness cannot use; plain `cargo test` builds under the dev/test profile (unwind). Toolchain is edition-2024-capable (flake pins Rust ≥ 1.85; currently 1.96).
 
 The **two-WASM-build pipeline** is `scripts/build-wasm.sh` (with `scripts/slice-check.sh`, `scripts/serve.sh`, and the capability-detection page `crates/client/web/index.html`), invoked by the `/build-wasm` and `/slice-check` slash commands. It runs two separate `cargo build --target wasm32-unknown-unknown` invocations — the WebGPU build enables the `webgpu` feature and needs `RUSTFLAGS=--cfg=web_sys_unstable_apis`; the WebGL2 build is the default — each followed by `wasm-bindgen`, then `wasm-opt -Oz --converge` (with the explicit BASELINE wasm-feature flags — never `-all`, which emits encodings stable browsers reject, ADR-0017), then brotli; the optimized artifact takes the `client_bg.wasm` name `client.js` fetches. **The Bevy client renders (ADR-0017)** and the sizes are REAL: ~15.6 MB wasm-opt → **3.38/3.40 MB brotli** per build (2d-pruned, no assets) — size-budget gate PASS (≤ ~8 MB). The size-optimized release profile is `opt-level="z"`, `lto=true`, `codegen-units=1`, `strip=true`, `panic="abort"`.

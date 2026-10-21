@@ -21,7 +21,7 @@ Not built yet:
 - The native client: a stub that prints its name.
 - Mode 2 end to end in a browser.
 - Real-network numbers, such as the STUN-only connection rate.
-- CI and published crates.
+- Published crates.
 
 ## Modes
 
@@ -54,12 +54,13 @@ The toolchain (Rust 1.96 with the wasm32 target, wasm-bindgen, wasm-opt, brotli,
 
 ```bash
 nix develop                  # or `direnv allow` once; .envrc uses the flake
-cargo build
-cargo test                   # not --release: the release profile aborts on panic
-cargo clippy --all-targets -- -D warnings
+just ci                      # the gate CI runs: fmt, clippy -D warnings, every test, cargo deny, the Mode-1 net-free check
+just test                    # the tests that need no external service (not --release: that profile aborts on panic)
+just wasm                    # both browser builds into dist/, ending with the 8 MB brotli size gate
+git config core.hooksPath scripts/git-hooks   # once per clone: the pre-commit hook (fmt, clippy, tests)
 ```
 
-The TURN-relay and shared-registry tests start `turnserver` and `redis-server`, which the dev shell provides.
+The three TURN-relay and two shared-registry tests start `turnserver` and `redis-server`, so they are `#[ignore]`d: `just test` (or a plain `cargo test`) skips them, and `just test-all` and `just ci` run them with the binaries the dev shell provides. `just --list` shows every recipe. CI (`.github/workflows/ci.yml`) runs `just ci`, `just wasm` and `nix flake check` through `nix develop`.
 
 Running it:
 
@@ -67,8 +68,7 @@ Running it:
 cargo run -p services        # signaling on port 3536 (UNIBLOX_SIGNALING_PORT; UNIBLOX_REDIS_URL for a shared registry)
 cargo run -p server          # Mode 3; joins UNIBLOX_SIGNALING_URL (default ws://127.0.0.1:3536/uniblox-demo)
 cargo run -p standalone      # Mode 1, headless
-scripts/build-wasm.sh        # the two browser builds into dist/, with the size check
-scripts/serve.sh             # serve dist/ locally
+scripts/serve.sh             # serve dist/ (after `just wasm`) locally
 ```
 
 ## Records

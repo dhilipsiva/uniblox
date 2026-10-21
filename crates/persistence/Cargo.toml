@@ -14,8 +14,8 @@ description = "Content-addressed uniblox saves: save and load a world by its bla
 # engine-core components so engine-core stays serde-free. No direct blake3 dep —
 # reached via protocol::content_id.
 [dependencies]
-protocol = { path = "../protocol" }
-engine-core = { path = "../engine-core" }
+protocol = { path = "../protocol", version = "0.1.0" }
+engine-core = { path = "../engine-core", version = "0.1.0" }
 bevy_ecs.workspace = true
 serde.workspace = true
 postcard.workspace = true

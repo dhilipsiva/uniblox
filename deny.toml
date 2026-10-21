@@ -25,6 +25,21 @@ unmaintained = "workspace"
 ignore = [
     # Repository-specific, each with its closing item and an expiry (see the header):
     # { id = "RUSTSEC-YYYY-NNNN", reason = "closed by P1-XXX-NN; expires YYYY-MM-DD" },
+    # uniblox, 2026-10-21. matchbox_socket 0.14.0 (the latest release) reaches rustls 0.21 through
+    # async-tls 0.13 for native WebSocket signaling; it matters only when a native peer (server, or the
+    # native client stub) dials signaling over wss:// (the defaults are ws://). No fixed release is
+    # in reach through a semver-compatible update.
+    { id = "RUSTSEC-2026-0346", reason = "rustls 0.21 via matchbox_socket/async-tls; closed by P2-UNIBLOX-01; expires 2027-01-19" },
+    { id = "RUSTSEC-2026-0349", reason = "rustls 0.21 via matchbox_socket/async-tls; closed by P2-UNIBLOX-01; expires 2027-01-19" },
+    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.101 via matchbox_socket/async-tls; closed by P2-UNIBLOX-01; expires 2027-01-19" },
+    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.101 via matchbox_socket/async-tls; closed by P2-UNIBLOX-01; expires 2027-01-19" },
+    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.101 via matchbox_socket/async-tls; closed by P2-UNIBLOX-01; expires 2027-01-19" },
+    { id = "RUSTSEC-2026-0382", reason = "rustls-webpki 0.101 via matchbox_socket/async-tls; closed by P2-UNIBLOX-01; expires 2027-01-19" },
+    { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.22 via matchbox_socket/async-tls; closed by P2-UNIBLOX-01; expires 2027-01-19" },
+    # uniblox, 2026-10-21. quick-xml 0.39 is build-time only: wayland-scanner, a proc macro under
+    # Bevy's winit, parses Wayland's own bundled protocol XML, never untrusted input.
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.39, build-time via bevy/winit/wayland-scanner; closed by P2-UNIBLOX-01; expires 2027-01-19" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.39, build-time via bevy/winit/wayland-scanner; closed by P2-UNIBLOX-01; expires 2027-01-19" },
 ]
 
 [licenses]

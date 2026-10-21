@@ -36,7 +36,8 @@ Toolchain notes (these differ from nibli — do not copy nibli's habits):
   (cargo/rustc/clippy/rustfmt, wasm32 target, currently 1.96) + `wasm-bindgen`/`wasm-opt`/`brotli`/`twiggy`/
   `node`, all pinned by `flake.lock`. Run **`direnv allow`** once per clone. Interactive `cd` auto-activates
   (direnv + nix-direnv); non-interactive shells enter it via the `direnv exec .` prefix above.
-  Without it, an ambient rustup may resolve cargo instead, so keep the prefix. No `just` here.
+  Without it, an ambient rustup may resolve cargo instead, so keep the prefix. The local gate is
+  `direnv exec . just ci` (the Justfile; CI runs the same recipe).
 - The **two-WASM-build** pipeline (`scripts/build-wasm.sh`) + `/build-wasm` and `/slice-check` are
   **scaffolded**; the WASM tools are present (via the flake), so `build-wasm.sh` **runs end-to-end**; on the
   current stub the output is byte-identical, KB-sized wasm — **meaningless** for the size budget until the Bevy

@@ -9,15 +9,15 @@ homepage.workspace = true
 description = "The uniblox authority-gated, per-entity state replication: acked-baseline deltas, interest management, prediction and ownership arbitration"
 
 [dependencies]
-protocol = { path = "../protocol" }
-engine-core = { path = "../engine-core" }
+protocol = { path = "../protocol", version = "0.1.0" }
+engine-core = { path = "../engine-core", version = "0.1.0" }
 bevy_ecs.workspace = true
 log.workspace = true
 
 [dev-dependencies]
 # e2e tests + the slice_metrics example only — transport stays OUT of the
 # lib dependency graph.
-transport = { path = "../transport" }
+transport = { path = "../transport", version = "0.1.0" }
 matchbox_signaling.workspace = true
 tokio = { workspace = true, features = ["time"] }
 ed25519-dalek.workspace = true

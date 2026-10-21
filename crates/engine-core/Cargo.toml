@@ -9,5 +9,5 @@ homepage.workspace = true
 description = "The uniblox simulation shared by every mode: ECS components, systems and the single per-entity authority decision"
 
 [dependencies]
-protocol = { path = "../protocol" }
+protocol = { path = "../protocol", version = "0.1.0" }
 bevy_ecs.workspace = true

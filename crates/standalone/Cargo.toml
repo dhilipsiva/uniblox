@@ -14,8 +14,8 @@ description = "The uniblox Mode-1 runtime: the shared simulation with local auth
 # stack absent" acceptance, provable at the crate-graph level (and guarded by a
 # cargo-tree check in scripts/git-hooks/pre-commit).
 [dependencies]
-protocol = { path = "../protocol" }
-engine-core = { path = "../engine-core" }
+protocol = { path = "../protocol", version = "0.1.0" }
+engine-core = { path = "../engine-core", version = "0.1.0" }
 bevy_app.workspace = true
 bevy_time.workspace = true
 bevy_ecs.workspace = true
