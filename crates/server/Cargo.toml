@@ -27,6 +27,9 @@ log.workspace = true
 getrandom.workspace = true
 
 [dev-dependencies]
+# The deployability test runs the binary against the real signaling service (ADR-0052).
+services = { path = "../services", version = "0.1.0" }
+serde_json.workspace = true
 # scripted_modes.rs runs Mode 1 on the real standalone app (ADR-0045).
 standalone = { path = "../standalone", version = "0.1.0" }
 # headless-app tests embed an in-process signaling server + a raw test client
