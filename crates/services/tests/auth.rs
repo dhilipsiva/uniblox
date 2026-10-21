@@ -156,6 +156,23 @@ async fn join(addr: SocketAddr, room: &str) -> (Ws, PeerId) {
     (ws, id)
 }
 
+/// Join `room` as a receiver that will not read, with a small kernel receive buffer. Setting it turns
+/// off the buffer's autotuning (which grows it to tens of MiB on some hosts), so on any host a flood
+/// outruns the kernel's buffers within a few MiB and the server's queue is what is left.
+async fn join_slow(addr: SocketAddr, room: &str) -> (Ws, PeerId) {
+    let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+    socket.set_recv_buffer_size(8 * 1024).expect("SO_RCVBUF");
+    let stream = socket.connect(addr).await.expect("tcp connect");
+    let (mut ws, _) = tokio_tungstenite::client_async(
+        format!("ws://{addr}/{room}"),
+        MaybeTlsStream::Plain(stream),
+    )
+    .await
+    .expect("ws connect");
+    let id = assigned_id(&mut ws).await;
+    (ws, id)
+}
+
 /// Whether an event matching `found` arrives on `ws` within `within`.
 async fn saw(ws: &mut Ws, within: Duration, found: impl Fn(&JsonPeerEvent) -> bool) -> bool {
     let deadline = tokio::time::Instant::now() + within;
@@ -196,9 +213,10 @@ async fn flood(ws: &mut Ws, from: PeerId, to: PeerId, bytes: usize) {
     }
 }
 
-/// The first flood of a receiver that does not read: far more than the kernel's socket buffers and
-/// the WebSocket write buffer hold, so its queue is left holding what the limits let through.
-const PAST_THE_BUFFERS: usize = 48 << 20;
+/// The first flood of a receiver that does not read ([`join_slow`]): several times what its kernel
+/// buffers (its small receive buffer, the server's send buffer of at most a few MiB) and the WebSocket
+/// write buffer hold, so its queue is left holding what the limits let through.
+const PAST_THE_BUFFERS: usize = 24 << 20;
 
 /// Limits for the flood tests: no frame-rate or drop-count limit gets in the way, and a receiver
 /// that does not read is not disconnected while a test runs.
@@ -219,7 +237,7 @@ fn flood_limits(max_outbound_queue: usize, max_outbound_bytes: usize) -> Signali
 
 /// B, then five flooders that flood B until its queue holds what they may take.
 async fn five_flooders_fill(addr: SocketAddr, path: &str) -> (Ws, Vec<(Ws, PeerId)>) {
-    let (b, b_id) = join(addr, path).await;
+    let (b, b_id) = join_slow(addr, path).await;
     let mut flooders = Vec::new();
     for _ in 0..5 {
         flooders.push(join(addr, path).await);
@@ -566,10 +584,13 @@ async fn a_peer_that_does_not_read_is_disconnected() {
         ..SignalingConfig::default()
     })
     .await;
-    let (mut a, _b, b_id) = pair(addr, &format!("{ROOM}?engine=1")).await;
-    // B never reads. Enough data to fill the kernel's socket buffers, so B's writer stalls.
+    let path = format!("{ROOM}?engine=1");
+    let (mut a, _) = join(addr, &path).await;
+    let (_b, b_id) = join_slow(addr, &path).await;
+    // B never reads. A floods it until its writer stalls and it is disconnected (a few MiB fill its
+    // kernel buffers; the cap only keeps a failing run finite).
     let payload = "y".repeat(30 * 1024);
-    for _ in 0..1000 {
+    for _ in 0..3000 {
         if a.send(signal(b_id, &payload)).await.is_err() || reg.peer_count(ROOM) < 2 {
             break;
         }
@@ -733,7 +754,7 @@ async fn a_peer_flooded_to_its_byte_budget_still_learns_of_newcomers() {
 async fn an_honest_sender_keeps_its_share_during_a_flood() {
     let (_reg, addr) = boot_with(flood_limits(64, 64 << 20)).await;
     let path = format!("{ROOM}?engine=1");
-    let (mut b, b_id) = join(addr, &path).await;
+    let (mut b, b_id) = join_slow(addr, &path).await;
     let (mut a, a_id) = join(addr, &path).await;
     let (mut c, _) = join(addr, &path).await;
     flood(&mut a, a_id, b_id, PAST_THE_BUFFERS).await;
@@ -753,7 +774,7 @@ async fn an_honest_sender_keeps_its_share_during_a_flood() {
 async fn one_sender_cannot_take_a_receivers_signal_bytes() {
     let (_reg, addr) = boot_with(flood_limits(1024, 1 << 20)).await;
     let path = format!("{ROOM}?engine=1");
-    let (mut b, b_id) = join(addr, &path).await;
+    let (mut b, b_id) = join_slow(addr, &path).await;
     let (mut a, a_id) = join(addr, &path).await;
     let (mut c, _) = join(addr, &path).await;
     flood(&mut a, a_id, b_id, PAST_THE_BUFFERS).await;
