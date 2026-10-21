@@ -59,19 +59,19 @@ fn main() {
         .unwrap_or_else(|_| "ws://127.0.0.1:3536/uniblox-demo".to_string());
     let entities = match std::env::var("UNIBLOX_SERVER_ENTITIES") {
         Ok(v) => v.parse::<usize>().unwrap_or_else(|_| {
-            eprintln!("[server] UNIBLOX_SERVER_ENTITIES={v:?} is not a number — using 2");
+            log::warn!("[server] UNIBLOX_SERVER_ENTITIES={v:?} is not a number — using 2");
             2
         }),
         Err(_) => 2,
     };
 
-    println!("[server] connecting to signaling at {url}");
+    log::info!("[server] connecting to signaling at {url}");
     let (mut transport, loop_fut) = Transport::connect(&url);
     // The message loop is executor-agnostic (async-compat supplies a tokio
     // context internally, ADR-0012); a plain blocked thread drives it.
     std::thread::spawn(move || {
         if let Err(err) = futures::executor::block_on(loop_fut) {
-            eprintln!("[server] transport message loop ended: {err:?}");
+            log::error!("[server] transport message loop ended: {err:?}");
         }
     });
 
@@ -82,7 +82,7 @@ fn main() {
             break id;
         }
         if started.elapsed() > ID_WAIT_TIMEOUT {
-            eprintln!(
+            log::error!(
                 "[server] no signaling id within {ID_WAIT_TIMEOUT:?} — is the signaling server up?"
             );
             std::process::exit(1);
@@ -90,7 +90,7 @@ fn main() {
         std::thread::sleep(Duration::from_millis(20));
     };
     let local = PeerId::from_uuid_bytes(*uuid.0.as_bytes());
-    println!("[server] up as {local:?}; owning {entities} entities; fixed tick 64 Hz");
+    log::info!("[server] up as {local:?}; owning {entities} entities; fixed tick 64 Hz");
 
     let mut app = build_server_app(transport, local, entities);
     let idle = match env_secs("UNIBLOX_IDLE_SHUTDOWN_SECS").unwrap_or(300) {
@@ -116,10 +116,10 @@ fn main() {
     }
     if let Ok(manifest) = std::env::var("UNIBLOX_BUNDLE") {
         if let Err(err) = server::load_content(&mut app, std::path::Path::new(&manifest)) {
-            eprintln!("[server] cannot load the bundle {manifest}: {err}");
+            log::error!("[server] cannot load the bundle {manifest}: {err}");
             std::process::exit(1);
         }
-        println!("[server] content loaded from {manifest}");
+        log::info!("[server] content loaded from {manifest}");
     }
     match app.run() {
         AppExit::Success => {}
