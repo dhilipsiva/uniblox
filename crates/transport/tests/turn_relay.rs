@@ -1,5 +1,7 @@
 //! TURN relay proof (ADR-0016) — hermetic, against a locally spawned coturn
-//! (`turnserver` comes from the flake devShell).
+//! (`turnserver` comes from the flake devShell). The tests are `#[ignore]`d so a
+//! plain `cargo test` passes without coturn; `just test-all` and CI run them with
+//! `--include-ignored` inside `nix develop`.
 //!
 //! The relay proof uses RAW webrtc-rs peers with `ice_transport_policy =
 //! Relay`: under that policy host/srflx candidates are excluded, so a
@@ -206,6 +208,7 @@ async fn connect_non_trickle(
 /// The relay proof: relay-only policy + valid credentials ⇒ the data channel
 /// opens and carries a payload — possible ONLY through the coturn allocation.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs turnserver (coturn) on PATH; run with --include-ignored in nix develop (just test-all, CI)"]
 async fn turn_relay_carries_data_with_credentials() {
     let turn = spawn_turnserver();
 
@@ -269,6 +272,7 @@ async fn turn_relay_carries_data_with_credentials() {
 /// (coturn rejects the allocation with 401 immediately; the window is slack,
 /// not load-bearing).
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs turnserver (coturn) on PATH; run with --include-ignored in nix develop (just test-all, CI)"]
 async fn turn_relay_refuses_bad_credentials() {
     let turn = spawn_turnserver();
 
@@ -305,6 +309,7 @@ async fn turn_relay_refuses_bad_credentials() {
 /// channels. (Relay FORCING is not expressible through matchbox — the relay
 /// proof above covers that at the layer matchbox is built on.)
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs turnserver (coturn) on PATH; run with --include-ignored in nix develop (just test-all, CI)"]
 async fn transport_connects_with_turn_ice_config() {
     use matchbox_signaling::SignalingServer;
 

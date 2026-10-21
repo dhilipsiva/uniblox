@@ -2,8 +2,9 @@
 //! flake devShell provides it, mirroring the coturn TURN-relay tests) and prove
 //! that TWO stateless signaling nodes over one Redis share the session registry.
 //!
-//! Like the coturn test, this hard-requires `redis-server` on PATH (no skip
-//! guard) — run it inside the flake devShell.
+//! Like the coturn tests, these need `redis-server` on PATH, so they are
+//! `#[ignore]`d: a plain `cargo test` reports them as ignored, and `just test-all`
+//! and CI run them with `--include-ignored` inside the flake devShell.
 
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::process::{Child, Command, Stdio};
@@ -106,6 +107,7 @@ async fn wait_global(reg: &SessionRegistry, want: usize) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs redis-server on PATH; run with --include-ignored in nix develop (just test-all, CI)"]
 async fn two_nodes_share_a_redis_registry() {
     let (_redis, url) = spawn_redis();
     // Two stateless nodes, each with its OWN Redis connection to the SAME server.
@@ -154,6 +156,7 @@ async fn two_nodes_share_a_redis_registry() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs redis-server on PATH; run with --include-ignored in nix develop (just test-all, CI)"]
 async fn redis_store_records_and_prunes() {
     let (_redis, url) = spawn_redis();
     let store = connect_store(&url).await;
