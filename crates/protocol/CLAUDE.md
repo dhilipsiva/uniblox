@@ -11,14 +11,15 @@ DETERMINISTIC per-peer wire output; the ordering has no wire meaning), quantizat
 (`QUANT_SCALE`=1024, tolerance ≤1/2048 for |v|≤16384, saturating), `StateMsg`/`StateEntry`
 (Options-only presence, derived mask, ABSOLUTE values — never arithmetic deltas; `StateMsg` also carries
 `tick` — the interpolation time axis — and `last_input` — the reconciliation marker, ADR-0022), `EventMsg` with
-the reserved-but-None signature field (Phase 6) + the `NetEvent::Input{seq,intent}` client-input variant
+the signature field (ADR-0049: the sender's key + an ed25519 signature over `event_signing_bytes`, required on every
+event but `Ack`) + the `NetEvent::Input{seq,intent}` client-input variant
 (ADR-0022 Stage B, reliable channel) + the **ADR-0024 anti-entropy resync** variants `NetEvent::{Digest{entries:
 Vec<DigestEntry>}, ResyncRequest{ids}, ResyncSpawn{id,pos,vel,seq}}` (`DigestEntry{id, state_hash: Option<u32>}`;
 all reliable, directed) + the **ADR-0025 A ownership-arbitration rank** `OwnerSeq{seq:u64, coordinator:PeerId}`
 (lexicographic `Ord` — `seq` dominant, `coordinator` breaks equal-seq ties toward the higher id) which now rides
 `OwnershipTransfer{id,new_owner,seq}` AND `ResyncSpawn` (A-kernel) + the **coordinator PULL handshake**
 `NetEvent::{ClaimOwnership{id}, OwnershipCommit{id,new_owner,seq}, ClaimRejected{id}}` (A-handshake), versioned
-postcard codecs (mismatch → clean Err). **`WIRE_VERSION`=7.** **Content-addressing (ADR-0032):**
+postcard codecs (mismatch → clean Err). **`WIRE_VERSION`=8.** **Content-addressing (ADR-0032):**
 `ContentId([u8;32])` = the blake3-256 digest of a byte blob (`content_id()`, `to_hex`/`from_hex` round-trip,
 `ContentIdError`, `Ord` for deterministic content-store iteration) — THE primitive for the Phase-4 Mode-1 save
 (B2) + Phase-7 object storage + Phase-8 publish. `blake3` is pinned `{default-features=false, features=["std",

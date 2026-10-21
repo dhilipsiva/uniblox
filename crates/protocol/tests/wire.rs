@@ -286,7 +286,8 @@ fn the_signed_bytes_are_domain_sender_recipient_event() {
         sig: Some(vec![9; 96]),
         event: protocol::NetEvent::Ack { seq: 3 },
     };
-    let bytes = protocol::event_signing_bytes(protocol::PeerId(1), protocol::PeerId(2), &msg).unwrap();
+    let bytes =
+        protocol::event_signing_bytes(protocol::PeerId(1), protocol::PeerId(2), &msg).unwrap();
     let mut want = b"uniblox-event-v1\0".to_vec();
     want.extend_from_slice(&1u64.to_le_bytes());
     want.extend_from_slice(&2u64.to_le_bytes());
@@ -299,4 +300,3 @@ fn the_signed_bytes_are_domain_sender_recipient_event() {
     );
     assert_eq!(bytes, want, "the signature itself is never covered");
 }
-

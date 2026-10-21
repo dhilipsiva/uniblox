@@ -112,7 +112,8 @@ fn a_saturated_rank_is_refused() {
             seq: rank,
         },
     ] {
-        b.repl.apply_events(&mut b.world, m, &signed(m, b.id, event));
+        b.repl
+            .apply_events(&mut b.world, m, &signed(m, b.id, event));
         assert_eq!(b.owner(), owner.id, "a top rank never applies");
     }
 }
@@ -151,11 +152,15 @@ fn the_coordinator_never_overflows_a_rank() {
         .map(|(_, bytes)| decode_event(bytes).unwrap().event)
         .collect();
     assert!(
-        events.iter().any(|e| matches!(e, NetEvent::ClaimRejected { .. })),
+        events
+            .iter()
+            .any(|e| matches!(e, NetEvent::ClaimRejected { .. })),
         "the claim is rejected: {events:?}"
     );
     assert!(
-        !events.iter().any(|e| matches!(e, NetEvent::OwnershipCommit { .. })),
+        !events
+            .iter()
+            .any(|e| matches!(e, NetEvent::OwnershipCommit { .. })),
         "nothing is minted past the range: {events:?}"
     );
     assert_eq!(coord.owner(), PeerId(6));
@@ -190,7 +195,13 @@ fn a_reconnecting_peer_gets_a_fresh_key_pin() {
     let id = announce(&mut a, &mut b); // B pins A's key from the Spawn
     b.repl.untrack_peer(a.id);
     // A straggler from the old connection, under the old key.
-    let straggler = signed(a.id, b.id, NetEvent::Despawn { id: NetEntityId { index: 999, ..id } });
+    let straggler = signed(
+        a.id,
+        b.id,
+        NetEvent::Despawn {
+            id: NetEntityId { index: 999, ..id },
+        },
+    );
     b.repl.apply_events(&mut b.world, a.id, &straggler);
     b.repl.on_peer_connected(a.id);
     let new_key = SigningKey::from_bytes(&[0x77; 32]);
@@ -209,7 +220,11 @@ fn a_reconnecting_peer_gets_a_fresh_key_pin() {
     )
     .unwrap();
     b.repl.apply_events(&mut b.world, a.id, &transfer);
-    assert_eq!(b.owner(), b.id, "the reconnected peer's new key is pinned afresh");
+    assert_eq!(
+        b.owner(),
+        b.id,
+        "the reconnected peer's new key is pinned afresh"
+    );
 }
 
 /// Every event the coordinator sends while arbitrating is signed, `ClaimRejected` included.
@@ -230,14 +245,24 @@ fn the_coordinators_commits_and_rejections_are_signed() {
     for (_, bytes) in &out {
         let msg = decode_event(bytes).unwrap();
         assert!(
-            msg.sig.as_ref().is_some_and(|s| s.len() == replication::SIGNATURE_BYTES),
+            msg.sig
+                .as_ref()
+                .is_some_and(|s| s.len() == replication::SIGNATURE_BYTES),
             "{:?} is unsigned",
             msg.event
         );
         kinds.push(msg.event);
     }
-    assert!(kinds.iter().any(|e| matches!(e, NetEvent::ClaimRejected { .. })));
-    assert!(kinds.iter().any(|e| matches!(e, NetEvent::OwnershipCommit { .. })));
+    assert!(
+        kinds
+            .iter()
+            .any(|e| matches!(e, NetEvent::ClaimRejected { .. }))
+    );
+    assert!(
+        kinds
+            .iter()
+            .any(|e| matches!(e, NetEvent::OwnershipCommit { .. }))
+    );
 }
 
 /// A host that sets `LocalPeer` after constructing the replicator still signs as that peer.

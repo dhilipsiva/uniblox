@@ -1960,7 +1960,18 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
   event. `replication::seal_event` signs an event a host or test injects.
 - **Why the first key is trusted:** a DataChannel is DTLS-authenticated, with its fingerprint exchanged through
   the signaling server (now authenticated, ADR-0047), and `from` derives from the id that server assigns. So the
-  first key seen on a link is the peer's own, as far as the signaling server can be trusted.
+  first key seen on a link is the peer's own, as far as the signaling server can be trusted. `on_peer_connected`
+  forgets a pin, so a reconnecting peer may bring a new key and a straggler from its old connection cannot lock
+  it out.
+- **What the signatures add today, honestly:** less than it may seem.
+  - `from` already comes from the authenticated transport, so a peer replaying another's event to a third peer
+    arrives as itself and is caught by sender binding alone.
+  - Recipient binding matters only against an attacker who can inject on someone else's link.
+  - The signed bytes carry no nonce or counter, so same-link replay of an old signed event is not covered.
+  - The minter binding below needs no signatures at all.
+
+  The signatures are the foundation for forwardable proofs: the grants of option A below are carried by peers
+  other than their minter, which needs signatures (and grant signatures that name no recipient).
 - **Decision — minter binding:** an `OwnershipTransfer` or `OwnershipCommit` must name its sender as the
   minter (`seq.coordinator == from`). A peer can then no longer mint a rank in another peer's name, for example
   to win the equal-seq tie toward the higher coordinator. Honest flows already satisfy this: the giver sends its
@@ -1968,10 +1979,25 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
 - **Keys:** the server makes a fresh key per process from the OS random source (`server::fresh_signing_key`).
   A persistent device key (non-extractable WebCrypto in IndexedDB, or the OS keyring) is still the open Phase-6
   bullet, so a peer's signing identity lasts one session.
-- **What this does not do:** it authenticates events; it does not authorize them. A peer can still mint a higher
-  rank in its own name and take any entity. A `ResyncSpawn` still lets its sender re-anchor an entity it claims at
-  a rank no lower than the receiver's. Closing that needs an entitlement rule in the replication core, which is
-  the owner's call, below.
+- **Hardening from the audit:**
+  - the top rank (`u64::MAX`) is reserved: refused on receipt and never minted. A forged rank can no longer
+    overflow the coordinator's next mint, which was a panic in debug builds and a silent wrap that locked the
+    entity in release;
+  - the coordinator honours a `TransferRequest` only from the entity's current owner;
+  - `LocalPeer` is re-read by every method that has the world, so a host may insert it after
+    `Replication::new`.
+- **What this does not do:** it authenticates events; it does not authorize them. Concretely, a malicious peer
+  can still:
+  - mint a higher rank in its own name and take any entity. In Mode 3 this includes the server's own entities:
+    the Transfer and Commit arms have no own-authority guard;
+  - lock an entity by minting the highest accepted rank, so no honest rank can follow;
+  - re-anchor an entity it claims with a `ResyncSpawn` at a rank no lower than the receiver's, or create a
+    phantom proxy for any third-party id it is not yet known by, which also blocks that id's later Spawn;
+  - claim any entity: claims are open by design, and the lowest-id claimant wins;
+  - be the coordinator, with probability 1/N: ids are random, so some peer always is, and in Mode 3 the server
+    is the lowest id only 1/(N+1) of the time.
+
+  Closing these needs an entitlement rule in the replication core, which is the owner's call, below.
 - **Proposed — authorization (needs the owner's decision and test cases; the replication crate is HIGH-risk):**
   - *A (recommended): coordinator-minted grants.* Every owner change is a grant `{id, new_owner, seq}` signed by
     its minter. It is accepted only from the receiver's current coordinator, or from the proxy's current owner (a
@@ -1980,8 +2006,11 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
     left, so a peer that joined later can still verify them.
     - Costs: a grant is dropped while views of the coordinator disagree, until resync; re-anchoring costs one
       commit per affected entity.
-    - The coordinator stays trusted: a malicious one can grant itself anything. A client can only become
-      coordinator by reconnecting until the server assigns it a low id, which ADR-0047's limits slow down.
+    - Option A closes self-minting, not entitlement: the coordinator honestly mints the grants for claims, which
+      are open by design, so who may claim what is a separate (game) rule.
+    - The coordinator stays trusted, and a malicious peer is the coordinator 1/N of the time (ids are random).
+      Mode 3 needs the server to be the minter whatever its id: option B, or A with the server pinned as
+      coordinator.
   - *B: one fixed session authority* (the session's first peer, or the Mode-3 server) is the only minter. This is
     simple and strong for Mode 3, but loses the migration of minting rights in Mode 2.
   - *C: keep authentication only*, inside the casual/co-op envelope.
@@ -1993,15 +2022,27 @@ ADR's decision — supersede it with a new, higher-numbered ADR.
     - a late joiner verifies an adopted entity;
     - R6 (a cross-sender reorder) still resolves by rank.
 - **Cost:** one signature per reliable event per recipient and one verification per received event: 9.3 µs and
-  18.9 µs natively with the opt-level=3 crypto override (README "Measurements"). Acks, the hot reliable path, are
-  unsigned.
+  18.9 µs natively with the opt-level=3 crypto override (README "Measurements").
+  - Acks are unsigned.
+  - Inputs are signed at the tick rate: 64 Hz per client, so a server with 32 clients verifies about 2,000 events
+    a second, roughly 39 ms a second.
+  - Spawn and Despawn bursts on join or AOI change cost one signature per entity per peer, bounded by the
+    ADR-0029 cap.
 - **Consequences:**
   - `tests/signing.rs` (8 tests) covers the signed transfer, the Done-when rejection of an unsigned
     `OwnershipTransfer` (stripped or crafted), tampering, another recipient, a changed key, minter binding,
     signatures on every non-Ack event, and the public key.
   - The existing suites now sign their hand-crafted events with the sending peer's test key and send ownership
     changes from their minter. T20 now gives each recipient its own copy of a transfer.
+  - `tests/ownership_guards.rs` (6) covers the reserved top rank, the coordinator's overflow-free mint, the
+    owner-only transfer request, the fresh pin on reconnect, signed rejections, and a late `LocalPeer`.
+    `protocol/tests/wire.rs` pins the signed bytes byte for byte.
   - Mutation-tested: ignoring the verification fails half of `signing.rs`.
+  - Audit: a fresh netcode audit of 47a98b5 returned APPROVE WITH NITS. It found no honest flow dropped (it
+    turned every drop into a panic and ran every suite), and every mutation of the gate, the pin, the recipient
+    and the minter binding was caught. Its findings are the hardening above and the corrections to this
+    record. Mutations that still survive: `verify` instead of `verify_strict`, and the domain string, which is
+    now pinned by the wire test.
 - **Status:** Proposed (2026-10-21) on branch `todo/P4-UNIBLOX-05`, part of a HIGH-risk item. The authorization
   section waits on the owner's decision.
 

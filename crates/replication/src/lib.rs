@@ -86,6 +86,20 @@ pub use ed25519_dalek::SigningKey;
 /// The length of a reliable event's signature field: the signer's public key, then the signature.
 pub const SIGNATURE_BYTES: usize = SIG_KEY_BYTES + 64;
 
+/// The top of the rank range, reserved: a received rank there is refused, and no peer mints it, so
+/// no forged rank can make the next mint overflow (ADR-0049 audit).
+const RANK_CEILING: u64 = u64::MAX;
+
+/// The rank after `seq` that `minter` mints, or `None` at the ceiling.
+fn next_rank(seq: u64, minter: PeerId) -> Option<OwnerSeq> {
+    seq.checked_add(1)
+        .filter(|&s| s < RANK_CEILING)
+        .map(|seq| OwnerSeq {
+            seq,
+            coordinator: minter,
+        })
+}
+
 /// This peer's event signer (ADR-0049): its key and its own id, the sender every signature names.
 struct EventSigner {
     key: SigningKey,
@@ -445,6 +459,14 @@ impl Replication {
         }
     }
 
+    /// Re-read `LocalPeer` (ADR-0049): a host may insert it after [`Self::new`]; every signature
+    /// must name the peer the world says we are. Called by every method that has the world.
+    fn refresh_local(&mut self, world: &World) {
+        if let Some(local) = world.get_resource::<LocalPeer>() {
+            self.signer.local = local.0;
+        }
+    }
+
     /// This peer's public key (ADR-0049), the one its signed events carry.
     pub fn public_key(&self) -> [u8; 32] {
         self.signer.key.verifying_key().to_bytes()
@@ -510,6 +532,7 @@ impl Replication {
     /// a corpse is never handed off; the id-map is pruned only AFTER every peer
     /// has been told, so a two-peer despawn reaches both).
     pub fn collect_all(&mut self, world: &mut World) -> Vec<(PeerId, Outbox)> {
+        self.refresh_local(world);
         let local = world.resource::<LocalPeer>().0;
         // The authoritative sim tick stamped into every snapshot (ADR-0022), the
         // interpolation time axis. Absent (a world without the resource) ⇒ 0.
@@ -1059,6 +1082,7 @@ impl Replication {
     /// RECEIVER, events channel (reliable + ordered per sender — processed in
     /// arrival order).
     pub fn apply_events(&mut self, world: &mut World, from: PeerId, bytes: &[u8]) {
+        self.refresh_local(world);
         let msg = match decode_event(bytes) {
             Ok(msg) => msg,
             Err(err) => {
@@ -1133,6 +1157,12 @@ impl Replication {
             }
             NetEvent::OwnershipTransfer { id, new_owner, seq } => {
                 // ADR-0049: a rank is minted in its minter's name; a transfer names its sender.
+                if seq.seq >= RANK_CEILING {
+                    log::warn!(
+                        "transfer for {id:?} from {from:?} at the reserved top rank — dropped"
+                    );
+                    return;
+                }
                 if seq.coordinator != from {
                     log::warn!(
                         "transfer for {id:?} from {from:?} minted as {:?} — dropped",
@@ -1148,11 +1178,12 @@ impl Replication {
                 // STRICTLY higher rank (`apply_ranked_owner_change`). This REPLACES
                 // the old `owner!=from` gate — a cross-sender-reordered stale
                 // transfer carries a lower seq and is dropped WITHOUT freezing the
-                // proxy (R6 resolves by rank). `from` is not consulted: a
-                // transfer's authority is proven by its seq (only the true current
-                // owner mints `prev.seq + 1`); a former owner's replay is strictly
-                // lower. (Forging a higher seq is a modified-client concern — the
-                // same trust envelope as the privileged `ResyncSpawn`.)
+                // proxy (R6 resolves by rank). `from` is consulted only as the
+                // minter (checked above, ADR-0049): the rank must be minted in the
+                // sender's name; whether the sender may hand the entity off is not
+                // checked (only the true current owner mints `prev.seq + 1`, and a
+                // former owner's replay is strictly lower). Forging a higher rank in
+                // one's own name is the authorization gap ADR-0049 proposes to close.
                 if !self.apply_ranked_owner_change(world, proxy, new_owner, seq) {
                     log::warn!("stale transfer for {id:?} (rank {seq:?}) — dropped");
                 }
@@ -1222,6 +1253,12 @@ impl Replication {
                 self.resync_requests.entry(from).or_default().extend(ids);
             }
             NetEvent::ResyncSpawn { id, pos, vel, seq } => {
+                if seq.seq >= RANK_CEILING {
+                    log::warn!(
+                        "resync for {id:?} from {from:?} at the reserved top rank — dropped"
+                    );
+                    return;
+                }
                 // RECEIVER (ADR-0024 resync + ADR-0025 A seq gate): the current
                 // owner `from` PRIVILEGED-asserts existence + owner + state.
                 // Create-or-correct, bypassing the `spawner!=from` (create) and
@@ -1339,6 +1376,12 @@ impl Replication {
                 // equal-seq tie resolves toward the higher coordinator (a
                 // post-migration coordinator's commit outranks the old one).
                 // ADR-0049: the coordinator sends the commits it mints.
+                if seq.seq >= RANK_CEILING {
+                    log::warn!(
+                        "commit for {id:?} from {from:?} at the reserved top rank — dropped"
+                    );
+                    return;
+                }
                 if seq.coordinator != from {
                     log::warn!(
                         "commit for {id:?} from {from:?} minted as {:?} — dropped",
@@ -1367,6 +1410,18 @@ impl Replication {
                 let local = world.resource::<LocalPeer>().0;
                 if self.coordinator(local) != local {
                     log::warn!("transfer-request for {id:?} reached non-coordinator — dropped");
+                    return;
+                }
+                // Only the current owner may hand an entity off (the sender side's rule, enforced
+                // here too). The coordinator mints every Mode-2 owner change, so its view is current.
+                let owner = self
+                    .map
+                    .by_id
+                    .get(&id)
+                    .and_then(|&e| world.get::<Owner>(e))
+                    .map(|o| o.0);
+                if owner != Some(from) {
+                    log::warn!("transfer-request for {id:?} from non-owner {from:?} — dropped");
                     return;
                 }
                 self.pending_transfer_requests.insert(id, to);
@@ -1426,6 +1481,7 @@ impl Replication {
     /// `(target, bytes)`; the caller does `send_event(target, bytes)`. Call once
     /// per pump after recording inputs; the reliable channel delivers each once.
     pub fn drain_inputs(&mut self, world: &mut World) -> Vec<(PeerId, Box<[u8]>)> {
+        self.refresh_local(world);
         let local = world.resource::<LocalPeer>().0;
         // Snapshot (entity, authority, unsent inputs) so the world borrow ends
         // before we mutate `input_sent`. Only entities we do NOT own (authority
@@ -1497,6 +1553,7 @@ impl Replication {
     /// only on a real mismatch). Call on a SLOWER cadence than `collect_all` (the
     /// caller's, like the net tick). Returns `(peer, encoded Digest event)`.
     pub fn collect_resync(&mut self, world: &mut World) -> Vec<(PeerId, Box<[u8]>)> {
+        self.refresh_local(world);
         let local = world.resource::<LocalPeer>().0;
         // Snapshot the entities we currently OWN (authority-gated, like collect_all).
         let rows: Vec<(Entity, QVec2, QVec2)> = match self.change_query.get(world) {
@@ -1585,6 +1642,7 @@ impl Replication {
     /// self-correcting under a concurrent handoff (we simply stop answering for an
     /// entity we no longer own).
     pub fn drain_resync_responses(&mut self, world: &mut World) -> Vec<(PeerId, Box<[u8]>)> {
+        self.refresh_local(world);
         let local = world.resource::<LocalPeer>().0;
         let mut requests: Vec<(PeerId, Vec<NetEntityId>)> =
             std::mem::take(&mut self.resync_requests)
@@ -1843,18 +1901,19 @@ impl Replication {
         // proxy and every stale in-flight transfer, so the receiver's `seq > proxy`
         // gate accepts this and rejects reorderings. (The record exists — minted
         // just above if it was absent.)
-        let next = self
-            .map
-            .by_entity
-            .get(&entity)
-            .map(|r| OwnerSeq {
-                seq: r.owner_seq.seq + 1,
-                coordinator: local,
-            })
-            .unwrap_or(OwnerSeq {
+        let next = match self.map.by_entity.get(&entity) {
+            Some(r) => match next_rank(r.owner_seq.seq, local) {
+                Some(next) => next,
+                None => {
+                    log::warn!("entity {entity:?} is at the top rank; it cannot be handed off");
+                    return Err(NotAuthoritative);
+                }
+            },
+            None => OwnerSeq {
                 seq: 1,
                 coordinator: local,
-            });
+            },
+        };
         // Record the one-shot intent (with its rank); the next `collect_all`
         // announces it — to every peer that knows the entity, plus the new owner
         // regardless of AOI (Spawn+Transfer) so it can build+own the proxy — then
@@ -1898,6 +1957,7 @@ impl Replication {
         world: &mut World,
         entity: Entity,
     ) -> Option<(PeerId, Box<[u8]>)> {
+        self.refresh_local(world);
         let local = world.resource::<LocalPeer>().0;
         let id = self.map.by_entity.get(&entity).map(|r| r.id)?;
         let coordinator = self.coordinator(local);
@@ -1934,6 +1994,7 @@ impl Replication {
         entity: Entity,
         to: PeerId,
     ) -> Option<(PeerId, Box<[u8]>)> {
+        self.refresh_local(world);
         let local = world.resource::<LocalPeer>().0;
         // Only the current owner may hand an entity off.
         let owner = world.get::<Owner>(entity).map(|o| o.0)?;
@@ -1984,6 +2045,7 @@ impl Replication {
     /// views reconcile — ADR-0028 (b); direct `transfer_ownership` remains a Mode-1
     /// / coordinator / mechanics primitive.)
     pub fn drain_commits(&mut self, world: &mut World) -> Vec<(PeerId, Box<[u8]>)> {
+        self.refresh_local(world);
         let local = world.resource::<LocalPeer>().0;
         let am_coordinator = self.coordinator(local) == local;
         let claims = std::mem::take(&mut self.pending_claims);
@@ -2031,9 +2093,10 @@ impl Replication {
             let Some(winner) = elect_owner(candidates.iter().copied()) else {
                 continue; // candidates non-empty (id came from a claim or request)
             };
-            let new_seq = OwnerSeq {
-                seq: current_seq.seq + 1,
-                coordinator: local,
+            let Some(new_seq) = next_rank(current_seq.seq, local) else {
+                log::warn!("{id:?} is at the top rank; its claims are rejected");
+                push_rejects(&self.signer, &mut out, id, &candidates);
+                continue;
             };
             // Apply the commit to our own proxy (advances the record + demotes us
             // if we were the owner). Same strict-rank gate as every owner change.
@@ -2094,6 +2157,9 @@ impl Replication {
     /// all-owned Spawn replay anymore (that would leak the existence of
     /// out-of-AOI entities). Per-peer state defaults lazily on the first collect.
     pub fn on_peer_connected(&mut self, peer: PeerId) {
+        // A new connection may bring a new key (ADR-0049): forget the old pin, which a straggler
+        // from the previous connection may have re-created after `untrack_peer`.
+        self.peer_keys.remove(&peer);
         self.track_peer(peer);
     }
 }
