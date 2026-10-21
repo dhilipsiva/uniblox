@@ -276,3 +276,27 @@ fn peer_id_from_uuid_bytes_stable_and_documented() {
         PeerId::from_uuid_bytes(uuid3)
     );
 }
+
+/// What a reliable event's signature covers (ADR-0049), pinned byte for byte: the domain string,
+/// the sender and the recipient (little-endian u64s), then the event encoded without a signature.
+#[test]
+fn the_signed_bytes_are_domain_sender_recipient_event() {
+    let msg = protocol::EventMsg {
+        version: protocol::WIRE_VERSION,
+        sig: Some(vec![9; 96]),
+        event: protocol::NetEvent::Ack { seq: 3 },
+    };
+    let bytes = protocol::event_signing_bytes(protocol::PeerId(1), protocol::PeerId(2), &msg).unwrap();
+    let mut want = b"uniblox-event-v1\0".to_vec();
+    want.extend_from_slice(&1u64.to_le_bytes());
+    want.extend_from_slice(&2u64.to_le_bytes());
+    want.extend_from_slice(
+        &protocol::encode_event(&protocol::EventMsg {
+            sig: None,
+            ..msg.clone()
+        })
+        .unwrap(),
+    );
+    assert_eq!(bytes, want, "the signature itself is never covered");
+}
+
