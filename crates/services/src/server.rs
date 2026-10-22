@@ -25,7 +25,7 @@ use uuid::Uuid;
 use crate::limits::{IpLimiter, TokenBucket, per_second};
 use crate::{
     ClientIp, JoinTokenKey, MAX_TOKEN_LIFETIME_SECS, SCOPE_SEP, SessionRegistry, SignalingConfig,
-    SignalingLimits, TOKEN_PARAM, TOKEN_PATH, TURN_PATH, TurnConfig, bad_request,
+    SignalingLimits, TOKEN_PARAM, TOKEN_PATH, TURN_PATH, TokenError, TurnConfig, bad_request,
     credential_expiry, engine_too_old, parse_engine, parse_next, parse_scope, turn_credential,
     unix_now, validate_room,
 };
@@ -139,13 +139,15 @@ impl PeerTx {
         let share_msgs = (self.max_msgs / 4).max(1);
         let share_bytes = self.max_bytes / 4;
         let reserve = (self.max_msgs / 8).max(1);
-        if self.tx.capacity() <= reserve {
-            return false;
-        }
         let len = msg_len(&msg);
+        // Every signal enqueue holds this lock, so the reserve check below is exact: senders racing at
+        // the edge of the reserve cannot all pass it.
         let Ok(mut shares) = self.budget.per_sender.lock() else {
             return false;
         };
+        if self.tx.capacity() <= reserve {
+            return false;
+        }
         let held = shares.entry(from).or_default();
         if held.msgs >= share_msgs
             || (held.msgs > 0 && held.bytes.saturating_add(len) > share_bytes)
@@ -382,6 +384,10 @@ impl Shared {
         // On a grid, so one token keeps one username for a while; never past the token (turn.rs).
         let expiry = credential_expiry(now, turn.ttl, token_expiry);
         let ttl = expiry.saturating_sub(now);
+        if ttl == 0 {
+            // A token in its last second: a credential would already have expired.
+            return unauthorized(TokenError::Expired);
+        }
         // The label is derived from the token, so redeeming a token again within a grid step yields the
         // same username, and coturn's per-user quota binds per token.
         let digest = Sha256::digest(token.as_bytes());

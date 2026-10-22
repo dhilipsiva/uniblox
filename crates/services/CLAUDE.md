@@ -56,7 +56,7 @@ cross-node relay is out of scope).** Hermetic test spawns a real `redis-server` 
 
 **TURN credentials (ADR-0050, proposed):** `SignalingConfig::turn` serves `GET /_uniblox/turn?room=&token=`: a
 coturn REST-API credential (`<expiry>:<label>`, base64 HMAC-SHA1 of the shared secret, `turn_credential`) only for a
-valid join token for that room (label = a hash of the token, expiry rounded down to a half-TTL grid and capped at the
+valid join token for that room (label = a hash of the token, expiry rounded down to a grid of ⌈TTL/2⌉ (`credential_expiry`) and capped at the
 token's, so one token keeps one username per grid step); 404 without TURN or auth. Env: `UNIBLOX_TURN_SECRET`, `UNIBLOX_TURN_URLS`,
 `UNIBLOX_TURN_TTL_SECS`.
 

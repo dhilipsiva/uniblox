@@ -43,11 +43,16 @@ pub struct TurnCredential {
 }
 
 /// When a credential minted at `now` (unix seconds) for a join token expiring at `token_expiry`
-/// expires. The expiry is rounded down to a grid of half the TTL, so a token keeps one username for
-/// a grid step (coturn's per-user quota binds per username), and it never outlives the token.
+/// expires. The expiry is rounded down to a grid whose step is half the TTL, rounded up, so:
+/// - a token keeps one username for a step (coturn's per-user quota binds per username);
+/// - a token holds at most two live usernames at any time (two steps exceed the TTL);
+/// - a credential lasts more than half the TTL and at most the TTL;
+/// - it never outlives the token.
+///
+/// For a TTL of one or two seconds the step is one second, so the username changes every second.
 pub fn credential_expiry(now: u64, ttl: Duration, token_expiry: u64) -> u64 {
     let ttl_secs = ttl.as_secs().clamp(1, MAX_TURN_TTL_SECS);
-    let step = (ttl_secs / 2).max(1);
+    let step = ttl_secs.div_ceil(2);
     ((now + ttl_secs) / step * step).min(token_expiry)
 }
 
