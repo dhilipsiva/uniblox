@@ -24,10 +24,10 @@ use uuid::Uuid;
 
 use crate::limits::{IpLimiter, TokenBucket, per_second};
 use crate::{
-    ClientIp, JoinTokenKey, MAX_TOKEN_LIFETIME_SECS, MAX_TURN_TTL_SECS, SCOPE_SEP, SessionRegistry,
-    SignalingConfig, SignalingLimits, TOKEN_PARAM, TOKEN_PATH, TURN_PATH, TurnConfig, bad_request,
-    engine_too_old, parse_engine, parse_next, parse_scope, turn_credential, unix_now,
-    validate_room,
+    ClientIp, JoinTokenKey, MAX_TOKEN_LIFETIME_SECS, SCOPE_SEP, SessionRegistry, SignalingConfig,
+    SignalingLimits, TOKEN_PARAM, TOKEN_PATH, TURN_PATH, TurnConfig, bad_request,
+    credential_expiry, engine_too_old, parse_engine, parse_next, parse_scope, turn_credential,
+    unix_now, validate_room,
 };
 
 /// How long a closing peer's writer may take to flush before it is cut off.
@@ -379,13 +379,8 @@ impl Shared {
             Ok(expiry) => expiry,
             Err(err) => return unauthorized(err),
         };
-        // Round the expiry down to a grid of half the TTL, so a token that outlives the TTL keeps one
-        // username for a grid step (coturn's per-user quota binds per username, and a token then has at
-        // most two valid ones at a time). A credential lasts between half the TTL and the TTL, and never
-        // outlives the token that admitted the client.
-        let ttl_secs = turn.ttl.as_secs().clamp(1, MAX_TURN_TTL_SECS);
-        let step = (ttl_secs / 2).max(1);
-        let expiry = ((now + ttl_secs) / step * step).min(token_expiry);
+        // On a grid, so one token keeps one username for a while; never past the token (turn.rs).
+        let expiry = credential_expiry(now, turn.ttl, token_expiry);
         let ttl = expiry.saturating_sub(now);
         // The label is derived from the token, so redeeming a token again within a grid step yields the
         // same username, and coturn's per-user quota binds per token.
@@ -738,6 +733,75 @@ mod tests {
             let _ = peer.send_signal(c, text(1));
         }
         assert!(!peer.send_signal(c, text(1)), "C's message share is full");
+    }
+
+    fn sender(n: u128) -> PeerId {
+        PeerId(Uuid::from_u128(n))
+    }
+
+    /// Signals stop with an eighth of the queue's messages left, which control events may use.
+    #[test]
+    fn signals_leave_the_message_reserve_to_control_events() {
+        // A share of 16 messages; the byte budget is out of reach.
+        let (peer, _rx) = peer_tx(64, 64 << 20);
+        let mut admitted = 0;
+        for s in 0..5 {
+            for _ in 0..16 {
+                admitted += usize::from(peer.send_signal(sender(s), text(1)));
+            }
+        }
+        assert_eq!(admitted, 56, "signals stop at the reserve");
+        for _ in 0..8 {
+            assert!(peer.send_control(text(1)), "control events use the reserve");
+        }
+        assert!(!peer.send_control(text(1)), "and the queue is then full");
+    }
+
+    /// Signals stop with an eighth of the byte budget left, which control events may use.
+    #[test]
+    fn signals_leave_the_byte_reserve_to_control_events() {
+        // A byte share of 16 KiB; the signal byte cap is 56 KiB; the message count is out of reach.
+        let (peer, _rx) = peer_tx(1024, 64 * 1024);
+        let mut admitted = 0;
+        for s in 0..5 {
+            for _ in 0..4 {
+                admitted += usize::from(peer.send_signal(sender(s), text(4096)));
+            }
+        }
+        assert_eq!(admitted, 14, "56 KiB of 4 KiB signals");
+        assert!(
+            peer.send_control(text(4096)),
+            "a control event fits in the reserve"
+        );
+    }
+
+    /// The reserve check and the enqueue happen under one lock, so senders racing at the edge of the
+    /// reserve admit one signal between them, not several.
+    #[test]
+    fn concurrent_senders_cannot_take_the_reserve() {
+        for trial in 0..300 {
+            // 55 of 64 queued: one more signal fits before the reserve of 8.
+            let (peer, _rx) = peer_tx(64, 64 << 20);
+            for i in 0..55 {
+                assert!(peer.send_signal(sender(1000 + i / 16), text(1)));
+            }
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+            let racers: Vec<_> = (0..16)
+                .map(|n| {
+                    let (peer, barrier) = (peer.clone(), std::sync::Arc::clone(&barrier));
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        peer.send_signal(sender(n), text(1))
+                    })
+                })
+                .collect();
+            let admitted = racers
+                .into_iter()
+                .filter_map(|r| r.join().ok())
+                .filter(|&ok| ok)
+                .count();
+            assert_eq!(admitted, 1, "trial {trial}: the reserve was entered");
+        }
     }
 
     /// A sender holding nothing may queue one signal larger than its byte share, so a small budget

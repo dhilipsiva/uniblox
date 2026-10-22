@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use services::{
     JoinTokenKey, SessionRegistry, SignalingConfig, TURN_PATH, TurnConfig,
-    build_signaling_server_with, turn_credential, unix_now,
+    build_signaling_server_with, credential_expiry, turn_credential, unix_now,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -221,4 +221,52 @@ async fn the_turn_endpoint_is_off_without_turn_or_auth() {
         let (status, _, _) = get(addr, &format!("{TURN_PATH}?room={ROOM}&token={token}")).await;
         assert_eq!(status, 404);
     }
+}
+
+/// The TTLs the expiry rule is checked over: tiny, odd and even, the default and the maximum.
+const TTLS: [u64; 15] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 600, 3600, 3601, 86400];
+
+/// A credential expires after more than half its TTL and within it, never past its token.
+#[test]
+fn a_credentials_lifetime_is_more_than_half_its_ttl() {
+    let base = 1_800_000_000;
+    for ttl in TTLS {
+        for now in (base..base + 3 * ttl).step_by((ttl as usize / 50).max(1)) {
+            let expiry = credential_expiry(now, Duration::from_secs(ttl), u64::MAX);
+            let life = expiry - now;
+            assert!(life <= ttl, "ttl {ttl} at {now}: {life}");
+            assert!(
+                life > ttl / 2,
+                "ttl {ttl} at {now}: {life} is not past half"
+            );
+        }
+        let capped = credential_expiry(base, Duration::from_secs(ttl), base + 1);
+        assert_eq!(capped, base + 1, "capped at the token's expiry");
+    }
+}
+
+/// A token holds at most two live usernames at any time, whatever its TTL (coturn's per-user quota
+/// binds per username).
+#[test]
+fn a_token_has_at_most_two_live_usernames() {
+    let base = 1_800_000_000;
+    for ttl in TTLS {
+        let ttl_d = Duration::from_secs(ttl);
+        for t in (base + ttl..base + 3 * ttl).step_by((ttl as usize / 50).max(1)) {
+            let live: std::collections::BTreeSet<u64> = (t - ttl..=t)
+                .map(|issued| credential_expiry(issued, ttl_d, u64::MAX))
+                .filter(|&expiry| expiry > t)
+                .collect();
+            assert!(live.len() <= 2, "ttl {ttl} at {t}: {live:?}");
+        }
+    }
+}
+
+/// A token in its last second would get a credential that has already expired: refused instead.
+#[tokio::test]
+async fn a_token_expiring_now_gets_no_credential() {
+    let addr = boot(configured()).await;
+    let token = JoinTokenKey::new(SECRET).unwrap().mint(ROOM, unix_now());
+    let (status, _, body) = get(addr, &format!("{TURN_PATH}?room={ROOM}&token={token}")).await;
+    assert_eq!(status, 401, "{body}");
 }

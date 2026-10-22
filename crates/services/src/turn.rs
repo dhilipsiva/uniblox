@@ -42,6 +42,15 @@ pub struct TurnCredential {
     pub credential: String,
 }
 
+/// When a credential minted at `now` (unix seconds) for a join token expiring at `token_expiry`
+/// expires. The expiry is rounded down to a grid of half the TTL, so a token keeps one username for
+/// a grid step (coturn's per-user quota binds per username), and it never outlives the token.
+pub fn credential_expiry(now: u64, ttl: Duration, token_expiry: u64) -> u64 {
+    let ttl_secs = ttl.as_secs().clamp(1, MAX_TURN_TTL_SECS);
+    let step = (ttl_secs / 2).max(1);
+    ((now + ttl_secs) / step * step).min(token_expiry)
+}
+
 /// The credential for `label` that coturn accepts until `expires` (unix seconds).
 pub fn turn_credential(secret: &[u8], label: &str, expires: u64) -> TurnCredential {
     let username = format!("{expires}:{label}");

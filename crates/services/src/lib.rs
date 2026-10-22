@@ -80,7 +80,7 @@ pub use store::{
     DEFAULT_NODE_TTL, MemoryRegistryStore, RegistryError, RegistryResult, RegistryStore,
     SessionInfo,
 };
-pub use turn::{MAX_TURN_TTL_SECS, TurnConfig, TurnCredential, turn_credential};
+pub use turn::{MAX_TURN_TTL_SECS, TurnConfig, TurnCredential, credential_expiry, turn_credential};
 
 /// The scope delimiter between a room path's tilde-separated parts.
 pub(crate) const SCOPE_SEP: char = '~';
